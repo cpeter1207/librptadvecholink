@@ -1,9 +1,12 @@
 //! Bounded directory transactions with atomic publication and freshness-gated admission.
+#[cfg(test)]
+mod tests;
 
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::Ipv4Addr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -50,11 +53,12 @@ pub enum AdmissionError {
 }
 
 /// One account's last good directory, replaced only after a complete refresh.
+#[derive(Clone)]
 pub struct DirectorySnapshot {
     freshness: Duration,
     published: Option<Instant>,
     snapshot_id: String,
-    entries: BTreeMap<String, DirectoryEntry>,
+    entries: Arc<BTreeMap<String, DirectoryEntry>>,
     failures: u64,
 }
 
@@ -65,7 +69,7 @@ impl DirectorySnapshot {
             freshness,
             published: None,
             snapshot_id: "0".into(),
-            entries: BTreeMap::new(),
+            entries: Arc::new(BTreeMap::new()),
             failures: 0,
         }
     }
@@ -85,7 +89,7 @@ impl DirectorySnapshot {
         let candidate = self.candidate(input);
         match candidate {
             Ok((entries, snapshot_id)) => {
-                self.entries = entries;
+                self.entries = Arc::new(entries);
                 self.snapshot_id = snapshot_id;
                 self.published = Some(now);
                 Ok(())
@@ -186,7 +190,7 @@ impl DirectorySnapshot {
             return Err(DirectoryError::Malformed);
         }
         let mut entries = if partial {
-            self.entries.clone()
+            self.entries.as_ref().clone()
         } else {
             BTreeMap::new()
         };
@@ -278,6 +282,34 @@ impl DirectorySnapshot {
                 token.into()
             },
         ))
+    }
+}
+
+/// Immutable, atomically published directory view for final host admission.
+/// It grants no account/QSO ownership; callers must also validate the exact live
+/// account and connection generation. No owner task, mutex or wait is entered.
+#[derive(Clone)]
+pub struct DirectoryView(Arc<arc_swap::ArcSwap<DirectorySnapshot>>);
+
+impl DirectoryView {
+    pub(crate) fn new(snapshot: &DirectorySnapshot) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(snapshot.clone())))
+    }
+    pub(crate) fn publish(&self, snapshot: &DirectorySnapshot) {
+        self.0.store(Arc::new(snapshot.clone()));
+    }
+    /// Copy the current fresh numeric identity, without reserving a QSO.
+    pub fn by_node(&self, node: u32, now: Instant) -> Result<DirectoryEntry, AdmissionError> {
+        self.0.load().by_node(node, now)
+    }
+    /// Recheck current callsign/address/freshness after pending host work.
+    pub fn lookup(
+        &self,
+        callsign: &str,
+        address: Ipv4Addr,
+        now: Instant,
+    ) -> Result<DirectoryEntry, AdmissionError> {
+        self.0.load().lookup(callsign, address, now)
     }
 }
 

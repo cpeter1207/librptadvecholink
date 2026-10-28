@@ -95,9 +95,14 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             });
             let sockets = Arc::new(DirectSockets::bind("127.0.0.1:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()).await.unwrap());
             let (network, mut events) = AccountNetwork::direct(settings(&server, 300_000, 0), Arc::clone(&sockets), || (9, 3)).unwrap();
+            let directory_view = network.directory();
+            assert_eq!(directory_view.by_node(123456, std::time::Instant::now()), Err(rptadv_echolink::directory::AdmissionError::Stale));
             loop {
                 if matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) { break; }
             }
+            let verified = directory_view.by_node(123456, std::time::Instant::now()).unwrap();
+            assert_eq!(verified.callsign, "K1ABC-R");
+            assert_eq!(directory_view.lookup("K1ABC-R", "192.0.2.1".parse().unwrap(), std::time::Instant::now()), Err(rptadv_echolink::directory::AdmissionError::Address));
             let mut connection = network.dial(123456).await.unwrap();
             assert_eq!(connection.connection.identity.callsign, "K1ABC-R");
             let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();

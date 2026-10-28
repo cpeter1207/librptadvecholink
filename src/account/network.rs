@@ -7,7 +7,7 @@ use super::{
     settings::PreparedSettings,
 };
 use crate::{
-    directory::DirectorySnapshot,
+    directory::{DirectorySnapshot, DirectoryView},
     transport::{
         ReplyKind, TransactionError,
         direct::DirectSockets,
@@ -107,6 +107,7 @@ enum Command {
 /// Owns a task on the existing Tokio runtime, never a new runtime/thread per account or peer.
 /// Dropping requests cancellation; stop() is the asynchronous quiescence barrier.
 pub struct AccountNetwork {
+    directory: DirectoryView,
     commands: mpsc::Sender<Command>,
     stopping: watch::Sender<bool>,
     task: Option<JoinHandle<()>>,
@@ -172,6 +173,7 @@ impl AccountNetwork {
         .ok_or(NetworkError::Invalid)?;
         let snapshot =
             DirectorySnapshot::new(Duration::from_millis(policy.directory_freshness_ms.into()));
+        let view = DirectoryView::new(&snapshot);
         let capacity = usize::try_from(
             u64::from(policy.max_stations) + u64::from(policy.max_pending_handshakes),
         )
@@ -186,6 +188,7 @@ impl AccountNetwork {
             coordinator,
             directory,
             snapshot,
+            view: view.clone(),
             peers: BTreeMap::new(),
             commands: receiver,
             events,
@@ -194,6 +197,7 @@ impl AccountNetwork {
         let task = runtime.spawn(owner.run());
         Ok((
             Self {
+                directory: view,
                 commands,
                 stopping,
                 task: Some(task),
@@ -222,6 +226,12 @@ impl AccountNetwork {
     /// Request an outbound route through the fresh directory; never block an executor thread.
     pub async fn dial(&self, node: u32) -> Result<PeerConnection, NetworkError> {
         self.request(|reply| Command::Dial(node, reply)).await
+    }
+
+    /// Read-only current directory for final provider-bound host admission.
+    /// A view is not permission to accept a connection or bypass account policy.
+    pub fn directory(&self) -> DirectoryView {
+        self.directory.clone()
     }
 
     /// Accept a retained incoming token after the host's policy checks.
@@ -261,6 +271,7 @@ struct Owner {
     coordinator: Coordinator,
     directory: DirectoryControl,
     snapshot: DirectorySnapshot,
+    view: DirectoryView,
     peers: BTreeMap<(u32, u64), Arc<Control>>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<NetworkEvent>,
@@ -330,6 +341,7 @@ impl Owner {
                 }} => {
                     work = None;
                     self.directory.finish(id, result.as_deref().map_err(|error| *error), &mut self.snapshot, Instant::now());
+                    self.view.publish(&self.snapshot);
                     self.health();
                 },
                 _ = async { match deadline {

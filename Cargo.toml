@@ -12,6 +12,7 @@ name = "rptadv_echolink"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+arc-swap = "=1.9.3"
 bytes = "1"
 flate2 = "1.1.10"
 md-5 = "=0.10.6"
