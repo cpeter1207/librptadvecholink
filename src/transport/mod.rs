@@ -3,6 +3,7 @@
 pub mod direct;
 pub mod driver;
 pub mod mailbox;
+pub mod routing;
 
 use crate::directory::{MAX_COMPRESSED, MAX_EXPANDED, MAX_LINE};
 use flate2::{Decompress, FlushDecompress, Status};
