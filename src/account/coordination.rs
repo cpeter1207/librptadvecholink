@@ -202,6 +202,11 @@ impl Coordinator {
                 }
             }
         }
+        // Queue progress restores control credit. Wake the selected owner so a
+        // full drain report can retry without an idle polling/retry timer.
+        if let Some(selected) = &self.selected {
+            selected.wake.wake();
+        }
         true
     }
 

@@ -147,3 +147,46 @@ fn full_control_queue_returns_credit_failure_without_waiting_or_closing_peers() 
         assert!(!owner.service().await);
     });
 }
+
+#[test]
+fn freed_account_credit_wakes_a_selected_peer_without_an_idle_retry_timer() {
+    use rptadv_echolink::transport::{
+        driver::{PeerDriver, PeerWait},
+        mailbox,
+    };
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let now = Instant::now();
+    let (mut owner, _, connections) = setup(now);
+    let control = Arc::new(Control::default());
+    let mut first = owner.port(1, connections[0].generation, Arc::clone(&control));
+    let mut second = owner.port(2, connections[1].generation, Arc::new(Control::default()));
+    let (_input, ingress) = mailbox::channel(connections[0].generation).unwrap();
+    let (notified, notifications) = std::sync::mpsc::channel();
+    let driver = PeerDriver::attach(Arc::clone(&runtime), control, ingress, move |_| {
+        notified.send(()).unwrap();
+        Some(PeerWait::default())
+    });
+    notifications.recv_timeout(Duration::from_secs(2)).unwrap();
+    first.offer(now).unwrap();
+    runtime.block_on(owner.service());
+    notifications.recv_timeout(Duration::from_secs(2)).unwrap();
+    first.selection().unwrap();
+    for value in [true, false, true, false] {
+        second.report_drained(value).unwrap();
+    }
+    assert_eq!(first.report_drained(true), Err(OfferError::Full));
+    runtime.block_on(owner.service());
+    let wake = notifications.recv_timeout(Duration::from_millis(200));
+    driver.detach();
+    assert!(
+        wake.is_ok(),
+        "account progress did not wake the selected owner waiting for credit"
+    );
+    first.report_drained(true).unwrap();
+}

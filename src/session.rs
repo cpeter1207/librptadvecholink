@@ -166,6 +166,11 @@ impl Qso {
         self.state
     }
 
+    /// Immutable routing generation; queued packets from retired routes cannot enter this QSO.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// First close cause; later cleanup cannot overwrite it.
     pub fn first_cause(&self) -> Option<Cause> {
         self.first_cause

@@ -6,6 +6,7 @@ pub mod directory;
 pub mod ffi;
 pub mod media;
 pub mod playout;
+pub mod receive;
 pub mod session;
 pub mod transport;
 pub mod wire;
