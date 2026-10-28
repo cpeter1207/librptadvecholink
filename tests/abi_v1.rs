@@ -1,6 +1,6 @@
 //! Caller-visible lifecycle and fail-closed descriptor tests.
 use rptadv_echolink::{
-    ffi::{AccountConfig, Descriptor, RuntimeConfig, Status},
+    ffi::{AccountConfig, ByteSpan, Descriptor, RuntimeConfig, Status},
     rptadv_echolink_descriptor_v1,
 };
 use std::{mem::size_of, ptr};
@@ -49,6 +49,53 @@ fn context_validation_clears_failed_outputs() {
         ..RuntimeConfig::default()
     };
     assert_eq!(unsafe { create(&config, &mut output) }, Status::Ok);
+    unsafe { api.context_destroy.unwrap()(output) };
+}
+
+#[test]
+fn runtime_resources_load_real_dsos_and_keep_the_legacy_prefix_usable() {
+    let api = unsafe { &*rptadv_echolink_descriptor_v1() };
+    let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
+    let gsm = format!("{directory}/librptadv_codec_gsm.so.1");
+    let speex = format!("{directory}/librptadv_codec_speex.so.1");
+    let jitter = format!("{directory}/rpt_advanced/librptadv_jitter_adapter.so.1");
+    let span = |value: &str| ByteSpan {
+        data: value.as_ptr(),
+        length: value.len(),
+    };
+    let mut config = RuntimeConfig {
+        worker_threads: 1,
+        gsm_library: span(&gsm),
+        speex_library: span(&speex),
+        jitter_library: span(&jitter),
+        ..Default::default()
+    };
+    let create = api.context_create.unwrap();
+    let mut output = ptr::null_mut();
+    assert_eq!(unsafe { create(&config, &mut output) }, Status::Ok);
+    unsafe { api.context_destroy.unwrap()(output) };
+    config.gsm_library = ByteSpan::default();
+    output = ptr::dangling_mut();
+    assert_eq!(unsafe { create(&config, &mut output) }, Status::Invalid);
+    assert!(output.is_null());
+    config.gsm_library = span("/nonexistent/fixture-gsm.so");
+    assert_eq!(unsafe { create(&config, &mut output) }, Status::Failed);
+    assert!(output.is_null());
+    #[repr(C)]
+    struct Legacy {
+        size: u32,
+        abi: u32,
+        workers: u32,
+    }
+    let legacy = Legacy {
+        size: 12,
+        abi: 1,
+        workers: 1,
+    };
+    assert_eq!(
+        unsafe { create(ptr::from_ref(&legacy).cast(), &mut output) },
+        Status::Ok
+    );
     unsafe { api.context_destroy.unwrap()(output) };
 }
 

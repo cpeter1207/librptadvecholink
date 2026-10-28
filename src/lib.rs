@@ -7,6 +7,7 @@ pub mod ffi;
 pub mod media;
 pub mod playout;
 pub mod receive;
+mod resources;
 pub mod session;
 pub mod transport;
 pub mod wire;
@@ -15,9 +16,18 @@ use std::{mem::size_of, ptr, sync::Arc};
 
 struct Context {
     runtime: Arc<tokio::runtime::Runtime>,
+    resources: Option<Arc<resources::Resources>>,
 }
 struct Account {
     _runtime: Arc<tokio::runtime::Runtime>,
+    _resources: Option<Arc<resources::Resources>>,
+}
+
+#[repr(C)]
+struct RuntimePrefix {
+    struct_size: u32,
+    abi_version: u32,
+    worker_threads: u32,
 }
 
 static DESCRIPTOR: Descriptor = Descriptor {
@@ -68,16 +78,25 @@ unsafe extern "C" fn context_create(
     };
     *output = ptr::null_mut();
     // SAFETY: configuration follows the sized-record contract.
-    let Some(config) = (unsafe { record(config) }) else {
+    let Some(prefix) = (unsafe { record::<RuntimePrefix>(config.cast()) }) else {
         return Status::Invalid;
     };
-    if config.abi_version != 1 || config.worker_threads > 256 {
+    if prefix.abi_version != 1 || prefix.worker_threads > 256 {
         return Status::Invalid;
     }
-    let workers = if config.worker_threads == 0 {
+    // Read optional resources only when the complete tail is actually present.
+    let resources = if prefix.struct_size as usize >= size_of::<RuntimeConfig>() {
+        match unsafe { resources::Resources::load(&*config) } {
+            Ok(resources) => resources.map(Arc::new),
+            Err(status) => return status,
+        }
+    } else {
+        None
+    };
+    let workers = if prefix.worker_threads == 0 {
         std::thread::available_parallelism().map_or(1, |count| count.get().clamp(1, 4))
     } else {
-        config.worker_threads as usize
+        prefix.worker_threads as usize
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
@@ -89,6 +108,7 @@ unsafe extern "C" fn context_create(
     };
     *output = Box::into_raw(Box::new(Context {
         runtime: Arc::new(runtime),
+        resources,
     }))
     .cast();
     Status::Ok
@@ -129,6 +149,7 @@ unsafe extern "C" fn account_prepare(
     }
     *output = Box::into_raw(Box::new(Account {
         _runtime: Arc::clone(&context.runtime),
+        _resources: context.resources.as_ref().map(Arc::clone),
     }))
     .cast();
     Status::Ok

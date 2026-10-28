@@ -49,6 +49,12 @@ struct rptadv_echolink_runtime_config_v1 {
     uint32_t struct_size; /**< Complete readable record size. */
     uint32_t abi_version; /**< One. */
     uint32_t worker_threads; /**< 1..256; zero selects available CPUs clamped to 1..4. */
+    /** Optional complete resource tail. All empty keeps lifecycle-only preparation.
+     * GSM and jitter are required together for enabled accounts. The original
+     * 12-byte lifecycle prefix remains accepted without this tail. */
+    struct rptadv_echolink_bytes_v1 gsm_library;
+    struct rptadv_echolink_bytes_v1 speex_library; /**< Optional narrowband Speex DSO. */
+    struct rptadv_echolink_bytes_v1 jitter_library; /**< Released packet-jitter adapter DSO. */
 };
 /** Advertised metadata, not hardware-control commands. */
 struct rptadv_echolink_station_v1 {

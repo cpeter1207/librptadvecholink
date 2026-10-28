@@ -4,7 +4,7 @@
 #include <assert.h>
 #include <string.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
     const struct rptadv_echolink_descriptor_v1 *api = rptadv_echolink_descriptor_v1();
     assert(api != NULL);
@@ -14,6 +14,16 @@ int main(void)
     struct rptadv_echolink_runtime_config_v1 config = {0};
     config.struct_size = sizeof(config);
     config.abi_version = 1;
+    assert(argc == 1 || argc == 4);
+    if (argc == 4) {
+        config.worker_threads = 1;
+        config.gsm_library = (struct rptadv_echolink_bytes_v1){
+            (const uint8_t *)argv[1], strlen(argv[1])};
+        config.speex_library = (struct rptadv_echolink_bytes_v1){
+            (const uint8_t *)argv[2], strlen(argv[2])};
+        config.jitter_library = (struct rptadv_echolink_bytes_v1){
+            (const uint8_t *)argv[3], strlen(argv[3])};
+    }
     struct rptadv_echolink_context *context = NULL;
     assert(api->context_create(&config, &context) == RPTADV_ECHOLINK_OK);
     struct rptadv_echolink_account_config_v1 account_config = {0};
