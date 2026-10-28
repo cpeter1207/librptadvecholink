@@ -2,6 +2,7 @@
 
 pub mod coordination;
 pub mod directory;
+pub mod settings;
 
 use crate::directory::{DirectoryEntry, DirectorySnapshot};
 use std::{
