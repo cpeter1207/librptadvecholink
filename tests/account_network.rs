@@ -1,12 +1,15 @@
 //! Real account ownership runs only against kernel-assigned loopback endpoints.
 use rptadv_echolink::{
     account::{
-        network::{AccountNetwork, NetworkError, NetworkEvent},
+        network::{AccountNetwork, NetworkError, NetworkEvent, PeerTransport},
         settings::PreparedSettings,
     },
     ffi::*,
-    transport::direct::DirectSockets,
-    wire::{Channel, ControlPacket, write_control},
+    transport::{
+        direct::DirectSockets,
+        proxy::{connect, session::ProxySession},
+    },
+    wire::{Channel, ControlPacket, ProxyKind, ProxyRecord, write_control},
 };
 use std::{mem::size_of, sync::Arc, time::Duration};
 use tokio::{
@@ -20,7 +23,7 @@ fn span(value: &str) -> ByteSpan {
         length: value.len(),
     }
 }
-fn settings(server: &str, refresh: u32) -> Arc<PreparedSettings> {
+fn settings(server: &str, refresh: u32, kind: u32) -> Arc<PreparedSettings> {
     let servers = [span(server)];
     let config = AccountConfig {
         enabled: 1,
@@ -33,14 +36,15 @@ fn settings(server: &str, refresh: u32) -> Arc<PreparedSettings> {
             ..Default::default()
         },
         transport: TransportConfig {
-            kind: 0,
+            kind,
             bind_address: span("127.0.0.1"),
             audio_port: 5198,
+            proxy_host: span("127.0.0.1"),
+            proxy_port: 8100,
             directory_servers: StringList {
                 items: servers.as_ptr(),
                 count: 1,
             },
-            ..Default::default()
         },
         policy: AccountPolicy {
             max_stations: 2,
@@ -90,7 +94,7 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
                 }
             });
             let sockets = Arc::new(DirectSockets::bind("127.0.0.1:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()).await.unwrap());
-            let (network, mut events) = AccountNetwork::direct(settings(&server, 300_000), Arc::clone(&sockets), || (9, 3)).unwrap();
+            let (network, mut events) = AccountNetwork::direct(settings(&server, 300_000, 0), Arc::clone(&sockets), || (9, 3)).unwrap();
             loop {
                 if matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) { break; }
             }
@@ -120,6 +124,78 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             network.stop().await.unwrap();
             assert!(incoming.connection.ingress.recv().await.is_none());
             directory.await.unwrap();
+        }).await.unwrap();
+    });
+}
+
+#[test]
+fn proxy_account_uses_its_selected_proxy_for_directory_and_peer_traffic() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            async fn frame(socket: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+                let mut header = [0; 9];
+                socket.read_exact(&mut header).await.unwrap();
+                assert_eq!(&header[1..5], &[127, 0, 0, 1]);
+                let mut payload = vec![0; u32::from_le_bytes(header[5..].try_into().unwrap()) as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                (header[0], payload)
+            }
+            fn bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
+                let mut bytes = vec![kind, 0, 0, 0, 0];
+                bytes.extend((payload.len() as u32).to_le_bytes());
+                bytes.extend(payload);
+                bytes
+            }
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (dialed, ready) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.write_all(b"12345678").await.unwrap();
+                socket.read_exact(&mut [0; 25]).await.unwrap();
+                for (request, response) in [
+                    (b"lN0CALL-R\xac\xacfixture-password\rONLINE1.00R(9: 3)\rTest site\rop@example.invalid\r".as_slice(), b"OK".as_slice()),
+                    (b"F0\r", b"@@@\n1\nK1ABC-R\nPeer\n123456\n127.0.0.1\n+++\n"),
+                ] {
+                    assert_eq!(frame(&mut socket).await, (1, vec![]));
+                    socket.write_all(&bytes(4, &[0; 4])).await.unwrap();
+                    assert_eq!(frame(&mut socket).await, (2, request.to_vec()));
+                    socket.write_all(&bytes(2, response)).await.unwrap();
+                    assert_eq!(frame(&mut socket).await, (3, vec![]));
+                    socket.write_all(&bytes(3, &[])).await.unwrap();
+                }
+                ready.await.unwrap();
+                let mut sdes = [0; 1024];
+                let count = write_control(&ControlPacket::Sdes { source: 0, callsign: "K1ABC-R".into(), station_name: "Peer".into(), speex: false }, &mut sdes).unwrap();
+                let mut packet = bytes(6, &sdes[..count]);
+                packet[1..5].copy_from_slice(&[127, 0, 0, 1]);
+                socket.write_all(&packet).await.unwrap();
+                assert_eq!(frame(&mut socket).await, (6, b"reply".to_vec()));
+                assert_eq!(frame(&mut socket).await, (1, vec![]));
+                socket.write_all(&bytes(4, &[0; 4])).await.unwrap();
+                assert_eq!(frame(&mut socket).await, (2, b"lN0CALL-R\xac\xacfixture-password\rOFF-V3.40\rTest site\r".to_vec()));
+                socket.write_all(&bytes(2, b"OK")).await.unwrap();
+                assert_eq!(frame(&mut socket).await, (3, vec![]));
+                socket.write_all(&bytes(3, &[])).await.unwrap();
+                assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+            });
+            let transport = connect(address, "N0CALL-R", "fixture-password", Duration::from_secs(2)).await.unwrap();
+            let session = ProxySession::start(transport, Duration::from_secs(2)).unwrap();
+            let (network, mut events) = AccountNetwork::proxy(settings("127.0.0.1", 300_000, 1), session, || (9, 3)).unwrap();
+            while !matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) {}
+            let mut peer = network.dial(123456).await.unwrap();
+            dialed.send(()).unwrap();
+            let packet = peer.connection.ingress.recv().await.unwrap();
+            assert_eq!(packet.class(), Channel::Control);
+            assert_eq!(packet.source(), "127.0.0.1:0".parse().unwrap());
+            let PeerTransport::Proxy(output) = &peer.transport else { panic!("Proxy account leaked direct UDP"); };
+            output.try_queue(ProxyRecord { kind: ProxyKind::UdpControl, address: std::net::Ipv4Addr::LOCALHOST, payload: b"reply" }, None).unwrap();
+            network.stop().await.unwrap();
+            server.await.unwrap();
         }).await.unwrap();
     });
 }
@@ -183,7 +259,7 @@ fn slow_directory_refresh_does_not_suspend_the_accounts_udp_router() {
                 .unwrap(),
             );
             let (network, mut events) =
-                AccountNetwork::direct(settings(&server, 40), Arc::clone(&sockets), || (9, 3))
+                AccountNetwork::direct(settings(&server, 40, 0), Arc::clone(&sockets), || (9, 3))
                     .unwrap();
             while !matches!(
                 events.recv().await.unwrap(),

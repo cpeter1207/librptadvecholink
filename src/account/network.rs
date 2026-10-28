@@ -13,6 +13,7 @@ use crate::{
         direct::DirectSockets,
         directory_exchange,
         driver::Control,
+        proxy::{ProxyError, ProxyOutput, session::ProxySession},
         routing::{Connection, PendingHandshake, RouteResult, Router},
     },
     wire::{Channel, MAX_DATAGRAM},
@@ -46,6 +47,8 @@ pub enum NetworkEvent {
     Pending(PendingHandshake),
     /// The account's direct transport failed with its original OS category.
     TransportLost(io::ErrorKind),
+    /// Selected Proxy transport failed; its original content-free cause is retained.
+    ProxyLost(ProxyError),
 }
 
 /// Explicit admission/control outcome; full control credit is not a hangup.
@@ -61,6 +64,28 @@ pub enum NetworkError {
     Admission(Admission),
 }
 
+/// Selected account transport; a Proxy peer cannot accidentally send direct UDP.
+#[derive(Clone)]
+pub enum PeerTransport {
+    /// Shared account sockets, with independent per-peer prepared sends/readiness.
+    Direct(Arc<DirectSockets>),
+    /// Nonblocking handoff to the account's one bounded TCP writer.
+    Proxy(ProxyOutput),
+}
+
+enum Transport {
+    Direct(Arc<DirectSockets>),
+    Proxy(ProxySession),
+}
+impl Transport {
+    fn peer(&self) -> PeerTransport {
+        match self {
+            Self::Direct(sockets) => PeerTransport::Direct(Arc::clone(sockets)),
+            Self::Proxy(session) => PeerTransport::Proxy(session.output()),
+        }
+    }
+}
+
 /// Exact route ownership transferred to one peer worker; no driver is retained on Tokio.
 pub struct PeerConnection {
     /// Verified identity, initial handshake and unique receive consumer.
@@ -69,8 +94,8 @@ pub struct PeerConnection {
     pub talker: TalkerPort,
     /// Wake/stop signals prepared before the worker or host can reenter.
     pub control: Arc<Control>,
-    /// Shared direct sockets; each peer retains its own outgoing packet/readiness state.
-    pub sockets: Arc<DirectSockets>,
+    /// Only the selected transport is available to this peer's outgoing owner.
+    pub transport: PeerTransport,
 }
 
 enum Command {
@@ -95,8 +120,30 @@ impl AccountNetwork {
         sockets: Arc<DirectSockets>,
         civil_time: fn() -> (u8, u8),
     ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), NetworkError> {
+        Self::start(settings, Transport::Direct(sockets), civil_time)
+    }
+
+    /// Start an account on its selected authenticated Proxy; all directory and peer
+    /// traffic shares that transport, with no direct UDP/TCP fallback.
+    pub fn proxy(
+        settings: Arc<PreparedSettings>,
+        session: ProxySession,
+        civil_time: fn() -> (u8, u8),
+    ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), NetworkError> {
+        Self::start(settings, Transport::Proxy(session), civil_time)
+    }
+
+    fn start(
+        settings: Arc<PreparedSettings>,
+        transport: Transport,
+        civil_time: fn() -> (u8, u8),
+    ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), NetworkError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| NetworkError::Invalid)?;
-        if settings.as_abi().transport.kind != 0 {
+        let mode = match &transport {
+            Transport::Direct(_) => 0,
+            Transport::Proxy(_) => 1,
+        };
+        if settings.as_abi().transport.kind != mode {
             return Err(NetworkError::Invalid);
         }
         let policy = &settings.as_abi().policy;
@@ -134,7 +181,7 @@ impl AccountNetwork {
         let (stopping, stop) = watch::channel(false);
         let owner = Owner {
             settings,
-            sockets,
+            transport,
             civil_time,
             coordinator,
             directory,
@@ -209,7 +256,7 @@ type DirectoryWork = Pin<Box<dyn Future<Output = (u64, Result<Vec<u8>, Transacti
 
 struct Owner {
     settings: Arc<PreparedSettings>,
-    sockets: Arc<DirectSockets>,
+    transport: Transport,
     civil_time: fn() -> (u8, u8),
     coordinator: Coordinator,
     directory: DirectoryControl,
@@ -224,6 +271,10 @@ impl Owner {
     async fn run(mut self) {
         let mut audio = vec![0; MAX_DATAGRAM];
         let mut control = vec![0; MAX_DATAGRAM];
+        let sockets = match &self.transport {
+            Transport::Direct(sockets) => Some(Arc::clone(sockets)),
+            Transport::Proxy(_) => None,
+        };
         let mut work: Option<DirectoryWork> = None;
         loop {
             if *self.stop.borrow() {
@@ -249,11 +300,29 @@ impl Owner {
                     None => break,
                 },
                 _ = self.coordinator.service() => {},
-                result = self.sockets.recv(Channel::Audio, &mut audio) => {
+                result = async { match sockets.as_ref() {
+                    Some(sockets) => sockets.recv(Channel::Audio, &mut audio).await,
+                    None => std::future::pending().await,
+                }} => {
                     if !self.received(Channel::Audio, result, &audio) { break; }
                 },
-                result = self.sockets.recv(Channel::Control, &mut control) => {
+                result = async { match sockets.as_ref() {
+                    Some(sockets) => sockets.recv(Channel::Control, &mut control).await,
+                    None => std::future::pending().await,
+                }} => {
                     if !self.received(Channel::Control, result, &control) { break; }
+                },
+                packet = async { match &mut self.transport {
+                    Transport::Proxy(session) => session.recv().await,
+                    Transport::Direct(_) => std::future::pending().await,
+                }} => match packet {
+                    Some(packet) => self.route(packet.class(), packet.source(), packet.arrived(), packet.payload()),
+                    None => {
+                        if let Transport::Proxy(session) = &self.transport {
+                            let _ = self.events.try_send(NetworkEvent::ProxyLost(session.failure().unwrap_or(ProxyError::Closed)));
+                        }
+                        break;
+                    }
                 },
                 (id, result) = async { match work.as_mut() {
                     Some(work) => work.await,
@@ -287,6 +356,9 @@ impl Owner {
                 Instant::now(),
             );
         }
+        if let Transport::Proxy(session) = self.transport {
+            let _ = session.stop().await;
+        }
     }
 
     fn health(&self) {
@@ -312,16 +384,18 @@ impl Owner {
                 return false;
             }
         };
-        if let RouteResult::Pending(pending) = self.coordinator.router().receive(
-            &self.snapshot,
-            class,
-            source,
-            Instant::now(),
-            &bytes[..length],
-        ) {
+        self.route(class, source, Instant::now(), &bytes[..length]);
+        true
+    }
+
+    fn route(&mut self, class: Channel, source: SocketAddr, arrived: Instant, bytes: &[u8]) {
+        if let RouteResult::Pending(pending) =
+            self.coordinator
+                .router()
+                .receive(&self.snapshot, class, source, arrived, bytes)
+        {
             let _ = self.events.try_send(NetworkEvent::Pending(pending));
         }
-        true
     }
 
     fn command(&mut self, command: Command) {
@@ -361,7 +435,7 @@ impl Owner {
                 .port(identity.0, identity.1, Arc::clone(&control)),
             connection,
             control: Arc::clone(&control),
-            sockets: Arc::clone(&self.sockets),
+            transport: self.transport.peer(),
         };
         if reply.send(Ok(peer)).is_ok() {
             self.peers.insert(identity, control);
@@ -373,6 +447,10 @@ impl Owner {
     fn directory_work(&self, job: DirectoryJob) -> DirectoryWork {
         let settings = Arc::clone(&self.settings);
         let (hour, day) = (self.civil_time)();
+        let proxy = match &self.transport {
+            Transport::Proxy(session) => Some(session.directory()),
+            Transport::Direct(_) => None,
+        };
         Box::pin(async move {
             let result = tokio::time::timeout(job.timeout, async {
                 let request = settings
@@ -391,7 +469,17 @@ impl Owner {
                 } else {
                     ReplyKind::Login
                 };
-                directory_exchange(address, &request, kind, job.timeout).await
+                match proxy {
+                    Some(proxy) => match address {
+                        SocketAddr::V4(address) => {
+                            proxy
+                                .exchange(*address.ip(), &request, kind, job.timeout)
+                                .await
+                        }
+                        SocketAddr::V6(_) => Err(TransactionError::Malformed),
+                    },
+                    None => directory_exchange(address, &request, kind, job.timeout).await,
+                }
             })
             .await
             .unwrap_or(Err(TransactionError::Timeout));
