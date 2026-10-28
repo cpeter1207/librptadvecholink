@@ -1,0 +1,15 @@
+name: Packet compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packet-fit:
+    uses: cpeter1207/librptadvecholink-workflows/.github/workflows/packet-fit.yml@main
+    with:
+      code_ref: ${{ github.sha }}
