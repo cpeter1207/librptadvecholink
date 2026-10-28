@@ -1,7 +1,7 @@
 //! Source-rate codec work, never performed in radio callbacks. Product owns resampling.
 
 use crate::wire::{Codec, VoicePacket, WireError, write_voice};
-use rptadv_codec_client::{CodecCatalog, Encoder, ProfileId};
+use rptadv_codec_client::{CodecCatalog, EncodeResult, Encoder, ProfileId, Status};
 
 const FRAMES: usize = 640;
 const MAX_ENCODED: usize = 252;
@@ -67,6 +67,72 @@ pub struct EncodedPacket {
     pub source_start: u64,
     /// Real source frames represented, excluding lookahead/padding.
     pub source_frames: u32,
+}
+
+/// Adapter to the controller's existing prepared-media result, with no pacing
+/// queue or resampler. One exclusive non-audio egress owner calls this object.
+pub struct PreparedMedia(Packetizer);
+
+impl PreparedMedia {
+    /// Prepare mandatory GSM. Authenticated Speex selection can upgrade it later.
+    pub fn new(
+        catalog: &CodecCatalog,
+        gain_db: f64,
+        sequence: u16,
+        source: u32,
+    ) -> Result<Self, MediaError> {
+        Packetizer::new(catalog, Codec::GsmFr, gain_db, sequence, source).map(Self)
+    }
+
+    /// Apply the negotiated extension on the egress owner, never the receive owner.
+    pub fn upgrade_speex(&mut self, catalog: &CodecCatalog) -> Result<(), MediaError> {
+        self.0.upgrade_speex(catalog)
+    }
+
+    /// Abandon expired/discontinuous input, preserving the connection's RTP clock.
+    pub fn reset(&mut self) -> Result<(), MediaError> {
+        self.0.reset()
+    }
+
+    /// Consume at most one four-unit coding block and copy at most one RTP packet.
+    /// Capacity below the 264-byte maximum consumes nothing and changes no history.
+    /// The product owns copied bytes, original source timing, send retries and expiry.
+    /// A finite flush terminates only after all offered input has been accepted.
+    pub fn prepare(
+        &mut self,
+        pcm: &[f32],
+        output: &mut [u8],
+        flush: bool,
+    ) -> Result<EncodeResult, MediaError> {
+        let mut result = EncodeResult {
+            status: Status::NeedInput,
+            consumed_frames: 0,
+            encoded_bytes: 0,
+            source_start_frames: 0,
+            source_frames: 0,
+            packet_frames: 0,
+        };
+        if output.len() < 12 + MAX_ENCODED {
+            result.status = Status::OutputFull;
+            return Ok(result);
+        }
+        result.consumed_frames = self.0.push(pcm)?;
+        if flush && result.consumed_frames == pcm.len() {
+            self.0.finish()?;
+        }
+        if let Some(packet) = self.0.packet() {
+            output[..packet.bytes.len()].copy_from_slice(&packet.bytes);
+            result.encoded_bytes = packet.bytes.len();
+            result.source_start_frames = packet.source_start;
+            result.source_frames = packet.source_frames;
+            result.packet_frames = FRAMES as u32;
+            result.status = Status::Complete;
+            self.0.retire()?;
+        } else if self.0.drained() {
+            result.status = Status::Complete;
+        }
+        Ok(result)
+    }
 }
 
 /// A single coding block and prepared packet, not another timing/audio queue.
