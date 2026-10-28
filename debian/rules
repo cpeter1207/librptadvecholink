@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
-DEB_VERSION_UPSTREAM ?= $(shell dpkg-parsechangelog -S Version | sed 's/-[^-]*$$//')
+DEB_VERSION_UPSTREAM ?= $(shell dpkg-parsechangelog -S Version | sed 's/-[^-]*$$//' | tr '~' '-')
 
 %:
 	dh $@
