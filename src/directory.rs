@@ -181,7 +181,8 @@ impl DirectorySnapshot {
         if expected > MAX_RECORDS {
             return Err(DirectoryError::Limit);
         }
-        if token.len() > 31 || token.chars().any(|ch| !ch.is_ascii_graphic()) {
+        // ASL's SNAPSHOT_SZ field holds 49 bytes plus its string terminator.
+        if token.len() > 49 || token.chars().any(|ch| !ch.is_ascii_graphic()) {
             return Err(DirectoryError::Malformed);
         }
         let mut entries = if partial {

@@ -7,6 +7,204 @@ use rptadv_echolink::{
 };
 use std::time::{Duration, Instant};
 
+#[test]
+fn directory_requests_follow_reference_login_logout_and_snapshot_framing() {
+    use rptadv_echolink::account::directory::DirectoryLogin;
+    let login = DirectoryLogin {
+        callsign: "K1ABC-R",
+        password: "not-a-real-password",
+        description: "North site",
+        email: "operator@example.invalid",
+    };
+    assert_eq!(
+        login.request(&Operation::Register, 9, 3).unwrap(),
+        b"lK1ABC-R\xac\xacnot-a-real-password\rONLINE1.00R(9: 3)\rNorth site\roperator@example.invalid\r"
+    );
+    assert_eq!(
+        login.request(&Operation::Logout, 9, 3).unwrap(),
+        b"lK1ABC-R\xac\xacnot-a-real-password\rOFF-V3.40\rNorth site\r"
+    );
+    let conference = DirectoryLogin {
+        callsign: "*EXAMPLE*",
+        ..login
+    };
+    assert!(
+        conference
+            .request(&Operation::Register, 23, 31)
+            .unwrap()
+            .windows(b"ONLINE1.00B(23:31)\rNor".len())
+            .any(|part| part == b"ONLINE1.00B(23:31)\rNor")
+    );
+    assert_eq!(
+        login
+            .request(
+                &Operation::Snapshot {
+                    snapshot_id: "0".into()
+                },
+                9,
+                3
+            )
+            .unwrap(),
+        b"F0\r"
+    );
+    let token = "a".repeat(49);
+    assert_eq!(
+        login
+            .request(
+                &Operation::Snapshot {
+                    snapshot_id: token.clone()
+                },
+                9,
+                3
+            )
+            .unwrap(),
+        format!("F{token}\r").as_bytes()
+    );
+    for bad in ["", "a\rb", "a\nb", &"a".repeat(50)] {
+        assert!(
+            login
+                .request(
+                    &Operation::Snapshot {
+                        snapshot_id: bad.into()
+                    },
+                    9,
+                    3
+                )
+                .is_err()
+        );
+    }
+    for (hour, day) in [(24, 3), (9, 0), (9, 32)] {
+        assert!(login.request(&Operation::Register, hour, day).is_err());
+    }
+    for callsign in ["", "K1ABC\r", "K1 ABC", "TOO-LONG-CALLSIGN"] {
+        assert!(
+            DirectoryLogin { callsign, ..login }
+                .request(&Operation::Register, 9, 3)
+                .is_err()
+        );
+    }
+    for field in ["one\rtwo", "one\ntwo", "one\0two", &"a".repeat(1024)] {
+        for changed in [
+            DirectoryLogin {
+                password: field,
+                ..login
+            },
+            DirectoryLogin {
+                description: field,
+                ..login
+            },
+            DirectoryLogin {
+                email: field,
+                ..login
+            },
+        ] {
+            assert!(changed.request(&Operation::Register, 9, 3).is_err());
+        }
+    }
+}
+
+#[test]
+fn scheduled_directory_jobs_execute_against_a_framed_loopback_server() {
+    use rptadv_echolink::{
+        account::directory::DirectoryLogin,
+        transport::{ReplyKind, directory_exchange},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let now = Instant::now();
+            let login = DirectoryLogin {
+                callsign: "K1ABC-R",
+                password: "fixture-password",
+                description: "Site",
+                email: "",
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut open = Vec::new();
+                for (expected, reply) in [
+                    (
+                        b"lK1ABC-R\xac\xacfixture-password\rONLINE1.00R(9: 3)\rSite\r\r".as_slice(),
+                        b"OK".as_slice(),
+                    ),
+                    (b"F0\r", b"@@@\n0:first\n+++\n"),
+                    (b"Ffirst\r", b"DDD\n0:second\n+++\n+++\n"),
+                    (
+                        b"lK1ABC-R\xac\xacfixture-password\rOFF-V3.40\rSite\r",
+                        b"OK",
+                    ),
+                ] {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0; expected.len()];
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request, expected);
+                    for chunk in reply.chunks(1) {
+                        stream.write_all(chunk).await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                    // Keep the current socket open until the next transaction is accepted.
+                    open.push(stream);
+                }
+            });
+            let mut owner = DirectoryControl::new(vec!["127.0.0.1".into()], policy()).unwrap();
+            let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+            for elapsed in [0, 0, 240] {
+                let time = now + Duration::from_secs(elapsed);
+                let job = owner.poll(&snapshot, time).unwrap().unwrap();
+                let request = login.request(&job.operation, 9, 3).unwrap();
+                let kind = if matches!(job.operation, Operation::Snapshot { .. }) {
+                    ReplyKind::Directory
+                } else {
+                    ReplyKind::Login
+                };
+                let reply = directory_exchange(address, &request, kind, job.timeout).await;
+                assert_eq!(
+                    owner.finish(
+                        job.id,
+                        reply.as_deref().map_err(|error| *error),
+                        &mut snapshot,
+                        time
+                    ),
+                    None
+                );
+            }
+            assert_eq!(snapshot.snapshot_id(), "second");
+            let logout = owner.stop().unwrap().unwrap();
+            let reply = directory_exchange(
+                address,
+                &login.request(&logout.operation, 9, 3).unwrap(),
+                ReplyKind::Login,
+                logout.timeout,
+            )
+            .await;
+            assert_eq!(
+                owner.finish(
+                    logout.id,
+                    reply.as_deref().map_err(|error| *error),
+                    &mut snapshot,
+                    now
+                ),
+                None
+            );
+            assert_eq!(owner.state(), DirectoryState::Stopped);
+            assert!(
+                owner
+                    .poll(&snapshot, now + Duration::from_secs(900))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(owner.stop().unwrap().is_none());
+            server.await.unwrap();
+        });
+}
+
 fn policy() -> DirectoryPolicy {
     DirectoryPolicy {
         operation_timeout: Duration::from_secs(10),

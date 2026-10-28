@@ -9,6 +9,22 @@ use std::{
 
 const FULL: &[u8] = b"@@@\n2:first\nK1ABC-R\nNorth [ON 12:00]\n123456\n192.0.2.1\nK2ABC-L\nSouth [ON 12:00]\n234567\n192.0.2.1\n+++\n";
 
+#[test]
+fn snapshot_tokens_keep_the_full_asl_directory_field() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    let token = "a".repeat(49);
+    snapshot
+        .update(format!("@@@\n0:{token}\n+++\n").as_bytes(), now)
+        .unwrap();
+    assert_eq!(snapshot.snapshot_id(), token);
+    assert_eq!(
+        snapshot.update(format!("@@@\n0:{token}a\n+++\n").as_bytes(), now),
+        Err(DirectoryError::Malformed)
+    );
+    assert_eq!(snapshot.snapshot_id(), token);
+}
+
 fn compressed(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes).unwrap();

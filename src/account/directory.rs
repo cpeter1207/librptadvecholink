@@ -48,6 +48,85 @@ pub enum Operation {
     Logout,
 }
 
+/// Borrow account credentials only while constructing a directory transaction.
+/// Neither this record nor its serialized request belongs in diagnostics.
+pub struct DirectoryLogin<'a> {
+    /// Normalized station callsign, including a link/repeater suffix when configured.
+    pub callsign: &'a str,
+    /// Account-specific directory password, not its Proxy password.
+    pub password: &'a str,
+    /// Configured directory display/QTH field.
+    pub description: &'a str,
+    /// Public contact email included in online registration.
+    pub email: &'a str,
+}
+
+impl DirectoryLogin<'_> {
+    /// Serialize the ASL online fields or EchoLib offline request, with no truncation.
+    /// `hour` and `day` are local civil hour and day-of-month; monotonic retry/liveness
+    /// deadlines never depend on them. Snapshot requests reuse only the committed token.
+    pub fn request(
+        &self,
+        operation: &Operation,
+        hour: u8,
+        day: u8,
+    ) -> Result<Vec<u8>, TransactionError> {
+        if let Operation::Snapshot { snapshot_id } = operation {
+            if snapshot_id.is_empty()
+                || snapshot_id.len() > 49
+                || !snapshot_id.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err(TransactionError::Malformed);
+            }
+            return Ok(format!("F{snapshot_id}\r").into_bytes());
+        }
+        if self.callsign.is_empty()
+            || self.callsign.len() > 15
+            || !self
+                .callsign
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-/*_".contains(&byte))
+            || self.password.is_empty()
+            || [self.password, self.description, self.email]
+                .iter()
+                .any(|field| {
+                    field.len() > 1023 || field.bytes().any(|byte| byte.is_ascii_control())
+                })
+        {
+            return Err(TransactionError::Malformed);
+        }
+        let status = if *operation == Operation::Logout {
+            "OFF-V3.40".to_owned()
+        } else {
+            if hour > 23 || !(1..=31).contains(&day) {
+                return Err(TransactionError::Malformed);
+            }
+            let class = if self.callsign.starts_with('*') {
+                'B'
+            } else {
+                'R'
+            };
+            format!("ONLINE1.00{class}({hour}:{day:2})")
+        };
+        let mut request = format!("l{}", self.callsign).into_bytes();
+        request.extend_from_slice(b"\xac\xac");
+        request.extend_from_slice(self.password.as_bytes());
+        request.push(b'\r');
+        request.extend_from_slice(status.as_bytes());
+        request.push(b'\r');
+        request.extend_from_slice(self.description.as_bytes());
+        request.push(b'\r');
+        if *operation == Operation::Register {
+            request.extend_from_slice(self.email.as_bytes());
+            request.push(b'\r');
+        }
+        if request.len() > 1023 {
+            return Err(TransactionError::Limit);
+        }
+        Ok(request)
+    }
+}
+
 /// One owned network transaction; at most one exists per account.
 #[derive(Clone, Debug)]
 pub struct DirectoryJob {
