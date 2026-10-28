@@ -129,7 +129,7 @@ impl DirectorySnapshot {
             .ok_or(AdmissionError::Unknown)
     }
 
-    fn require_fresh(&self, now: Instant) -> Result<(), AdmissionError> {
+    pub(crate) fn require_fresh(&self, now: Instant) -> Result<(), AdmissionError> {
         self.published
             .and_then(|published| now.checked_duration_since(published))
             .filter(|age| *age < self.freshness)
