@@ -7,7 +7,6 @@ use super::mailbox::{Budget, Charge};
 use crate::wire::{ProxyDecoder, ProxyKind, ProxyRecord, WireError};
 use md5::{Digest, Md5};
 use std::{
-    collections::VecDeque,
     io::ErrorKind,
     net::SocketAddr,
     sync::Arc,
@@ -19,6 +18,7 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
 };
 
 /// Content-free transport/authentication failure; no credentials or payload bodies.
@@ -156,6 +156,8 @@ pub enum QueueError {
     Full,
     /// Invalid kind-specific frame size; nothing was allocated or queued.
     Invalid,
+    /// Account output has closed; no packet was copied or admitted.
+    Closed,
 }
 
 /// One owner turn's result; the caller yields between bounded turns.
@@ -172,43 +174,48 @@ pub enum FlushOutcome {
 struct Queued {
     wire: Vec<u8>,
     offset: usize,
-    media: bool,
     expires: Option<Instant>,
     _charge: Charge,
+    _slot: OwnedSemaphorePermit,
+    _media_slot: Option<OwnedSemaphorePermit>,
 }
 
-/// Serialized output staging: 64 slots/256 KiB payload, reserving eight slots and
-/// 64 KiB for control. No second writer may interleave bytes into a partial frame.
-pub struct ProxyWriter<S> {
-    stream: S,
-    queue: VecDeque<Queued>,
-    media_count: usize,
+/// Nonblocking multi-peer handoff to the sole Proxy writer. All clones and the
+/// partially submitted frame share 64 slots/256 KiB, with eight slots/64 KiB for control.
+#[derive(Clone)]
+pub struct ProxyOutput {
+    sender: mpsc::Sender<Queued>,
+    slots: Arc<Semaphore>,
+    media_slots: Arc<Semaphore>,
     budget: Arc<Budget>,
 }
 
-impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
-    /// Prepare bounded accounting outside any real-time callback.
-    pub fn new(stream: S) -> Self {
-        Self {
-            stream,
-            queue: VecDeque::with_capacity(64),
-            media_count: 0,
-            budget: Arc::new(Budget::default()),
-        }
-    }
-
+impl ProxyOutput {
     /// Reserve before copying; only UDP data is media. Pass its existing age deadline,
     /// not a new time stamp. Control never expires or replaces an already submitted frame.
     pub fn try_queue(
-        &mut self,
+        &self,
         record: ProxyRecord<'_>,
         expires: Option<Instant>,
     ) -> Result<(), QueueError> {
         let header = record.header().map_err(|_| QueueError::Invalid)?;
         let media = record.kind == ProxyKind::UdpData;
-        if self.queue.len() == 64 || (media && self.media_count == 56) {
-            return Err(QueueError::Full);
-        }
+        let permit = self.sender.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => QueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => QueueError::Closed,
+        })?;
+        let slot = Arc::clone(&self.slots)
+            .try_acquire_owned()
+            .map_err(|_| QueueError::Full)?;
+        let media_slot = if media {
+            Some(
+                Arc::clone(&self.media_slots)
+                    .try_acquire_owned()
+                    .map_err(|_| QueueError::Full)?,
+            )
+        } else {
+            None
+        };
         let charge = self
             .budget
             .reserve(record.payload.len(), media)
@@ -216,31 +223,82 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
         let mut wire = Vec::with_capacity(header.len() + record.payload.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(record.payload);
-        self.queue.push_back(Queued {
+        permit.send(Queued {
             wire,
             offset: 0,
-            media,
             expires: if media { expires } else { None },
             _charge: charge,
+            _slot: slot,
+            _media_slot: media_slot,
         });
-        self.media_count += usize::from(media);
         Ok(())
+    }
+}
+
+/// Sole TCP writer; cancellation retains exact offsets and cannot interleave frames.
+pub struct ProxyWriter<S> {
+    stream: S,
+    output: ProxyOutput,
+    receiver: mpsc::Receiver<Queued>,
+    current: Option<Queued>,
+}
+
+impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
+    /// Prepare bounded accounting outside any real-time callback.
+    pub fn new(stream: S) -> Self {
+        let (sender, receiver) = mpsc::channel(64);
+        Self {
+            stream,
+            receiver,
+            current: None,
+            output: ProxyOutput {
+                sender,
+                slots: Arc::new(Semaphore::new(64)),
+                media_slots: Arc::new(Semaphore::new(56)),
+                budget: Arc::new(Budget::default()),
+            },
+        }
+    }
+
+    /// Clone only queue admission, never the socket or its partial-write cursor.
+    pub fn output(&self) -> ProxyOutput {
+        self.output.clone()
+    }
+
+    /// Admit through the same budget used by concurrent peer workers.
+    pub fn try_queue(
+        &mut self,
+        record: ProxyRecord<'_>,
+        expires: Option<Instant>,
+    ) -> Result<(), QueueError> {
+        self.output.try_queue(record, expires)
     }
 
     /// Queued payload bytes, including the partially submitted frame until completion.
     pub fn queued_bytes(&self) -> usize {
-        self.budget.retained_bytes()
+        self.output.budget.retained_bytes()
+    }
+
+    /// Wait for actual queued work, then flush one frame. Both queue receive and
+    /// partial writes are cancellation-safe when selected alongside account input.
+    pub async fn flush_next(&mut self) -> Result<FlushOutcome, ProxyError> {
+        if self.current.is_none() {
+            self.current = self.receiver.recv().await;
+        }
+        self.flush_one(Instant::now()).await
     }
 
     /// Send at most one record. Cancellation retains its exact offset; even an expired
     /// media record must finish if one byte was sent. Other accounts run independently.
     pub async fn flush_one(&mut self, now: Instant) -> Result<FlushOutcome, ProxyError> {
-        let Some(front) = self.queue.front_mut() else {
+        if self.current.is_none() {
+            self.current = self.receiver.try_recv().ok();
+        }
+        let Some(front) = self.current.as_mut() else {
             return Ok(FlushOutcome::Empty);
         };
         if front.offset == 0 && front.expires.is_some_and(|deadline| now >= deadline) {
-            let removed = self.queue.pop_front().unwrap();
-            self.media_count -= usize::from(removed.media);
+            self.current = None;
             return Ok(FlushOutcome::Skipped);
         }
         while front.offset < front.wire.len() {
@@ -254,8 +312,7 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
             }
             front.offset += count;
         }
-        let removed = self.queue.pop_front().unwrap();
-        self.media_count -= usize::from(removed.media);
+        self.current = None;
         Ok(FlushOutcome::Sent)
     }
 }

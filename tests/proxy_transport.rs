@@ -275,3 +275,56 @@ fn proxy_output_reserves_control_bytes_and_sheds_only_unsent_expired_media() {
         );
     });
 }
+
+#[test]
+fn concurrent_proxy_senders_share_one_slot_budget_and_wake_the_existing_writer() {
+    run(async {
+        let (output, mut sink) = tokio::io::duplex(4096);
+        let mut writer = ProxyWriter::new(output);
+        let first = writer.output();
+        let second = first.clone();
+        let now = Instant::now();
+        let media = ProxyRecord {
+            kind: ProxyKind::UdpData,
+            address: Ipv4Addr::LOCALHOST,
+            payload: b"a",
+        };
+        let control = ProxyRecord {
+            kind: ProxyKind::UdpControl,
+            address: Ipv4Addr::LOCALHOST,
+            payload: b"c",
+        };
+        for _ in 0..56 {
+            first.try_queue(media, Some(now)).unwrap();
+        }
+        assert_eq!(second.try_queue(media, None), Err(QueueError::Full));
+        for _ in 0..8 {
+            second.try_queue(control, None).unwrap();
+        }
+        assert_eq!(writer.try_queue(control, None), Err(QueueError::Full));
+        assert_eq!(writer.queued_bytes(), 64);
+        assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
+        first.try_queue(media, Some(now)).unwrap();
+        for _ in 0..55 {
+            assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
+        }
+        for _ in 0..8 {
+            assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Sent);
+        }
+        assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
+        assert_eq!(writer.queued_bytes(), 0);
+        let mut bytes = [0; 80];
+        sink.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes.as_slice(), record(6, [127, 0, 0, 1], b"c").repeat(8));
+
+        let peer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            second.try_queue(control, None).unwrap();
+        });
+        // This waits for producer notification, not an idle writability polling loop.
+        assert_eq!(writer.flush_next().await.unwrap(), FlushOutcome::Sent);
+        peer.await.unwrap();
+        drop(writer);
+        assert_eq!(first.try_queue(control, None), Err(QueueError::Closed));
+    });
+}
