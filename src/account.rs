@@ -1,5 +1,7 @@
 //! Serialized account admission and EchoLink-only first-talker ownership.
 
+pub mod directory;
+
 use crate::directory::{DirectoryEntry, DirectorySnapshot};
 use std::{
     collections::BTreeMap,
