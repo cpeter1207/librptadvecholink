@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Require complete line and branch coverage for production Rust code."""
 
 from __future__ import annotations
