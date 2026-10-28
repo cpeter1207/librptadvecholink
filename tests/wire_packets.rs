@@ -306,3 +306,56 @@ fn malformed_is_not_close_and_short_output_is_unchanged() {
     );
     assert_eq!(short, [0xa5; 143]);
 }
+
+#[test]
+fn outbound_chat_and_station_info_keep_distinct_reference_grammars() {
+    use rptadv_echolink::wire::{write_chat, write_station_info};
+    let mut output = [0xa5; 256];
+    let length = write_chat("K1ABC-R", "Hello, world.", &mut output).unwrap();
+    assert_eq!(&output[..length], b"oNDATAK1ABC-R>Hello, world.\r\n\0");
+    assert_eq!(
+        parse_datagram(Channel::Audio, &output[..length]).unwrap(),
+        WirePacket::Chat {
+            sender: "K1ABC-R",
+            body: "Hello, world."
+        }
+    );
+    let length = write_station_info("K1ABC-R\nRepeater\r\nStatus", &mut output).unwrap();
+    assert_eq!(&output[..length], b"oNDATA\rK1ABC-R\rRepeater\rStatus\0");
+    assert!(matches!(
+        parse_datagram(Channel::Audio, &output[..length]).unwrap(),
+        WirePacket::StationInfo(_)
+    ));
+    let mut short = [0xa5; 3];
+    assert!(matches!(
+        write_chat("K1ABC-R", "Hello", &mut short),
+        Err(WireError::Capacity(_))
+    ));
+    assert!(matches!(
+        write_station_info("Station", &mut short),
+        Err(WireError::Capacity(_))
+    ));
+    assert_eq!(short, [0xa5; 3]);
+    for (sender, body) in [
+        ("bad>sender", "text"),
+        ("K1ABC-R", "text\0bad"),
+        ("K1ABC-R", "text\r\ncommand"),
+    ] {
+        assert_eq!(
+            write_chat(sender, body, &mut output),
+            Err(WireError::Malformed)
+        );
+    }
+    assert_eq!(
+        write_chat("K1ABC-R", &"x".repeat(4097), &mut output),
+        Err(WireError::TooLarge)
+    );
+    assert_eq!(
+        write_station_info("text\0hidden", &mut output),
+        Err(WireError::Malformed)
+    );
+    assert_eq!(
+        write_station_info(&"x".repeat(65500), &mut output),
+        Err(WireError::TooLarge)
+    );
+}

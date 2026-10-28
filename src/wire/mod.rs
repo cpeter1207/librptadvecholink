@@ -2,6 +2,7 @@
 mod control;
 mod proxy;
 mod text;
+pub use text::{write_chat, write_station_info};
 mod voice;
 pub use control::{ControlPacket, write_control};
 pub use proxy::{ProxyDecoder, ProxyKind, ProxyRecord};
