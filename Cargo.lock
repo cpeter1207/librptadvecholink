@@ -233,6 +233,7 @@ dependencies = [
  "md-5",
  "rptadv-codec-client",
  "rptadv-jitter-client",
+ "rptadv-peer-support",
  "rtcp",
  "rtp",
  "serde",
@@ -490,6 +491,14 @@ dependencies = [
 name = "rptadv-jitter-client"
 version = "0.1.0-alpha17"
 source = "git+https://github.com/cpeter1207/rpt_advanced?rev=a151c00450937c5316607c80cd37bbedb12fc5e0#a151c00450937c5316607c80cd37bbedb12fc5e0"
+
+[[package]]
+name = "rptadv-peer-support"
+version = "0.1.0-alpha17"
+source = "git+https://github.com/cpeter1207/rpt_advanced?rev=f9b04ba2e9c1c6d6c839668cc089470ca781d2a7#f9b04ba2e9c1c6d6c839668cc089470ca781d2a7"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "rtcp"

@@ -9,8 +9,15 @@ pub mod playout;
 pub mod session;
 pub mod transport;
 pub mod wire;
-use ffi::{Account, AccountConfig, AccountSecrets, Context, Descriptor, RuntimeConfig, Status};
+use ffi::{AccountConfig, AccountSecrets, Descriptor, RuntimeConfig, Status};
 use std::{mem::size_of, ptr, sync::Arc};
+
+struct Context {
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+struct Account {
+    _runtime: Arc<tokio::runtime::Runtime>,
+}
 
 static DESCRIPTOR: Descriptor = Descriptor {
     struct_size: size_of::<Descriptor>() as u32,
@@ -52,7 +59,7 @@ unsafe fn record<'a, T>(pointer: *const T) -> Option<&'a T> {
 
 unsafe extern "C" fn context_create(
     config: *const RuntimeConfig,
-    output: *mut *mut Context,
+    output: *mut *mut ffi::Context,
 ) -> Status {
     // SAFETY: caller owns writable output when it is nonnull.
     let Some(output) = (unsafe { output.as_mut() }) else {
@@ -81,22 +88,23 @@ unsafe extern "C" fn context_create(
     };
     *output = Box::into_raw(Box::new(Context {
         runtime: Arc::new(runtime),
-    }));
+    }))
+    .cast();
     Status::Ok
 }
 
-unsafe extern "C" fn context_destroy(context: *mut Context) {
+unsafe extern "C" fn context_destroy(context: *mut ffi::Context) {
     if !context.is_null() {
         // SAFETY: caller transfers its once-owned live context allocation.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Box::from_raw(context.cast::<Context>()) });
     }
 }
 
 unsafe extern "C" fn account_prepare(
-    context: *mut Context,
+    context: *mut ffi::Context,
     config: *const AccountConfig,
     _secrets: *const AccountSecrets,
-    output: *mut *mut Account,
+    output: *mut *mut ffi::Account,
 ) -> Status {
     // SAFETY: caller owns writable output when it is nonnull.
     let Some(output) = (unsafe { output.as_mut() }) else {
@@ -104,7 +112,7 @@ unsafe extern "C" fn account_prepare(
     };
     *output = ptr::null_mut();
     // SAFETY: context is borrowed from its live owner for this call.
-    let Some(context) = (unsafe { context.as_ref() }) else {
+    let Some(context) = (unsafe { context.cast::<Context>().as_ref() }) else {
         return Status::Invalid;
     };
     // SAFETY: configuration follows the sized-record contract.
@@ -120,11 +128,12 @@ unsafe extern "C" fn account_prepare(
     }
     *output = Box::into_raw(Box::new(Account {
         _runtime: Arc::clone(&context.runtime),
-    }));
+    }))
+    .cast();
     Status::Ok
 }
 
-unsafe extern "C" fn account_stop(account: *mut Account) -> Status {
+unsafe extern "C" fn account_stop(account: *mut ffi::Account) -> Status {
     if account.is_null() {
         Status::Invalid
     } else {
@@ -132,9 +141,9 @@ unsafe extern "C" fn account_stop(account: *mut Account) -> Status {
     }
 }
 
-unsafe extern "C" fn account_destroy(account: *mut Account) {
+unsafe extern "C" fn account_destroy(account: *mut ffi::Account) {
     if !account.is_null() {
         // SAFETY: caller transfers its once-owned account after callbacks have stopped.
-        drop(unsafe { Box::from_raw(account) });
+        drop(unsafe { Box::from_raw(account.cast::<Account>()) });
     }
 }
