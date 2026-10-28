@@ -122,6 +122,25 @@ impl Playout {
         })
     }
 
+    /// Inspect framing before requesting first-talker ownership. This does not decode,
+    /// advance history, admit a jitter packet or prime a timeline. Invalid wire input
+    /// is not a provider failure; endpoint/session authentication remains separate.
+    pub fn validate(&self, packet: &VoicePacket<'_>) -> Result<bool, MediaError> {
+        if packet.codec != self.codec
+            || packet.payload.is_empty()
+            || packet.payload.len() > MAX_PAYLOAD
+        {
+            return Ok(false);
+        }
+        match self.decoder.inspect(packet.payload) {
+            Ok(info) => Ok(info.frames == FRAMES as u32),
+            Err(error) if matches!(error.status, Status::Malformed | Status::Unsupported) => {
+                Ok(false)
+            }
+            Err(error) => Err(MediaError::Provider(error)),
+        }
+    }
+
     /// Inspect before timeline changes; zero RTP timestamp/SSRC is valid, not authentication.
     /// The authenticated router and selected-talker gate must run before this operation.
     pub fn receive(
@@ -132,16 +151,8 @@ impl Playout {
         if self.pending.is_some() || self.ending {
             return Ok(Reception::Busy);
         }
-        if packet.codec != self.codec || packet.payload.is_empty() {
+        if !self.validate(&packet)? {
             return Ok(Reception::Invalid);
-        }
-        match self.decoder.inspect(packet.payload) {
-            Ok(info) if info.frames == FRAMES as u32 => (),
-            Ok(_) => return Ok(Reception::Invalid),
-            Err(error) if matches!(error.status, Status::Malformed | Status::Unsupported) => {
-                return Ok(Reception::Invalid);
-            }
-            Err(error) => return Err(MediaError::Provider(error)),
         }
         // Start one epoch above zero so an immediately reordered predecessor remains representable.
         // A non-rewinding high-water mark unwraps 65535 -> 0 independently of unreliable RTP time.

@@ -72,6 +72,45 @@ fn voice(bytes: &[u8]) -> VoicePacket<'_> {
     packet.timestamp = 0; // Real EchoLink implementations need not supply a useful RTP clock.
     packet
 }
+
+#[test]
+fn codec_preflight_rejects_contenders_without_priming_a_media_timeline() {
+    let providers = Providers::new();
+    let now = Instant::now();
+    for codec in [Codec::GsmFr, Codec::Speex] {
+        let mut playout = providers.playout(codec, now);
+        let packets = providers.packets(codec, 1, 1);
+        let packet = voice(&packets[0]);
+        assert!(playout.validate(&packet).unwrap());
+        assert!(playout.validate(&packet).unwrap());
+        for payload in [&[][..], &[0][..], &[0; 253][..]] {
+            assert!(
+                !playout
+                    .validate(&VoicePacket { payload, ..packet })
+                    .unwrap()
+            );
+        }
+        let other = if codec == Codec::GsmFr {
+            Codec::Speex
+        } else {
+            Codec::GsmFr
+        };
+        assert!(
+            !playout
+                .validate(&VoicePacket {
+                    codec: other,
+                    ..packet
+                })
+                .unwrap()
+        );
+        assert_eq!(playout.observe().unwrap().queued_packets, 0);
+        assert_eq!(
+            playout.receive(packet, now).unwrap(),
+            Reception::Admitted(Admission::Accepted)
+        );
+        assert_eq!(playout.observe().unwrap().queued_packets, 1);
+    }
+}
 #[derive(Default)]
 struct Sink {
     next: u64,
