@@ -15,3 +15,4 @@ jobs:
     with:
       code_ref: ${{ github.sha }}
       full: ${{ github.event_name != 'push' }}
+      quality_image: ghcr.io/cpeter1207/rptadv-echolink-quality-debian13:latest
