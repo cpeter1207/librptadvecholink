@@ -95,14 +95,8 @@ fn codec_preflight_rejects_contenders_without_priming_a_media_timeline() {
         } else {
             Codec::GsmFr
         };
-        assert!(
-            !playout
-                .validate(&VoicePacket {
-                    codec: other,
-                    ..packet
-                })
-                .unwrap()
-        );
+        let other_packets = providers.packets(other, 1, 1);
+        assert!(playout.validate(&voice(&other_packets[0])).unwrap());
         assert_eq!(playout.observe().unwrap().queued_packets, 0);
         assert_eq!(
             playout.receive(packet, now).unwrap(),
@@ -116,6 +110,7 @@ struct Sink {
     next: u64,
     audio: Vec<f32>,
     gaps: u64,
+    concealed: u64,
     limit: usize,
 }
 impl PcmSink for Sink {
@@ -132,6 +127,11 @@ impl PcmSink for Sink {
         self.gaps += u64::from(count);
         self.next += u64::from(count);
         count
+    }
+    fn concealed(&mut self, source_start: u64, pcm: &[f32]) -> usize {
+        let accepted = self.audio(source_start, pcm);
+        self.concealed += accepted as u64;
+        accepted
     }
 }
 fn drain(playout: &mut Playout, origin: Instant, sink: &mut Sink) {
@@ -197,6 +197,57 @@ fn sequence_wrap_zero_timestamp_and_reordering_preserve_every_sample() {
 }
 
 #[test]
+fn one_receive_timeline_reorders_mixed_codecs_and_uses_each_packets_decoder() {
+    let providers = Providers::new();
+    let origin = Instant::now();
+    let codecs = [Codec::GsmFr, Codec::Speex, Codec::GsmFr, Codec::Speex];
+    let packets: Vec<_> = codecs
+        .iter()
+        .enumerate()
+        .map(|(index, codec)| providers.packets(*codec, index as u16, 1).remove(0))
+        .collect();
+    let mut playout = providers.playout(Codec::GsmFr, origin);
+    // Reorder across a codec transition without resetting the shared sequence timeline.
+    for (index, millis) in [(0, 0), (2, 80), (1, 90), (3, 160)] {
+        assert_eq!(
+            playout
+                .receive(
+                    voice(&packets[index]),
+                    origin + Duration::from_millis(millis)
+                )
+                .unwrap(),
+            Reception::Admitted(Admission::Accepted)
+        );
+    }
+    let mut sink = Sink {
+        limit: 37,
+        ..Default::default()
+    };
+    drain(&mut playout, origin, &mut sink);
+    assert_eq!((sink.next, sink.gaps), (2560, 0));
+    let mut gsm = providers
+        .catalog
+        .decoder(ProfileId::GsmFr, 0, 640, 252)
+        .unwrap();
+    let mut speex = providers
+        .catalog
+        .decoder(ProfileId::Speex, 0, 640, 252)
+        .unwrap();
+    let mut expected = Vec::new();
+    for (codec, bytes) in codecs.into_iter().zip(&packets) {
+        let decoder = if codec == Codec::GsmFr {
+            &mut gsm
+        } else {
+            &mut speex
+        };
+        let mut pcm = [0.0; 640];
+        decoder.decode(voice(bytes).payload, &mut pcm).unwrap();
+        expected.extend_from_slice(&pcm);
+    }
+    assert_eq!(sink.audio, expected);
+}
+
+#[test]
 fn missing_audio_uses_native_codec_plc_before_ring_fallback_and_never_runs_past_tail() {
     let providers = Providers::new();
     let origin = Instant::now();
@@ -218,10 +269,15 @@ fn missing_audio_uses_native_codec_plc_before_ring_fallback_and_never_runs_past_
                 sink.gaps, 640,
                 "unsupported codec PLC falls back to the ring"
             );
+            assert_eq!(sink.concealed, 0);
         } else {
             assert_eq!(
                 sink.gaps, 0,
                 "Speex PLC must remain enabled for complete coding units"
+            );
+            assert_eq!(
+                sink.concealed, 640,
+                "native PLC must be distinguishable from received DTMF"
             );
         }
     }

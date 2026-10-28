@@ -110,6 +110,50 @@ fn gsm_80ms_roundtrip_uses_four_raw_units_and_keeps_prepared_bytes_on_retry() {
 }
 
 #[test]
+fn late_speex_upgrade_preserves_pending_bytes_partial_pcm_and_one_sequence_clock() {
+    let catalog = catalog();
+    for pending in [false, true] {
+        let mut encoder = Packetizer::new(&catalog, Codec::GsmFr, 0.0, 65535, 42).unwrap();
+        let mut before = None;
+        if pending {
+            encoder.push(&source(640)).unwrap();
+            before = Some(encoder.packet().unwrap().bytes.clone());
+        } else {
+            encoder.push(&source(320)).unwrap();
+        }
+        encoder.upgrade_speex(&catalog).unwrap();
+        encoder.upgrade_speex(&catalog).unwrap();
+        if let Some(before) = before {
+            assert_eq!(encoder.packet().unwrap().bytes, before);
+            encoder.retire().unwrap();
+            encoder.push(&source(640)).unwrap();
+        } else {
+            encoder.push(&source(320)).unwrap();
+        }
+        let first = encoder.packet().unwrap();
+        let packet = voice(&first.bytes);
+        assert_eq!(
+            (packet.codec, packet.sequence, packet.timestamp, packet.ssrc),
+            (
+                Codec::Speex,
+                if pending { 0 } else { 65535 },
+                if pending { 640 } else { 0 },
+                42
+            )
+        );
+        let base = if pending { 640 } else { 0 };
+        // The selected narrowband provider reports forty samples of encoder lookahead.
+        assert_eq!((first.source_start, first.source_frames), (base, 600));
+        encoder.finish().unwrap();
+        encoder.retire().unwrap();
+        let tail = encoder.packet().unwrap();
+        assert_eq!((tail.source_start, tail.source_frames), (base + 600, 40));
+        encoder.retire().unwrap();
+        assert!(encoder.drained());
+    }
+}
+
+#[test]
 fn speex_packet_is_one_four_frame_bitstream_and_lookahead_survives_finite_tail() {
     let catalog = catalog();
     for count in [1, 620, 640, 1260] {

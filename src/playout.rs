@@ -18,6 +18,11 @@ const MAX_PAYLOAD: usize = 252;
 pub trait PcmSink {
     /// Accept exactly a prefix of normalized 8 kHz PCM, returning its length.
     fn audio(&mut self, source_start: u64, pcm: &[f32]) -> usize;
+    /// Accept native codec PLC without presenting it to an in-band DTMF detector.
+    /// Ordinary audio-only sinks may consume it identically to received PCM.
+    fn concealed(&mut self, source_start: u64, pcm: &[f32]) -> usize {
+        self.audio(source_start, pcm)
+    }
     /// Accept exactly a prefix of an ordered missing interval for ring fallback PLC.
     fn gap(&mut self, source_start: u64, samples: u32) -> u32;
 }
@@ -50,16 +55,17 @@ pub enum Progress {
 /// Storage holds only one decoded packet and one fetched decision, never another PCM ring.
 pub struct Playout {
     jitter: Jitter,
-    decoder: Decoder,
-    codec: Codec,
+    decoders: [Option<Decoder>; 2],
+    last_codec: Codec,
     gain: f32,
     origin: Instant,
     highest: Option<u64>,
-    encoded: [u8; MAX_PAYLOAD],
+    encoded: [u8; MAX_PAYLOAD + 1],
     pending: Option<Decision>,
     prefix: u32,
     remaining: u32,
     decoded: bool,
+    concealed: bool,
     pcm: [f32; FRAMES],
     position: usize,
     count: usize,
@@ -75,6 +81,8 @@ pub struct Playout {
 impl Playout {
     /// Compose the retained 160/180/500 ms jitter policy and an always-PLC-enabled codec.
     /// Gain is applied once after decode/concealment; all work is off radio callbacks.
+    /// `codec` is only the initial PLC hint, not a receive-format restriction. Each
+    /// queued packet retains its own format on the single shared jitter timeline.
     /// # Safety
     /// The jitter descriptor must be readable and its DSO retained through this object's drop.
     pub unsafe fn new(
@@ -88,27 +96,32 @@ impl Playout {
         if !gain_db.is_finite() || !gain.is_finite() {
             return Err(MediaError::Invalid);
         }
-        let profile = match codec {
-            Codec::GsmFr => ProfileId::GsmFr,
-            Codec::Speex => ProfileId::Speex,
-        };
-        let decoder = catalog
-            .decoder(profile, 0, FRAMES as u32, MAX_PAYLOAD)
+        let gsm = catalog
+            .decoder(ProfileId::GsmFr, 0, FRAMES as u32, MAX_PAYLOAD)
             .map_err(MediaError::Provider)?;
-        let jitter = unsafe { Jitter::new_at_rate(descriptor, 8000, 160, MAX_PAYLOAD) }
+        let speex = catalog
+            .profile(ProfileId::Speex)
+            .map(|_| catalog.decoder(ProfileId::Speex, 0, FRAMES as u32, MAX_PAYLOAD))
+            .transpose()
+            .map_err(MediaError::Provider)?;
+        if codec == Codec::Speex && speex.is_none() {
+            return Err(MediaError::Invalid);
+        }
+        let jitter = unsafe { Jitter::new_at_rate(descriptor, 8000, 160, MAX_PAYLOAD + 1) }
             .map_err(MediaError::Jitter)?;
         Ok(Self {
             jitter,
-            decoder,
-            codec,
+            decoders: [Some(gsm), speex],
+            last_codec: codec,
             gain,
             origin,
             highest: None,
-            encoded: [0; MAX_PAYLOAD],
+            encoded: [0; MAX_PAYLOAD + 1],
             pending: None,
             prefix: 0,
             remaining: 0,
             decoded: false,
+            concealed: false,
             pcm: [0.0; FRAMES],
             position: 0,
             count: 0,
@@ -126,13 +139,13 @@ impl Playout {
     /// advance history, admit a jitter packet or prime a timeline. Invalid wire input
     /// is not a provider failure; endpoint/session authentication remains separate.
     pub fn validate(&self, packet: &VoicePacket<'_>) -> Result<bool, MediaError> {
-        if packet.codec != self.codec
-            || packet.payload.is_empty()
-            || packet.payload.len() > MAX_PAYLOAD
-        {
+        if packet.payload.is_empty() || packet.payload.len() > MAX_PAYLOAD {
             return Ok(false);
         }
-        match self.decoder.inspect(packet.payload) {
+        let Some(decoder) = self.decoders[codec_index(packet.codec)].as_ref() else {
+            return Ok(false);
+        };
+        match decoder.inspect(packet.payload) {
             Ok(info) => Ok(info.frames == FRAMES as u32),
             Err(error) if matches!(error.status, Status::Malformed | Status::Unsupported) => {
                 Ok(false)
@@ -168,9 +181,19 @@ impl Playout {
         let timestamp = sequence
             .checked_mul(FRAMES as u64)
             .ok_or(MediaError::Contract)?;
+        // The neutral jitter capability retains opaque bytes. One private byte
+        // preserves codec identity through reordering without another jitter queue.
+        let mut tagged = [0; MAX_PAYLOAD + 1];
+        tagged[0] = codec_index(packet.codec) as u8;
+        tagged[1..1 + packet.payload.len()].copy_from_slice(packet.payload);
         let admission = self
             .jitter
-            .put(timestamp, FRAMES as u32, self.ns(arrival), packet.payload)
+            .put(
+                timestamp,
+                FRAMES as u32,
+                self.ns(arrival),
+                &tagged[..1 + packet.payload.len()],
+            )
             .map_err(MediaError::Jitter)?;
         if admission == Admission::Accepted {
             self.highest = Some(self.highest.unwrap_or(sequence).max(sequence));
@@ -197,7 +220,9 @@ impl Playout {
             return Err(MediaError::Contract);
         }
         self.jitter.reset().map_err(MediaError::Jitter)?;
-        self.decoder.reset().map_err(MediaError::Provider)?;
+        for decoder in self.decoders.iter_mut().flatten() {
+            decoder.reset().map_err(MediaError::Provider)?;
+        }
         self.highest = None;
         self.tail_end = None;
         self.released_to = 0;
@@ -266,7 +291,12 @@ impl Playout {
             count as usize
         } else {
             let available = self.count - self.position;
-            let count = sink.audio(self.output, &self.pcm[self.position..self.count]);
+            let pcm = &self.pcm[self.position..self.count];
+            let count = if self.concealed {
+                sink.concealed(self.output, pcm)
+            } else {
+                sink.audio(self.output, pcm)
+            };
             if count > available {
                 return Err(MediaError::Contract);
             }
@@ -291,6 +321,7 @@ impl Playout {
     fn prepare(&mut self) -> Result<(), MediaError> {
         self.count = 0;
         self.position = 0;
+        self.concealed = false;
         let decision = self.pending.as_ref().expect("fetched jitter decision");
         if self.prefix != 0 {
             let span = self.prefix.min(FRAMES as u32);
@@ -298,10 +329,28 @@ impl Playout {
             return self.prepare_gap(span, true);
         }
         if decision.kind == Kind::Packet && !self.decoded {
-            self.count = self
-                .decoder
-                .decode_recovering(&self.encoded[..decision.length], &mut self.pcm)
-                .map_err(MediaError::Provider)?;
+            self.last_codec = match self.encoded[0] {
+                0 => Codec::GsmFr,
+                1 => Codec::Speex,
+                _ => return Err(MediaError::Contract),
+            };
+            let payload = self
+                .encoded
+                .get(1..decision.length)
+                .ok_or(MediaError::Contract)?;
+            let decoder = self.decoders[codec_index(self.last_codec)]
+                .as_mut()
+                .ok_or(MediaError::Contract)?;
+            self.count = match decoder.decode(payload, &mut self.pcm) {
+                Err(error) if error.status == Status::Malformed => {
+                    // Preflight already established this packet's 640-frame span.
+                    // Retain native PLC provenance as well as the recovered samples.
+                    self.concealed = true;
+                    decoder.conceal(FRAMES as u32, &mut self.pcm)
+                }
+                result => result,
+            }
+            .map_err(MediaError::Provider)?;
             let skip = decision.start_offset.saturating_neg().max(0) as usize;
             if skip > FRAMES || (self.count != 0 && self.count != FRAMES) {
                 return Err(MediaError::Contract);
@@ -328,7 +377,9 @@ impl Playout {
         // Insertions add playout time without advancing source decoder history.
         // Only genuine missing/damaged source media requests native codec PLC first.
         self.count = if missing {
-            self.decoder
+            self.decoders[codec_index(self.last_codec)]
+                .as_mut()
+                .ok_or(MediaError::Contract)?
                 .conceal(span, &mut self.pcm)
                 .map_err(MediaError::Provider)?
         } else {
@@ -337,6 +388,7 @@ impl Playout {
         if self.count == 0 {
             self.gap = span;
         } else {
+            self.concealed = true;
             for sample in &mut self.pcm[..self.count] {
                 *sample *= self.gain;
             }
@@ -364,5 +416,12 @@ impl Playout {
         time.saturating_duration_since(self.origin)
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64
+    }
+}
+
+fn codec_index(codec: Codec) -> usize {
+    match codec {
+        Codec::GsmFr => 0,
+        Codec::Speex => 1,
     }
 }

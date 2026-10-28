@@ -74,6 +74,8 @@ pub struct EncodedPacket {
 /// the codec, never concatenate independently terminated Speex bitstreams.
 pub struct Packetizer {
     encoder: Encoder,
+    upgrade: Option<(Encoder, u64)>,
+    encoder_base: u64,
     codec: Codec,
     gain: f32,
     pcm: [f32; FRAMES],
@@ -112,6 +114,8 @@ impl Packetizer {
             .map_err(MediaError::Provider)?;
         Ok(Self {
             encoder,
+            upgrade: None,
+            encoder_base: 0,
             codec,
             gain,
             pcm: [0.0; FRAMES],
@@ -125,6 +129,23 @@ impl Packetizer {
             clock: 0,
             source,
         })
+    }
+
+    /// Schedule the authenticated, monotonic GSM-to-Speex upgrade at the next
+    /// coding boundary. Already prepared bytes, partial PCM and RTP timing survive.
+    /// Encoder creation occurs only on the non-audio owner.
+    pub fn upgrade_speex(&mut self, catalog: &CodecCatalog) -> Result<(), MediaError> {
+        if self.codec == Codec::Speex || self.upgrade.is_some() {
+            return Ok(());
+        }
+        let profile = catalog
+            .profile(ProfileId::Speex)
+            .ok_or(MediaError::Invalid)?;
+        let encoder = catalog
+            .encoder(ProfileId::Speex, 0, FRAMES as u32, MAX_ENCODED)
+            .map_err(MediaError::Provider)?;
+        self.upgrade = Some((encoder, u64::from(profile.lookahead_frames)));
+        Ok(())
     }
 
     /// Accept only the available prefix; a retained packet prevents further acceptance.
@@ -185,6 +206,7 @@ impl Packetizer {
         self.finishing = false;
         self.real = 0;
         self.wire = 0;
+        self.encoder_base = 0;
         Ok(())
     }
 
@@ -201,6 +223,12 @@ impl Packetizer {
     }
 
     fn render(&mut self) -> Result<(), MediaError> {
+        if let Some((encoder, lookahead)) = self.upgrade.take() {
+            self.encoder = encoder;
+            self.lookahead = lookahead;
+            self.encoder_base = self.wire;
+            self.codec = Codec::Speex;
+        }
         let mut encoded = [0; MAX_ENCODED];
         // Wire padding is already explicit PCM. The generic finite-flush operation
         // rounds to codec units, not EchoLink's four-unit packet, so do not use it.
@@ -227,9 +255,12 @@ impl Packetizer {
             &mut bytes,
         )
         .map_err(MediaError::Wire)?;
-        let start = result.source_start_frames.min(self.real);
-        let end = result
-            .source_start_frames
+        let source_start = self
+            .encoder_base
+            .checked_add(result.source_start_frames)
+            .ok_or(MediaError::Contract)?;
+        let start = source_start.min(self.real);
+        let end = source_start
             .saturating_add(u64::from(result.source_frames))
             .min(self.real);
         self.pending = Some(EncodedPacket {
