@@ -146,7 +146,8 @@ impl Account {
                 Selection::Suppressed
             }
             Some(talker) => {
-                talker.last_packet = now;
+                // Concurrent routing may deliver an older arrival after a newer one.
+                talker.last_packet = talker.last_packet.max(now);
                 talker.keyed = true;
                 Selection::Selected
             }

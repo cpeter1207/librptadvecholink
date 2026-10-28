@@ -21,6 +21,35 @@ fn directory(now: Instant) -> DirectorySnapshot {
 }
 
 #[test]
+fn delayed_voice_offers_cannot_rewind_the_selected_talkers_quiet_timer() {
+    let now = Instant::now();
+    let mut account = Account::new(20, vec![], vec![]).unwrap();
+    account
+        .admit(
+            &directory(now),
+            "K1ABC-R",
+            Ipv4Addr::new(192, 0, 2, 1),
+            1,
+            now,
+        )
+        .unwrap();
+    assert_eq!(
+        account.voice(1, 1, now + Duration::from_secs(1)),
+        Selection::Selected
+    );
+    assert_eq!(account.voice(1, 1, now), Selection::Selected);
+    assert_eq!(account.poll(now + Duration::from_millis(1_100), true), None);
+    assert!(account.receiving());
+    assert_eq!(
+        account.poll(now + Duration::from_millis(1_320), true),
+        Some((1, 1))
+    );
+    assert_eq!(account.selected(), Some((1, 1)));
+    account.poll(now + Duration::from_millis(1_800), true);
+    assert_eq!(account.selected(), None);
+}
+
+#[test]
 fn deny_wins_after_directory_validation() {
     let now = Instant::now();
     let directory = directory(now);

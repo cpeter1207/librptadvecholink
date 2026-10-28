@@ -43,3 +43,12 @@ It covers standard RTCP padding, TOOL, and two non-SPEEX private items. Do not
 copy the official client's TOOL value into our outgoing identity. Endpoint
 admission tests must consume the recorded source-port variants separately;
 wire parsing cannot establish endpoint authorization.
+
+Directory request tests follow ASL3 `chan_echolink.c` at the same pinned ASL
+revision: online registration uses the `1.00R` station or `1.00B` conference
+label, local hour/day, display field and email; `F` requests retain the full
+49-byte snapshot token. Offline framing follows EchoLib's `OFF-V3.40` request.
+These are directory application labels, not RTP protocol-version negotiation.
+Loopback fixtures use reserved example identities/passwords, split framed
+replies, full/delta publication and finite shutdown; they do not log in to a
+public service.

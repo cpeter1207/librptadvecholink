@@ -50,6 +50,44 @@ fn establish(call: &mut Qso, generation: u64, now: Instant) {
 }
 
 #[test]
+fn delayed_valid_packets_cannot_rewind_media_or_liveness_deadlines() {
+    let now = Instant::now();
+    for old in [
+        Packet::Report { source: 0 },
+        Packet::Sdes {
+            callsign: "K1ABC-R".into(),
+            source: 0,
+        },
+        Packet::Voice { source: 0 },
+    ] {
+        let mut call = qso(now, 1);
+        establish(&mut call, 1, now);
+        assert_eq!(
+            call.handle(
+                1,
+                packet(Packet::Voice { source: 0 }),
+                now + Duration::from_secs(20)
+            ),
+            Some(QsoAction::Voice)
+        );
+        call.handle(1, packet(old), now + Duration::from_secs(10));
+        assert!(call.raw_receiving(now + Duration::from_millis(20_100)));
+        assert_eq!(
+            call.handle(1, QsoEvent::Poll, now + Duration::from_secs(110)),
+            Some(QsoAction::Heartbeat)
+        );
+        assert_eq!(call.state(), QsoState::Connected);
+        assert_eq!(
+            call.handle(1, QsoEvent::Poll, now + Duration::from_secs(120)),
+            Some(QsoAction::Closing {
+                cause: Cause::LivenessExpired,
+                send_bye: true
+            })
+        );
+    }
+}
+
+#[test]
 fn heartbeat_silence_is_not_hangup() {
     let now = Instant::now();
     let mut call = qso(now, 1);

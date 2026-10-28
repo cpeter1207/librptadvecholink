@@ -227,7 +227,7 @@ impl Qso {
                         if source != 0 {
                             self.control_source = Some(source);
                         }
-                        self.last_valid = now;
+                        self.last_valid = self.last_valid.max(now);
                         if self.state == QsoState::Connecting {
                             self.state = QsoState::Connected;
                             Some(QsoAction::Connected)
@@ -242,15 +242,15 @@ impl Qso {
                         if source != 0 {
                             self.voice_source = Some(source);
                         }
-                        self.last_valid = now;
-                        self.last_voice = Some(now);
+                        self.last_valid = self.last_valid.max(now);
+                        self.last_voice = Some(self.last_voice.unwrap_or(now).max(now));
                         Some(QsoAction::Voice)
                     }
                     Packet::Report { source }
                         if self.state == QsoState::Connected
                             && matches_source(self.control_source, source) =>
                     {
-                        self.last_valid = now;
+                        self.last_valid = self.last_valid.max(now);
                         None
                     }
                     Packet::Bye { source }
