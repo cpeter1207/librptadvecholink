@@ -69,6 +69,55 @@ fn voice() -> Vec<u8> {
 }
 
 #[test]
+fn verified_control_can_alternate_source_ports_without_losing_its_session() {
+    let now = Instant::now();
+    let directory = directory(now);
+    let mut router = router();
+    let mut peer = router.dial(&directory, 1, now).unwrap();
+    // Issue 826 reports the same named station using both 5198 and 5199 for RTCP.
+    for port in [5198, 5199, 5198] {
+        assert!(matches!(
+            router.receive(
+                &directory,
+                Channel::Control,
+                endpoint(1, port),
+                now,
+                &sdes(1)
+            ),
+            RouteResult::Routed
+        ));
+        assert_eq!(peer.ingress.try_recv().unwrap().source(), endpoint(1, port));
+    }
+    for control in [
+        ControlPacket::Report { source: 1 },
+        ControlPacket::Bye {
+            source: 1,
+            reason: vec![],
+        },
+    ] {
+        let mut bytes = [0; 1024];
+        let length = write_control(&control, &mut bytes).unwrap();
+        for port in [5199, 5198] {
+            assert!(
+                matches!(
+                    router.receive(
+                        &directory,
+                        Channel::Control,
+                        endpoint(1, port),
+                        now,
+                        &bytes[..length]
+                    ),
+                    RouteResult::Routed
+                ),
+                "control={control:?} port={port} bytes={:?}",
+                &bytes[..length]
+            );
+            assert_eq!(peer.ingress.try_recv().unwrap().source(), endpoint(1, port));
+        }
+    }
+}
+
+#[test]
 fn unknown_flood_retains_only_bounded_verified_handshakes() {
     let now = Instant::now();
     let directory = directory(now);
@@ -308,6 +357,21 @@ fn shared_ip_is_not_itself_a_unique_station_identity() {
     // Both have zero/unknown voice SSRC. Never duplicate or guess the media owner.
     assert!(matches!(
         router.receive(&directory, Channel::Audio, endpoint(1, 5198), now, &voice()),
+        RouteResult::Dropped
+    ));
+    assert!(first.ingress.try_recv().is_none());
+    assert!(second.ingress.try_recv().is_none());
+    // A changed control port and zero SSRC cannot identify either shared-IP peer.
+    let mut control = [0; 1024];
+    let count = write_control(&ControlPacket::Report { source: 0 }, &mut control).unwrap();
+    assert!(matches!(
+        router.receive(
+            &directory,
+            Channel::Control,
+            endpoint(1, 5198),
+            now,
+            &control[..count]
+        ),
         RouteResult::Dropped
     ));
     assert!(first.ingress.try_recv().is_none());

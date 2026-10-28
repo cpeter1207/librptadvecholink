@@ -234,6 +234,35 @@ fn policy() -> DirectoryPolicy {
 }
 
 #[test]
+fn directory_deadlines_park_inflight_work_and_choose_the_next_real_operation() {
+    let now = Instant::now();
+    let mut owner =
+        DirectoryControl::new(vec!["directory.example.invalid".into()], policy()).unwrap();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    assert_eq!(owner.deadline(now), Some(now));
+    let register = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert_eq!(owner.deadline(now), None);
+    owner.finish(register.id, Ok(b"OK"), &mut snapshot, now);
+    assert_eq!(owner.deadline(now), Some(now));
+    let full = owner.poll(&snapshot, now).unwrap().unwrap();
+    owner.finish(full.id, Ok(b"@@@\n0:first\n+++\n"), &mut snapshot, now);
+    assert_eq!(owner.deadline(now), Some(now + Duration::from_secs(240)));
+    let later = now + Duration::from_secs(240);
+    let update = owner.poll(&snapshot, later).unwrap().unwrap();
+    owner.finish(
+        update.id,
+        Err(TransactionError::Timeout),
+        &mut snapshot,
+        later,
+    );
+    assert_eq!(owner.deadline(later), Some(later + Duration::from_secs(20)));
+    let logout = owner.stop().unwrap().unwrap();
+    assert_eq!(owner.deadline(later), None);
+    owner.finish(logout.id, Ok(b"OK"), &mut snapshot, later);
+    assert_eq!(owner.deadline(later), None);
+}
+
+#[test]
 fn ordered_server_failover_obeys_retry_deadlines_and_ignores_old_completions() {
     let now = Instant::now();
     let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));

@@ -212,6 +212,35 @@ impl DirectoryControl {
         self.failures
     }
 
+    /// Next due account operation; in-flight I/O has its own finite timeout.
+    /// The network owner waits on this deadline alongside packets and commands,
+    /// rather than periodically polling registration state during idle time.
+    pub fn deadline(&self, now: Instant) -> Option<Instant> {
+        if self.pending.is_some()
+            || matches!(
+                self.state,
+                DirectoryState::Stopping | DirectoryState::Stopped
+            )
+        {
+            return None;
+        }
+        if let Some(failed) = self.retry_since {
+            return failed.checked_add(self.policy.retry);
+        }
+        if self.must_register || self.last_registration.is_none() || self.last_snapshot.is_none() {
+            return Some(now);
+        }
+        [
+            self.last_registration
+                .and_then(|last| last.checked_add(self.policy.registration_refresh)),
+            self.last_snapshot
+                .and_then(|last| last.checked_add(self.policy.directory_refresh)),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// Start only a due operation. The worker applies the returned transport deadline.
     pub fn poll(
         &mut self,

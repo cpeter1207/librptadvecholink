@@ -171,12 +171,37 @@ impl Qso {
         self.first_cause
     }
 
+    /// Next control heartbeat/setup/liveness deadline for the existing serial owner.
+    /// Closing generations wait only for media drain, never a heartbeat polling loop.
+    pub fn deadline(&self) -> Option<Instant> {
+        let expiry = match self.state {
+            QsoState::Connecting => self.created.checked_add(self.timers.connect),
+            QsoState::Connected => self.last_valid.checked_add(self.timers.liveness),
+            QsoState::Closing | QsoState::Closed => return None,
+        };
+        [
+            expiry,
+            self.last_heartbeat.checked_add(self.timers.heartbeat),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// Raw packet activity only; the account separately reports selected/drained activity.
     pub fn raw_receiving(&self, now: Instant) -> bool {
         self.state == QsoState::Connected
             && self.last_voice.is_some_and(|last| {
                 now.saturating_duration_since(last) < Duration::from_millis(320)
             })
+    }
+
+    /// Schedule the raw receive-release guard independently from control heartbeats.
+    /// The account still waits for accepted media and the product ring to drain.
+    pub fn receive_deadline(&self, now: Instant) -> Option<Instant> {
+        self.last_voice
+            .filter(|_| self.raw_receiving(now))?
+            .checked_add(Duration::from_millis(320))
     }
 
     /// Consume one generation-fenced event outside real-time callbacks.

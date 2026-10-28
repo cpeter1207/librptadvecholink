@@ -82,12 +82,19 @@ impl Route {
                 ..
             }) => {
                 callsign.eq_ignore_ascii_case(&self.identity.callsign)
-                    && self.control_endpoint.is_none_or(|known| known == source)
                     && matches_source(self.control_source, *id)
             }
             WirePacket::Control(
                 ControlPacket::Report { source: id } | ControlPacket::Bye { source: id, .. },
-            ) => self.control_endpoint == Some(source) && matches_source(self.control_source, *id),
+            ) => {
+                self.control_endpoint.is_some()
+                    && matches_source(self.control_source, *id)
+                    // A verified station may alternate its RTCP source port. A shared
+                    // address still needs an exact endpoint or a nonzero bound SSRC.
+                    && (self.control_endpoint == Some(source)
+                        || only
+                        || (*id != 0 && self.control_source == Some(*id)))
+            }
             WirePacket::Voice(voice) => {
                 channel == Channel::Audio
                     && self.control_endpoint.is_some()

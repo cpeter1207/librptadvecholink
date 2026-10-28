@@ -50,6 +50,49 @@ fn establish(call: &mut Qso, generation: u64, now: Instant) {
 }
 
 #[test]
+fn qso_owner_waits_for_heartbeat_or_expiry_and_parks_closed_generations() {
+    let now = Instant::now();
+    let mut call = qso(now, 1);
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(10)));
+    for seconds in [10, 20] {
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(seconds));
+    }
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(30)));
+    establish(&mut call, 1, now + Duration::from_secs(25));
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(30)));
+    for seconds in (30..=120).step_by(10) {
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(seconds));
+    }
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(125)));
+    call.handle(1, QsoEvent::Poll, now + Duration::from_secs(125));
+    assert_eq!(call.state(), QsoState::Closing);
+    assert_eq!(call.deadline(), None);
+    call.handle(1, QsoEvent::Drained, now + Duration::from_secs(126));
+    assert_eq!(call.deadline(), None);
+}
+
+#[test]
+fn receive_release_is_a_real_deadline_not_a_heartbeat_side_effect() {
+    let now = Instant::now();
+    let mut call = qso(now, 1);
+    establish(&mut call, 1, now);
+    call.handle(1, packet(Packet::Voice { source: 0 }), now);
+    assert_eq!(
+        call.receive_deadline(now),
+        Some(now + Duration::from_millis(320))
+    );
+    assert_eq!(
+        call.receive_deadline(now + Duration::from_millis(320)),
+        None
+    );
+    call.handle(1, QsoEvent::Stop, now + Duration::from_millis(321));
+    assert_eq!(
+        call.receive_deadline(now + Duration::from_millis(321)),
+        None
+    );
+}
+
+#[test]
 fn delayed_valid_packets_cannot_rewind_media_or_liveness_deadlines() {
     let now = Instant::now();
     for old in [

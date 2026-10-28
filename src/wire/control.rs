@@ -87,12 +87,23 @@ fn packets(wire: &[u8]) -> Result<Packets, WireError> {
                 return Err(WireError::Malformed);
             }
             let end = packet.len() - padding;
-            if end % 4 != 0 {
-                return Err(WireError::Malformed);
+            if packet[1] == 203 {
+                // BYE's optional length-prefixed reason need not end on a word.
+                // The released parser needs the aligned envelope but does not
+                // exclude padding from its reason bound, so validate that here.
+                let reason = 4 + usize::from(packet[0] & 0x1f) * 4;
+                if reason > end || (reason < end && reason + 1 + usize::from(packet[reason]) > end)
+                {
+                    return Err(WireError::Malformed);
+                }
+            } else {
+                if end % 4 != 0 {
+                    return Err(WireError::Malformed);
+                }
+                packet.truncate(end);
+                packet[0] &= !0x20;
+                packet[2..4].copy_from_slice(&((end / 4 - 1) as u16).to_be_bytes());
             }
-            packet.truncate(end);
-            packet[0] &= !0x20;
-            packet[2..4].copy_from_slice(&((end / 4 - 1) as u16).to_be_bytes());
         }
         if matches!(packet[1], 202 | 203) && packet[0] & 0x1f != 1 {
             return Err(WireError::Malformed);

@@ -36,6 +36,24 @@ fn wire_reference_roundtrip() {
 }
 
 #[test]
+fn valid_bye_reason_padding_need_not_leave_a_word_aligned_body() {
+    // RR followed by a one-source BYE, empty reason and three padding bytes.
+    let mut bytes = hex("c0c9000100000000e1cb00020000000100000003");
+    assert_eq!(
+        parse_datagram(Channel::Control, &bytes),
+        Ok(WirePacket::Control(ControlPacket::Bye {
+            source: 1,
+            reason: vec![],
+        }))
+    );
+    bytes[16] = 1; // A reason cannot claim the envelope's padding as content.
+    assert_eq!(
+        parse_datagram(Channel::Control, &bytes),
+        Err(WireError::Malformed)
+    );
+}
+
+#[test]
 fn gsm_four_units_is_144_bytes() {
     let payload = [0xd0; 132];
     let voice = VoicePacket {
