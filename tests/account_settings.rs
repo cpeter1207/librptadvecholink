@@ -177,3 +177,33 @@ fn malformed_records_or_borrowed_spans_fail_without_publishing_settings() {
         assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
     }
 }
+
+#[test]
+fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
+    let servers = [span("directory.example.invalid")];
+    let secret = secrets("fixture-password");
+    let mut config = settings("K1ABC-R", "North", &servers, &[]);
+    let prepared = unsafe { PreparedSettings::copy(&config, &secret) }.unwrap();
+    assert_eq!(
+        prepared.aprs_location(" On @ 0903 [2/20]").unwrap(),
+        ")EL-K1ABC-!4500.00NE09300.00W0PHG3204/146520/114 On @ 0903 [2/20]"
+    );
+    config.station.latitude = -89.9999999;
+    config.station.longitude = 179.9999999;
+    config.station.power_w = 1e30;
+    config.station.antenna_height_m = 0.0;
+    config.station.antenna_gain_db = 100.0;
+    config.station.antenna_direction_deg = 0.0;
+    let prepared = unsafe { PreparedSettings::copy(&config, &secret) }.unwrap();
+    assert_eq!(
+        prepared.aprs_location(" ready").unwrap(),
+        ")EL-K1ABC-!9000.00SE18000.00E0PHG9098/146520/114 ready"
+    );
+    config.station.antenna_direction_deg = -1.0;
+    let prepared = unsafe { PreparedSettings::copy(&config, &secret) }.unwrap();
+    assert!(prepared.aprs_location("").unwrap().contains("PHG9090"));
+    assert!(prepared.aprs_location("bad\nstatus").is_err());
+    assert!(prepared.aprs_location(&"x".repeat(256)).is_err());
+    config.station.antenna_direction_deg = -0.5;
+    assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
+}

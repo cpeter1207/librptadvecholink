@@ -359,3 +359,57 @@ fn outbound_chat_and_station_info_keep_distinct_reference_grammars() {
         Err(WireError::TooLarge)
     );
 }
+
+#[test]
+fn aprs_metadata_uses_version_two_cname_and_location_not_peer_identity() {
+    use rptadv_echolink::wire::write_aprs;
+    use rtcp::{
+        receiver_report::ReceiverReport,
+        source_description::{SdesType, SourceDescription},
+    };
+    let location = ")EL-K1ABC-!4500.00NE09300.00W0PHG3274/146520/114 On @ 0903 [2/20]";
+    let mut output = [0xa5; 512];
+    let length = write_aprs("K1ABC-R", location, &mut output).unwrap();
+    assert_eq!(output[0], 0x80);
+    assert_eq!(output[8], 0x81);
+    let packets = rtcp::packet::unmarshal(&mut &output[..length]).unwrap();
+    assert_eq!(packets.len(), 2);
+    assert_eq!(
+        packets[0]
+            .as_any()
+            .downcast_ref::<ReceiverReport>()
+            .unwrap()
+            .ssrc,
+        0
+    );
+    let sdes = packets[1]
+        .as_any()
+        .downcast_ref::<SourceDescription>()
+        .unwrap();
+    assert_eq!(sdes.chunks.len(), 1);
+    assert_eq!(sdes.chunks[0].source, 0);
+    let items = &sdes.chunks[0].items;
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].sdes_type, SdesType::SdesCname);
+    assert_eq!(items[0].text.as_ref(), b"K1ABC-R/K1ABC-R");
+    assert_eq!(items[1].sdes_type, SdesType::SdesLocation);
+    assert_eq!(items[1].text.as_ref(), location.as_bytes());
+    let mut short = [0xa5; 3];
+    assert_eq!(
+        write_aprs("K1ABC-R", location, &mut short),
+        Err(WireError::Capacity(length))
+    );
+    assert_eq!(short, [0xa5; 3]);
+    assert_eq!(
+        write_aprs("bad>call", location, &mut output),
+        Err(WireError::Malformed)
+    );
+    assert_eq!(
+        write_aprs("K1ABC-R", "bad\nlocation", &mut output),
+        Err(WireError::Malformed)
+    );
+    assert_eq!(
+        write_aprs("K1ABC-R", &"x".repeat(256), &mut output),
+        Err(WireError::TooLarge)
+    );
+}

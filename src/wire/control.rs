@@ -249,10 +249,53 @@ pub fn write_control(packet: &ControlPacket, out: &mut [u8]) -> Result<usize, Wi
             }));
         }
     }
+    write_packets(packets, 3, out)
+}
+
+/// Write EchoLink's APRS RR/SDES metadata using version two, zero SSRC,
+/// CNAME `call/call` and LOCATION (not the peer-control NAME item).
+/// The one-byte SDES item bound is checked before building either packet.
+pub fn write_aprs(callsign: &str, location: &str, out: &mut [u8]) -> Result<usize, WireError> {
+    if callsign.len() > 15 || location.len() > 255 {
+        return Err(WireError::TooLarge);
+    }
+    if callsign.is_empty()
+        || !callsign
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-/*_".contains(&byte))
+        || location.chars().any(char::is_control)
+    {
+        return Err(WireError::Malformed);
+    }
+    write_packets(
+        vec![
+            Box::new(ReceiverReport::default()),
+            Box::new(SourceDescription {
+                chunks: vec![SourceDescriptionChunk {
+                    source: 0,
+                    items: vec![
+                        SourceDescriptionItem {
+                            sdes_type: SdesType::SdesCname,
+                            text: format!("{callsign}/{callsign}").into(),
+                        },
+                        SourceDescriptionItem {
+                            sdes_type: SdesType::SdesLocation,
+                            text: bytes::Bytes::copy_from_slice(location.as_bytes()),
+                        },
+                    ],
+                }],
+            }),
+        ],
+        2,
+        out,
+    )
+}
+
+fn write_packets(packets: Packets, version: u8, out: &mut [u8]) -> Result<usize, WireError> {
     let mut wire = Vec::new();
     for packet in packets {
         let mut part = packet.marshal().map_err(|_| WireError::Malformed)?.to_vec();
-        part[0] = (part[0] & 0x3f) | 0xc0;
+        part[0] = (part[0] & 0x3f) | (version << 6);
         if let Some(sdes) = packet.as_any().downcast_ref::<SourceDescription>() {
             let end = 8 + sdes.chunks[0]
                 .items

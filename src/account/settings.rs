@@ -216,6 +216,51 @@ impl PreparedSettings {
     pub fn deny(&self) -> impl Iterator<Item = &str> {
         self.entries(self.config.policy.deny)
     }
+    /// Format RF/location metadata for the EchoLink APRS LOCATION item.
+    /// Coordinates round to hundredths of a minute with degree carry. PHG
+    /// values use nearest representable digits clamped to 0..9; height H0 is
+    /// the smallest representable height (10 feet), including unknown/zero.
+    /// Direction -1 is omnidirectional; zero/360 is north (PHG8).
+    pub fn aprs_location(&self, status: &str) -> Result<String, crate::wire::WireError> {
+        use crate::wire::WireError;
+        if status.chars().any(char::is_control) {
+            return Err(WireError::Malformed);
+        }
+        if status.len() > 255 {
+            return Err(WireError::TooLarge);
+        }
+        let station = &self.config.station;
+        let latitude = (station.latitude.abs() * 6000.0).round() as u32;
+        let longitude = (station.longitude.abs() * 6000.0).round() as u32;
+        let digit = |value: f64| value.round().clamp(0.0, 9.0) as u8;
+        let power = digit(station.power_w.sqrt());
+        let height = digit((station.antenna_height_m * 3.28084 / 10.0).log2());
+        let gain = digit(station.antenna_gain_db);
+        let direction = if station.antenna_direction_deg < 0.0 {
+            0
+        } else {
+            let sector = (station.antenna_direction_deg / 45.0).round() as u8;
+            if sector == 0 { 8 } else { sector }
+        };
+        let location = format!(
+            ")EL-{:<6.6}!{:02}{:02}.{:02}{}E{:03}{:02}.{:02}{}0PHG{power}{height}{gain}{direction}/{:06}/{:03}{status}",
+            self.callsign(),
+            latitude / 6000,
+            latitude / 100 % 60,
+            latitude % 100,
+            if station.latitude < 0.0 { 'S' } else { 'N' },
+            longitude / 6000,
+            longitude / 100 % 60,
+            longitude % 100,
+            if station.longitude < 0.0 { 'W' } else { 'E' },
+            (station.frequency_mhz * 1000.0).round().min(999_999.0) as u32,
+            (station.tone_hz + 0.05).floor().min(999.0) as u32,
+        );
+        if location.len() > 255 {
+            return Err(WireError::TooLarge);
+        }
+        Ok(location)
+    }
     /// Borrow credentials only while creating one directory request.
     pub fn directory_login(&self) -> DirectoryLogin<'_> {
         let name = self.known(self.config.station.name);
@@ -264,7 +309,8 @@ fn valid_numbers(config: &AccountConfig) -> bool {
         && station.longitude.is_finite()
         && (-180.0..=180.0).contains(&station.longitude)
         && station.antenna_direction_deg.is_finite()
-        && (0.0..=360.0).contains(&station.antenna_direction_deg)
+        && (station.antenna_direction_deg == -1.0
+            || (0.0..=360.0).contains(&station.antenna_direction_deg))
         && station.antenna_gain_db.is_finite()
         && [
             station.frequency_mhz,

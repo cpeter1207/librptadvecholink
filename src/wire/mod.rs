@@ -4,7 +4,7 @@ mod proxy;
 mod text;
 pub use text::{write_chat, write_station_info};
 mod voice;
-pub use control::{ControlPacket, write_control};
+pub use control::{ControlPacket, write_aprs, write_control};
 pub use proxy::{ProxyDecoder, ProxyKind, ProxyRecord};
 use std::fmt;
 pub use voice::{Codec, VoicePacket, write_voice};

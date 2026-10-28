@@ -69,7 +69,7 @@ struct rptadv_echolink_station_v1 {
     double power_w; /**< Advertised RF power in watts. */
     double antenna_height_m; /**< Antenna height in metres. */
     double antenna_gain_db; /**< Advertised antenna gain. */
-    double antenna_direction_deg; /**< Antenna direction in degrees. */
+    double antenna_direction_deg; /**< 0..360 degrees (zero is north); -1 is omnidirectional. */
 };
 /** Selected transport; passwords are separate. */
 struct rptadv_echolink_transport_v1 {
