@@ -31,6 +31,18 @@ pub struct ProxyRecord<'a> {
     /// Payload, never retained across the callback.
     pub payload: &'a [u8],
 }
+
+impl ProxyRecord<'_> {
+    pub(crate) fn header(&self) -> Result<[u8; 9], WireError> {
+        let length = u32::try_from(self.payload.len()).map_err(|_| WireError::TooLarge)?;
+        let mut bytes = [0; 9];
+        bytes[0] = self.kind as u8;
+        bytes[1..5].copy_from_slice(&self.address.octets());
+        bytes[5..].copy_from_slice(&length.to_le_bytes());
+        header(&bytes)?;
+        Ok(bytes)
+    }
+}
 /// One bounded transport parser; a bad header clears only its buffered record.
 pub struct ProxyDecoder {
     buffer: Vec<u8>,

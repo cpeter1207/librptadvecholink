@@ -27,10 +27,14 @@ pub enum PushError {
 }
 
 #[derive(Default)]
-struct Budget(AtomicU64);
+pub(crate) struct Budget(AtomicU64);
 
 impl Budget {
-    fn reserve(self: &Arc<Self>, length: usize, media: bool) -> Result<Charge, PushError> {
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        length: usize,
+        media: bool,
+    ) -> Result<Charge, PushError> {
         // Both byte counts change in one CAS; a control/media race cannot overbook them.
         let amount = ((length as u64) << 32) | if media { length as u64 } else { 0 };
         self.0
@@ -45,9 +49,13 @@ impl Budget {
             amount,
         })
     }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        (self.0.load(Ordering::Acquire) >> 32) as usize
+    }
 }
 
-struct Charge {
+pub(crate) struct Charge {
     budget: Arc<Budget>,
     amount: u64,
 }
@@ -141,7 +149,7 @@ impl Producer {
 
     /// Payload bytes still queued or borrowed by the serialized consumer.
     pub fn retained_bytes(&self) -> usize {
-        (self.budget.0.load(Ordering::Acquire) >> 32) as usize
+        self.budget.retained_bytes()
     }
 }
 

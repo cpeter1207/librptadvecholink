@@ -3,6 +3,7 @@
 pub mod direct;
 pub mod driver;
 pub mod mailbox;
+pub mod proxy;
 pub mod routing;
 
 use crate::directory::{MAX_COMPRESSED, MAX_EXPANDED, MAX_LINE};
@@ -54,21 +55,6 @@ pub async fn directory_exchange(
     .map_err(|_| TransactionError::Timeout)?
 }
 
-/// Perform the same framed exchange over an already connected Proxy directory stream.
-pub async fn exchange_on_stream<S>(
-    stream: S,
-    request: &[u8],
-    kind: ReplyKind,
-    deadline: Duration,
-) -> Result<Vec<u8>, TransactionError>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::time::timeout(deadline, exchange(stream, request, kind))
-        .await
-        .map_err(|_| TransactionError::Timeout)?
-}
-
 async fn exchange<S>(
     mut stream: S,
     request: &[u8],
@@ -79,7 +65,15 @@ where
 {
     stream.write_all(request).await.map_err(io_error)?;
     stream.flush().await.map_err(io_error)?;
-    let mut reader = BufReader::new(stream);
+    read_reply(BufReader::new(stream), kind).await
+}
+
+// Both real transports use the same framed response parser. Proxy request writes
+// are queued by its account owner, never by a reader that would stall UDP routing.
+pub(crate) async fn read_reply<S: AsyncRead + Unpin>(
+    mut reader: BufReader<S>,
+    kind: ReplyKind,
+) -> Result<Vec<u8>, TransactionError> {
     if matches!(kind, ReplyKind::Login) {
         let mut reply = [0; 2];
         reader.read_exact(&mut reply).await.map_err(io_error)?;
