@@ -25,3 +25,14 @@ Upstream attribution: EchoLib/SvxLink by Tobias Blomberg/SM0SVX and contributors
 GPL-2.0-or-later under the pinned project's COPYRIGHT. No app_rpt implementation
 code is incorporated. Reference fixture bytes document interoperability; the
 EchoLink compatibility wrapper is independently implemented.
+
+`issue-826-normalized.json` is hand-derived from
+[SvxLink issue 826](https://github.com/sm0svx/svxlink/issues/826), not a captured
+packet. The issue reports control sent from both source ports 5199 and 5198 to
+destination 5199. Its printed NAME text is two bytes shorter than its declared
+length. This fixture uses a 15-column callsign field to make the 96-byte packet
+internally consistent; that reconstruction is not proof of the original bytes.
+It covers standard RTCP padding, TOOL, and two non-SPEEX private items. Do not
+copy the official client's TOOL value into our outgoing identity. Endpoint
+admission tests must consume the recorded source-port variants separately;
+wire parsing cannot establish endpoint authorization.
