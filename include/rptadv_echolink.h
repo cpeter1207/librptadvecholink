@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/** @file @brief Sized EchoLink provider lifecycle and serial-owner ABI.
+/** @file
+ * @brief Sized EchoLink provider lifecycle and serial-owner ABI.
  * All operations run off audio. Caller buffers are borrowed only during the call.
  * Stop and quiesce all callbacks/handles before unloading the provider DSO.
  */

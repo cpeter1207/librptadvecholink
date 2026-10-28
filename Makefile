@@ -86,7 +86,7 @@ static-analysis:
 		--std=c11 -Iinclude $(wildcard tests/*.c)
 
 docs: rustdoc | build
-	$(DOXYGEN) Doxyfile
+	$(DOXYGEN) Doxyfile || { cat build/doxygen-warnings.log; exit 1; }
 	test ! -s build/doxygen-warnings.log
 
 rustdoc:
