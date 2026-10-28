@@ -2,6 +2,7 @@
 //! The account owns its two halves; TCP head-of-line delay remains account-wide.
 
 pub mod directory;
+pub mod session;
 
 use super::mailbox::{Budget, Charge};
 use crate::wire::{ProxyDecoder, ProxyKind, ProxyRecord, WireError};
@@ -119,7 +120,10 @@ impl<S: AsyncRead + Unpin> ProxyReader<S> {
 
     /// Read one bounded chunk. The account must use nonblocking per-peer queue admission
     /// in emit; directory or media backpressure cannot suspend this shared demultiplexer.
-    pub async fn read(&mut self, emit: &mut dyn FnMut(ProxyRecord<'_>)) -> Result<(), ProxyError> {
+    pub async fn read<F: FnMut(ProxyRecord<'_>) + ?Sized>(
+        &mut self,
+        emit: &mut F,
+    ) -> Result<(), ProxyError> {
         let mut input = [0; 8192];
         let count = self.stream.read(&mut input).await.map_err(io_error)?;
         if count == 0 {
