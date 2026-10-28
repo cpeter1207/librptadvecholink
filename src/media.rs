@@ -6,6 +6,44 @@ use rptadv_codec_client::{CodecCatalog, Encoder, ProfileId};
 const FRAMES: usize = 640;
 const MAX_ENCODED: usize = 252;
 
+/// One connection's optional narrowband extension. GSM is always mandatory and initial.
+pub struct CodecChoice {
+    speex: bool,
+    selected: Codec,
+}
+impl CodecChoice {
+    /// Advertise Speex only when its validated bidirectional dynamic provider is composed.
+    pub fn new(catalog: &CodecCatalog) -> Result<Self, MediaError> {
+        if catalog.profile(ProfileId::GsmFr).is_none() {
+            return Err(MediaError::Invalid);
+        }
+        Ok(Self {
+            speex: catalog.profile(ProfileId::Speex).is_some(),
+            selected: Codec::GsmFr,
+        })
+    }
+    /// Include the raw SPEEX PRIV item, never wideband or another IAX codec.
+    pub fn advertise_speex(&self) -> bool {
+        self.speex
+    }
+    /// Observe only authenticated session-bound SDES, after the account/router gate.
+    /// Like EchoLib, later plain heartbeats do not undo a negotiated extension.
+    pub fn observe_sdes(&mut self, control: &crate::wire::ControlPacket) {
+        if self.speex
+            && matches!(
+                control,
+                crate::wire::ControlPacket::Sdes { speex: true, .. }
+            )
+        {
+            self.selected = Codec::Speex;
+        }
+    }
+    /// Current peer egress choice; receive packets still validate their own payload type.
+    pub fn codec(&self) -> Codec {
+        self.selected
+    }
+}
+
 /// Bounded media/provider failure, without PCM or packet contents.
 #[derive(Debug)]
 pub enum MediaError {

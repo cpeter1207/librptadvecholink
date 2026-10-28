@@ -82,7 +82,7 @@ lint:
 
 static-analysis:
 	$(CARGO) clippy --all-targets -- -D warnings
-	$(CPPCHECK) --force --enable=warning,style,performance,portability --error-exitcode=1 \
+	$(CPPCHECK) --force --check-level=exhaustive --enable=warning,style,performance,portability --error-exitcode=1 \
 		--std=c11 -Iinclude $(wildcard tests/*.c)
 
 docs: rustdoc | build

@@ -13,6 +13,13 @@ the surplus word in two cases. All six literals were cross-checked byte-for-byte
 on Debian 13 ARM64 by compiling the unmodified pinned maker on 2026-10-28.
 This is executed reference-maker evidence, not a captured client trace.
 
+`tests/speex_reference.c` is a separate upstream-libspeex C API probe. It checks
+that the provider's continuous packet decodes to four narrowband frames followed
+by a terminator. A peer-side packet uses EchoLib's quality 8/complexity 4 settings
+and is independently inspected/decoded by the provider. The probe does not load
+project codec or protocol code; it does not prove an authenticated live-client
+session. Existing provider quality settings and IAX packetization are unchanged.
+
 Voice headers follow the packed structure and send operation in
 [`EchoLinkQso.h`](https://github.com/sm0svx/svxlink/blob/595cf9bb3325be753d05b219bdd39feab6a22b33/src/echolib/EchoLinkQso.h#L149-L159)
 and
