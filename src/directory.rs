@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_COMPRESSED: usize = 2 * 1024 * 1024;
-const MAX_EXPANDED: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_COMPRESSED: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_EXPANDED: usize = 16 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
-const MAX_LINE: usize = 1024;
+pub(crate) const MAX_LINE: usize = 1024;
 
 /// An authenticated directory identity, copied into each established QSO.
 #[derive(Clone, Debug, PartialEq, Eq)]

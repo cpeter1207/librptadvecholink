@@ -1,5 +1,9 @@
 //! Bounded, asynchronous directory I/O shared by direct and Proxy stream transports.
 
+pub mod direct;
+pub mod mailbox;
+
+use crate::directory::{MAX_COMPRESSED, MAX_EXPANDED, MAX_LINE};
 use flate2::{Decompress, FlushDecompress, Status};
 use std::{io::ErrorKind, net::SocketAddr, time::Duration};
 use tokio::{
@@ -96,18 +100,14 @@ async fn read_plain<S: AsyncRead + Unpin>(
     mut output: Vec<u8>,
     partial: bool,
 ) -> Result<Vec<u8>, TransactionError> {
-    append(
-        &mut output,
-        &read_line(reader, false).await?,
-        16 * 1024 * 1024,
-    )?;
+    append(&mut output, &read_line(reader, false).await?, MAX_EXPANDED)?;
     let mut fields = 0;
     let mut deleting = false;
     loop {
         let line = read_line(reader, fields == 0 && (!partial || deleting)).await?;
         let contents = line.strip_suffix(b"\n").unwrap_or(&line);
         let contents = contents.strip_suffix(b"\r").unwrap_or(contents);
-        append(&mut output, &line, 16 * 1024 * 1024)?;
+        append(&mut output, &line, MAX_EXPANDED)?;
         if fields != 0 {
             fields -= 1;
         } else if contents == b"+++" {
@@ -146,7 +146,7 @@ async fn read_line<S: AsyncRead + Unpin>(
             .iter()
             .position(|byte| *byte == b'\n')
             .map_or(input.len(), |position| position + 1);
-        if line.len() + count > 1025 {
+        if line.len() + count > MAX_LINE + 1 {
             return Err(TransactionError::Limit);
         }
         let done = input[count - 1] == b'\n';
@@ -169,7 +169,7 @@ async fn read_compressed<S: AsyncRead + Unpin>(
         if count == 0 {
             return Err(TransactionError::Truncated);
         }
-        append(&mut output, &input[..count], 2 * 1024 * 1024)?;
+        append(&mut output, &input[..count], MAX_COMPRESSED)?;
         loop {
             let before_in = decoder.total_in();
             let before_out = decoder.total_out();
@@ -181,7 +181,7 @@ async fn read_compressed<S: AsyncRead + Unpin>(
                     FlushDecompress::None,
                 )
                 .map_err(|_| TransactionError::Malformed)?;
-            if decoder.total_out() > 16 * 1024 * 1024 {
+            if decoder.total_out() > MAX_EXPANDED as u64 {
                 return Err(TransactionError::Limit);
             }
             if status == Status::StreamEnd {
