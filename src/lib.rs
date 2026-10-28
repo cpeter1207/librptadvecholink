@@ -5,6 +5,7 @@ pub mod account;
 pub mod directory;
 pub mod ffi;
 pub mod session;
+pub mod transport;
 pub mod wire;
 use ffi::{Account, AccountConfig, AccountSecrets, Context, Descriptor, RuntimeConfig, Status};
 use std::{mem::size_of, ptr, sync::Arc};

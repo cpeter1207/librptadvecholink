@@ -17,7 +17,7 @@ flate2 = "1.1.10"
 rtp = "=0.12.0"
 rtcp = "=0.12.0"
 webrtc-util = { version = "=0.10.0", default-features = false, features = ["marshal"] }
-tokio = { version = "=1.48.0", features = ["rt-multi-thread", "net", "time", "sync"] }
+tokio = { version = "=1.48.0", features = ["rt-multi-thread", "net", "time", "sync", "io-util"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
