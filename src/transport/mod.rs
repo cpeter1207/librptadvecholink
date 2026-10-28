@@ -1,6 +1,7 @@
 //! Bounded, asynchronous directory I/O shared by direct and Proxy stream transports.
 
 pub mod direct;
+pub mod driver;
 pub mod mailbox;
 
 use crate::directory::{MAX_COMPRESSED, MAX_EXPANDED, MAX_LINE};
