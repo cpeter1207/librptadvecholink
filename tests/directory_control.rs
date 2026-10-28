@@ -83,7 +83,7 @@ fn directory_requests_follow_reference_login_logout_and_snapshot_framing() {
                 .is_err()
         );
     }
-    for field in ["one\rtwo", "one\ntwo", "one\0two", &"a".repeat(1024)] {
+    for field in ["one\rtwo", "one\ntwo", "one\0two", &"a".repeat(4097)] {
         for changed in [
             DirectoryLogin {
                 password: field,
@@ -101,6 +101,25 @@ fn directory_requests_follow_reference_login_logout_and_snapshot_framing() {
             assert!(changed.request(&Operation::Register, 9, 3).is_err());
         }
     }
+}
+
+#[test]
+fn configured_directory_metadata_is_not_limited_by_asls_local_printf_buffer() {
+    use rptadv_echolink::account::directory::DirectoryLogin;
+    let text = "site ".repeat(400);
+    let login = DirectoryLogin {
+        callsign: "K1ABC-R",
+        password: "fixture-password",
+        description: &text,
+        email: &text,
+    };
+    let request = login.request(&Operation::Register, 9, 3).unwrap();
+    assert!(
+        request
+            .windows(text.len())
+            .any(|field| field == text.as_bytes())
+    );
+    assert!(request.len() < 16_384);
 }
 
 #[test]

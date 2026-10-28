@@ -90,7 +90,7 @@ impl DirectoryLogin<'_> {
             || [self.password, self.description, self.email]
                 .iter()
                 .any(|field| {
-                    field.len() > 1023 || field.bytes().any(|byte| byte.is_ascii_control())
+                    field.len() > 4096 || field.bytes().any(|byte| byte.is_ascii_control())
                 })
         {
             return Err(TransactionError::Malformed);
@@ -120,9 +120,8 @@ impl DirectoryLogin<'_> {
             request.extend_from_slice(self.email.as_bytes());
             request.push(b'\r');
         }
-        if request.len() > 1023 {
-            return Err(TransactionError::Limit);
-        }
+        // Field budgets bound the request below 16 KiB, within the Proxy's 64 KiB budget.
+        // ASL's local printf buffer is not a protocol limit on resolved metadata.
         Ok(request)
     }
 }
