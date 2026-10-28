@@ -8,7 +8,7 @@ on:
       target:
         type: choice
         default: packet
-        options: [packet, abi, wire]
+        options: [packet, abi, wire, state]
 
 permissions:
   contents: read

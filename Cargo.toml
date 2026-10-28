@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bytes = "1"
+flate2 = "1.1.10"
 rtp = "=0.12.0"
 rtcp = "=0.12.0"
 webrtc-util = { version = "=0.10.0", default-features = false, features = ["marshal"] }

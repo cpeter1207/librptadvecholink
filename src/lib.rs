@@ -1,7 +1,10 @@
 //! Versioned EchoLink provider boundary, independent of Asterisk and radio I/O.
 #![deny(missing_docs)]
 
+pub mod account;
+pub mod directory;
 pub mod ffi;
+pub mod session;
 pub mod wire;
 use ffi::{Account, AccountConfig, AccountSecrets, Context, Descriptor, RuntimeConfig, Status};
 use std::{mem::size_of, ptr, sync::Arc};
