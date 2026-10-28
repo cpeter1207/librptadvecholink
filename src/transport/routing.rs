@@ -124,7 +124,7 @@ impl Route {
 /// Different source addresses have independent queues; shared-IP ambiguity is dropped,
 /// not resolved by trusting a represented sender or assuming a fixed remote UDP port.
 pub struct Router {
-    account: Account,
+    pub(crate) account: Account,
     maximum_pending: usize,
     setup_timeout: Duration,
     next: u64,

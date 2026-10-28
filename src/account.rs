@@ -1,5 +1,6 @@
 //! Serialized account admission and EchoLink-only first-talker ownership.
 
+pub mod coordination;
 pub mod directory;
 
 use crate::directory::{DirectoryEntry, DirectorySnapshot};
@@ -8,6 +9,9 @@ use std::{
     net::Ipv4Addr,
     time::{Duration, Instant},
 };
+
+const UNKEY_AFTER: Duration = Duration::from_millis(320);
+const RELEASE_AFTER: Duration = Duration::from_millis(800);
 
 /// Safe admission rejection, independent of controller policy after attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,13 +172,13 @@ impl Account {
     pub fn poll(&mut self, now: Instant, drained: bool) -> Option<(u32, u64)> {
         let talker = self.talker.as_mut()?;
         let quiet = now.saturating_duration_since(talker.last_packet);
-        let unkey = if drained && quiet >= Duration::from_millis(320) && talker.keyed {
+        let unkey = if drained && quiet >= UNKEY_AFTER && talker.keyed {
             talker.keyed = false;
             Some(talker.identity)
         } else {
             None
         };
-        if drained && quiet >= Duration::from_millis(800) {
+        if drained && quiet >= RELEASE_AFTER {
             self.talker = None;
         }
         unkey
