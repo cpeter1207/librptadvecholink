@@ -1,0 +1,20 @@
+#!/usr/bin/make -f
+
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+DEB_VERSION_UPSTREAM ?= $(shell dpkg-parsechangelog -S Version | sed 's/-[^-]*$$//')
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) PACKAGE_VERSION=$(DEB_VERSION_UPSTREAM) all
+
+override_dh_auto_test:
+	$(MAKE) PACKAGE_VERSION=$(DEB_VERSION_UPSTREAM) test
+
+override_dh_auto_install:
+	$(MAKE) PACKAGE_VERSION=$(DEB_VERSION_UPSTREAM) DESTDIR=$(CURDIR)/debian/tmp PREFIX=/usr \
+		LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH) install
+
+override_dh_auto_clean:
+	$(MAKE) clean

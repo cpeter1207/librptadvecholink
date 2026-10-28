@@ -1,0 +1,3 @@
+usr/lib/*/librptadv_echolink.so
+usr/lib/*/pkgconfig/rptadv_echolink.pc
+usr/include/rptadv_echolink/rptadv_echolink.h

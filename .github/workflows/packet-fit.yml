@@ -4,12 +4,18 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        default: packet
+        options: [packet, abi]
 
 permissions:
   contents: read
 
 jobs:
   packet-fit:
-    uses: cpeter1207/librptadvecholink-workflows/.github/workflows/packet-fit.yml@main
+    uses: cpeter1207/librptadvecholink-workflows/.github/workflows/packet-fit.yml@feature/echolink-validation
     with:
       code_ref: ${{ github.sha }}
+      target: ${{ inputs.target || 'packet' }}

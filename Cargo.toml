@@ -7,11 +7,16 @@ license = "GPL-2.0-only"
 publish = false
 description = "EchoLink protocol provider for RPT Advanced"
 
+[lib]
+name = "rptadv_echolink"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 bytes = "1"
 rtp = "=0.12.0"
 rtcp = "=0.12.0"
 webrtc-util = { version = "=0.10.0", default-features = false, features = ["marshal"] }
+tokio = { version = "=1.48.0", features = ["rt-multi-thread", "net", "time", "sync"] }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

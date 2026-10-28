@@ -1,0 +1,22 @@
+Source: librptadvecholink
+Section: libs
+Priority: optional
+Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
+Build-Depends: cargo (>= 1.85), debhelper-compat (= 13), pkg-config, rustc (>= 1.85)
+Standards-Version: 4.7.2
+Homepage: https://github.com/cpeter1207/librptadvecholink
+Rules-Requires-Root: no
+
+Package: librptadvecholink1
+Architecture: any
+Multi-Arch: same
+Depends: ${misc:Depends}, ${shlibs:Depends}
+Description: EchoLink protocol provider for RPT Advanced
+ Independently versioned provider for EchoLink account, protocol and media work.
+
+Package: librptadvecholink-dev
+Architecture: any
+Multi-Arch: same
+Depends: ${misc:Depends}, librptadvecholink1 (= ${binary:Version})
+Description: development files for the RPT Advanced EchoLink provider
+ C-compatible descriptor header, linker symlink and pkg-config metadata.

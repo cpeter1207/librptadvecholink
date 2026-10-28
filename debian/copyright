@@ -1,0 +1,14 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: librptadvecholink
+Source: https://github.com/cpeter1207/librptadvecholink
+
+Files: *
+Copyright: 2026 Chris Peterson and contributors
+License: GPL-2
+ See /usr/share/common-licenses/GPL-2 and the source COPYING file.
+
+Files: tests/fixtures/*
+Copyright: 2026 Chris Peterson and contributors
+           EchoLib reference behavior by Tobias Blomberg and SvxLink contributors
+License: GPL-2
+ Independent protocol fixture derivation; provenance in tests/fixtures/README.md.
