@@ -19,7 +19,7 @@ md-5 = "=0.10.6"
 libloading = "0.8"
 rptadv-codec-client = { git = "https://github.com/cpeter1207/rptadv-codec-adapters", rev = "becbff939a0817cc91df6dcb0d40e85e381ec87b" }
 rptadv-jitter-client = { git = "https://github.com/cpeter1207/rpt_advanced", rev = "a151c00450937c5316607c80cd37bbedb12fc5e0" }
-rptadv-peer-support = { git = "https://github.com/cpeter1207/rpt_advanced", rev = "678f578014034a570856ff80e6033db5960d66fb" }
+rptadv-peer-support = { git = "https://github.com/cpeter1207/rpt_advanced", rev = "b3e885dbf89f3338e46d0bdd7f478702c5c57142" }
 rtp = "=0.12.0"
 rtcp = "=0.12.0"
 webrtc-util = { version = "=0.10.0", default-features = false, features = ["marshal"] }

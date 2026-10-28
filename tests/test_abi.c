@@ -4,6 +4,11 @@
 #include <assert.h>
 #include <string.h>
 
+_Static_assert(offsetof(struct rptadv_echolink_event_v1, taken) == 32,
+               "incoming ownership acknowledgement layout");
+_Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,
+               "complete borrowed incoming event layout");
+
 int main(int argc, char **argv)
 {
     const struct rptadv_echolink_descriptor_v1 *api = rptadv_echolink_descriptor_v1();

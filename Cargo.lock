@@ -505,7 +505,7 @@ source = "git+https://github.com/cpeter1207/rpt_advanced?rev=a151c00450937c53166
 [[package]]
 name = "rptadv-peer-support"
 version = "0.1.0-alpha17"
-source = "git+https://github.com/cpeter1207/rpt_advanced?rev=678f578014034a570856ff80e6033db5960d66fb#678f578014034a570856ff80e6033db5960d66fb"
+source = "git+https://github.com/cpeter1207/rpt_advanced?rev=b3e885dbf89f3338e46d0bdd7f478702c5c57142#b3e885dbf89f3338e46d0bdd7f478702c5c57142"
 dependencies = [
  "libc",
 ]

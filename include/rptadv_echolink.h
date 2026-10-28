@@ -137,6 +137,10 @@ struct rptadv_echolink_event_v1 {
     struct rptadv_echolink_qso *qso; /**< Provider-owned pending/live QSO or null. */
     uint64_t generation; /**< Account/QSO generation appropriate to kind. */
     rptadv_echolink_status status; /**< Value-free operation/termination status. */
+    /** Incoming-only writable acknowledgement initialized to zero. Set to one
+     * before returning only to accept QSO ownership, released by peer_destroy.
+     * Null for events that transfer no ownership; otherwise the provider retains it. */
+    uint32_t *taken;
 };
 /** Off-audio event notification; must not unwind or retain borrowed records. */
 typedef void (*rptadv_echolink_event_fn)(void *, const struct rptadv_echolink_event_v1 *);
@@ -179,6 +183,9 @@ struct rptadv_echolink_descriptor_v1 {
     void (*peer_wake)(struct rptadv_echolink_registration *);
     /** Relative nanosecond product deadline; UINT64_MAX clears it. */
     rptadv_echolink_status (*peer_set_deadline)(struct rptadv_echolink_qso *, uint64_t);
+    /** Compatible network-group tail; release off executor after stop/detach.
+     * Null QSO is harmless. Lifecycle-only callers need not expose this tail. */
+    void (*peer_destroy)(struct rptadv_echolink_qso *);
 };
 /** Borrow the immutable table while the DSO remains loaded. */
 const struct rptadv_echolink_descriptor_v1 *rptadv_echolink_descriptor_v1(void);
