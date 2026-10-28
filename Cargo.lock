@@ -229,6 +229,7 @@ version = "0.1.0-alpha1"
 dependencies = [
  "bytes",
  "flate2",
+ "libloading",
  "md-5",
  "rptadv-codec-client",
  "rptadv-jitter-client",

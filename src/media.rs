@@ -17,6 +17,8 @@ pub enum MediaError {
     Contract,
     /// Protocol envelope validation failed.
     Wire(WireError),
+    /// Composed jitter capability failed; the account preserves the first cause.
+    Jitter(rptadv_jitter_client::Error),
 }
 
 /// Immutable prepared bytes retained until sent or explicitly retired by their owner.
