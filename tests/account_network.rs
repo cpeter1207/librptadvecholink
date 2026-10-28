@@ -5,10 +5,7 @@ use rptadv_echolink::{
         settings::PreparedSettings,
     },
     ffi::*,
-    transport::{
-        direct::DirectSockets,
-        proxy::{connect, session::ProxySession},
-    },
+    transport::direct::DirectSockets,
     wire::{Channel, ControlPacket, ProxyKind, ProxyRecord, write_control},
 };
 use std::{mem::size_of, sync::Arc, time::Duration};
@@ -24,6 +21,15 @@ fn span(value: &str) -> ByteSpan {
     }
 }
 fn settings(server: &str, refresh: u32, kind: u32) -> Arc<PreparedSettings> {
+    settings_at(server, refresh, kind, 5198, 8100)
+}
+fn settings_at(
+    server: &str,
+    refresh: u32,
+    kind: u32,
+    audio_port: u16,
+    proxy_port: u16,
+) -> Arc<PreparedSettings> {
     let servers = [span(server)];
     let config = AccountConfig {
         enabled: 1,
@@ -38,9 +44,9 @@ fn settings(server: &str, refresh: u32, kind: u32) -> Arc<PreparedSettings> {
         transport: TransportConfig {
             kind,
             bind_address: span("127.0.0.1"),
-            audio_port: 5198,
+            audio_port,
             proxy_host: span("127.0.0.1"),
-            proxy_port: 8100,
+            proxy_port,
             directory_servers: StringList {
                 items: servers.as_ptr(),
                 count: 1,
@@ -95,6 +101,7 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             });
             let sockets = Arc::new(DirectSockets::bind("127.0.0.1:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()).await.unwrap());
             let (network, mut events) = AccountNetwork::direct(settings(&server, 300_000, 0), Arc::clone(&sockets), || (9, 3)).unwrap();
+            let commands = network.control();
             let directory_view = network.directory();
             assert_eq!(directory_view.by_node(123456, std::time::Instant::now()), Err(rptadv_echolink::directory::AdmissionError::Stale));
             loop {
@@ -103,7 +110,7 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             let verified = directory_view.by_node(123456, std::time::Instant::now()).unwrap();
             assert_eq!(verified.callsign, "K1ABC-R");
             assert_eq!(directory_view.lookup("K1ABC-R", "192.0.2.1".parse().unwrap(), std::time::Instant::now()), Err(rptadv_echolink::directory::AdmissionError::Address));
-            let mut connection = network.dial(123456).await.unwrap();
+            let mut connection = commands.dial(123456).await.unwrap();
             assert_eq!(connection.connection.identity.callsign, "K1ABC-R");
             let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut bytes = [0; 1024];
@@ -127,6 +134,7 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             peer.send_to(&bytes[..count], sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
             assert_eq!(incoming.connection.ingress.recv().await.unwrap().payload(), &bytes[..count]);
             network.stop().await.unwrap();
+            assert!(matches!(commands.dial(123456).await, Err(NetworkError::Stopped)));
             assert!(incoming.connection.ingress.recv().await.is_none());
             directory.await.unwrap();
         }).await.unwrap();
@@ -188,9 +196,7 @@ fn proxy_account_uses_its_selected_proxy_for_directory_and_peer_traffic() {
                 socket.write_all(&bytes(3, &[])).await.unwrap();
                 assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
             });
-            let transport = connect(address, "N0CALL-R", "fixture-password", Duration::from_secs(2)).await.unwrap();
-            let session = ProxySession::start(transport, Duration::from_secs(2)).unwrap();
-            let (network, mut events) = AccountNetwork::proxy(settings("127.0.0.1", 300_000, 1), session, || (9, 3)).unwrap();
+            let (network, mut events) = AccountNetwork::open(settings_at("127.0.0.1", 300_000, 1, 5198, address.port()), || (9, 3)).await.unwrap();
             while !matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) {}
             let mut peer = network.dial(123456).await.unwrap();
             dialed.send(()).unwrap();
@@ -202,6 +208,28 @@ fn proxy_account_uses_its_selected_proxy_for_directory_and_peer_traffic() {
             network.stop().await.unwrap();
             server.await.unwrap();
         }).await.unwrap();
+    });
+}
+
+#[test]
+fn activation_preserves_the_direct_bind_error_without_trying_another_transport() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = settings_at(
+            "127.0.0.1:1",
+            300_000,
+            0,
+            occupied.local_addr().unwrap().port(),
+            8100,
+        );
+        assert!(matches!(
+            AccountNetwork::open(config, || (9, 3)).await,
+            Err(NetworkError::Io(std::io::ErrorKind::AddrInUse))
+        ));
     });
 }
 

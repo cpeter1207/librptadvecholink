@@ -196,6 +196,9 @@ impl PreparedSettings {
     pub fn callsign(&self) -> &str {
         self.known(self.config.callsign)
     }
+    pub(crate) fn bind_address(&self) -> &str {
+        self.known(self.config.transport.bind_address)
+    }
     /// Configured standard Proxy endpoint, not an HTTP proxy.
     pub fn proxy_host(&self) -> &str {
         self.known(self.config.transport.proxy_host)

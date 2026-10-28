@@ -13,7 +13,7 @@ use crate::{
         direct::DirectSockets,
         directory_exchange,
         driver::Control,
-        proxy::{ProxyError, ProxyOutput, session::ProxySession},
+        proxy::{ProxyError, ProxyOutput, connect, session::ProxySession},
         routing::{Connection, PendingHandshake, RouteResult, Router},
     },
     wire::{Channel, MAX_DATAGRAM},
@@ -62,6 +62,10 @@ pub enum NetworkError {
     Full,
     /// Existing directory/account policy rejected the requested generation.
     Admission(Admission),
+    /// Direct bind or Proxy-name resolution failed; no transport fallback was attempted.
+    Io(io::ErrorKind),
+    /// Selected Proxy setup failed with its content-free original cause.
+    Proxy(ProxyError),
 }
 
 /// Selected account transport; a Proxy peer cannot accidentally send direct UDP.
@@ -107,13 +111,63 @@ enum Command {
 /// Owns a task on the existing Tokio runtime, never a new runtime/thread per account or peer.
 /// Dropping requests cancellation; stop() is the asynchronous quiescence barrier.
 pub struct AccountNetwork {
-    directory: DirectoryView,
-    commands: mpsc::Sender<Command>,
-    stopping: watch::Sender<bool>,
+    control: NetworkControl,
     task: Option<JoinHandle<()>>,
 }
 
+/// Cloneable off-audio command port; it owns no join handle or account task.
+/// Account shutdown gates every clone before its owner performs the join.
+#[derive(Clone)]
+pub struct NetworkControl {
+    directory: DirectoryView,
+    commands: mpsc::Sender<Command>,
+    stopping: watch::Sender<bool>,
+}
+
 impl AccountNetwork {
+    /// Activate the configured transport on the caller's existing Tokio pool.
+    /// Direct binding and the complete Proxy DNS/connect/authentication sequence
+    /// finish before publishing the account. Proxy failure never selects UDP.
+    pub async fn open(
+        settings: Arc<PreparedSettings>,
+        civil_time: fn() -> (u8, u8),
+    ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), NetworkError> {
+        let config = settings.as_abi();
+        if config.transport.kind == 0 {
+            let ip: std::net::Ipv4Addr = settings
+                .bind_address()
+                .parse()
+                .map_err(|_| NetworkError::Invalid)?;
+            let audio = SocketAddr::from((ip, config.transport.audio_port));
+            let control = SocketAddr::from((ip, config.transport.audio_port + 1));
+            let sockets = DirectSockets::bind(audio, control)
+                .await
+                .map_err(|error| NetworkError::Io(error.kind()))?;
+            return Self::direct(settings, Arc::new(sockets), civil_time);
+        }
+        let timeout = Duration::from_millis(config.policy.directory_timeout_ms.into());
+        let transport = tokio::time::timeout(timeout, async {
+            let address =
+                tokio::net::lookup_host((settings.proxy_host(), config.transport.proxy_port))
+                    .await
+                    .map_err(|error| NetworkError::Io(error.kind()))?
+                    .next()
+                    .ok_or(NetworkError::Io(io::ErrorKind::AddrNotAvailable))?;
+            connect(
+                address,
+                settings.callsign(),
+                settings.proxy_password(),
+                timeout,
+            )
+            .await
+            .map_err(NetworkError::Proxy)
+        })
+        .await
+        .map_err(|_| NetworkError::Proxy(ProxyError::Timeout))??;
+        let session = ProxySession::start(transport, timeout).map_err(NetworkError::Proxy)?;
+        Self::proxy(settings, session, civil_time)
+    }
+
     /// Start a direct account with already-bound sockets and an off-audio civil-time source.
     /// No login occurs during preparation. All directory I/O begins on the spawned owner.
     pub fn direct(
@@ -197,15 +251,50 @@ impl AccountNetwork {
         let task = runtime.spawn(owner.run());
         Ok((
             Self {
-                directory: view,
-                commands,
-                stopping,
+                control: NetworkControl {
+                    directory: view,
+                    commands,
+                    stopping,
+                },
                 task: Some(task),
             },
             output,
         ))
     }
 
+    /// Borrowable command lifetime is independent of the account's join ownership.
+    pub fn control(&self) -> NetworkControl {
+        self.control.clone()
+    }
+
+    /// Read-only current directory; a view alone never authorizes a QSO.
+    pub fn directory(&self) -> DirectoryView {
+        self.control.directory()
+    }
+
+    /// Request a route on the account owner, without blocking the executor.
+    pub async fn dial(&self, node: u32) -> Result<PeerConnection, NetworkError> {
+        self.control.dial(node).await
+    }
+
+    /// Accept a retained incoming token after the host's policy checks.
+    pub async fn accept(&self, token: u64) -> Result<PeerConnection, NetworkError> {
+        self.control.accept(token).await
+    }
+
+    /// Unregister an exact generation; control work must retry Full.
+    pub fn remove(&self, node: u32, generation: u64) -> Result<(), NetworkError> {
+        self.control.remove(node, generation)
+    }
+
+    /// Gate commands/routing, signal peers and finish one finite logout before returning.
+    pub async fn stop(mut self) -> Result<(), tokio::task::JoinError> {
+        self.control.stopping.send_replace(true);
+        self.task.take().unwrap().await
+    }
+}
+
+impl NetworkControl {
     async fn request(
         &self,
         command: impl FnOnce(oneshot::Sender<Result<PeerConnection, NetworkError>>) -> Command,
@@ -248,17 +337,11 @@ impl AccountNetwork {
                 mpsc::error::TrySendError::Closed(_) => NetworkError::Stopped,
             })
     }
-
-    /// Gate commands/routing, signal peers and finish one finite logout before returning.
-    pub async fn stop(mut self) -> Result<(), tokio::task::JoinError> {
-        self.stopping.send_replace(true);
-        self.task.take().unwrap().await
-    }
 }
 
 impl Drop for AccountNetwork {
     fn drop(&mut self) {
-        self.stopping.send_replace(true);
+        self.control.stopping.send_replace(true);
     }
 }
 

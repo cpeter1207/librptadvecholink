@@ -21,6 +21,7 @@ struct Context {
 struct Account {
     _runtime: Arc<tokio::runtime::Runtime>,
     _resources: Option<Arc<resources::Resources>>,
+    _settings: Option<Arc<account::settings::PreparedSettings>>,
 }
 
 #[repr(C)]
@@ -124,7 +125,7 @@ unsafe extern "C" fn context_destroy(context: *mut ffi::Context) {
 unsafe extern "C" fn account_prepare(
     context: *mut ffi::Context,
     config: *const AccountConfig,
-    _secrets: *const AccountSecrets,
+    secrets: *const AccountSecrets,
     output: *mut *mut ffi::Account,
 ) -> Status {
     // SAFETY: caller owns writable output when it is nonnull.
@@ -143,13 +144,26 @@ unsafe extern "C" fn account_prepare(
     if config.abi_version != 1 || config.enabled > 1 {
         return Status::Invalid;
     }
-    // Network capability is not published until the account/transport owner exists.
-    if config.enabled != 0 {
-        return Status::Unsupported;
-    }
+    // Preparation owns configuration and credentials but performs no socket/login
+    // operation. Activation/network capability remains separate and unpublished.
+    let settings = if config.enabled == 0 {
+        None
+    } else {
+        if context.resources.is_none() {
+            return Status::Unsupported;
+        }
+        let Some(secrets) = (unsafe { record(secrets) }) else {
+            return Status::Invalid;
+        };
+        match unsafe { account::settings::PreparedSettings::copy(config, secrets) } {
+            Ok(settings) => Some(Arc::new(settings)),
+            Err(status) => return status,
+        }
+    };
     *output = Box::into_raw(Box::new(Account {
         _runtime: Arc::clone(&context.runtime),
         _resources: context.resources.as_ref().map(Arc::clone),
+        _settings: settings,
     }))
     .cast();
     Status::Ok

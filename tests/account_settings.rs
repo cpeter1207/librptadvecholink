@@ -207,3 +207,47 @@ fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
     config.station.antenna_direction_deg = -0.5;
     assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
 }
+
+#[test]
+fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
+    let gsm = format!("{directory}/librptadv_codec_gsm.so.1");
+    let speex = format!("{directory}/librptadv_codec_speex.so.1");
+    let jitter = format!("{directory}/rpt_advanced/librptadv_jitter_adapter.so.1");
+    let runtime = RuntimeConfig {
+        worker_threads: 1,
+        gsm_library: span(&gsm),
+        speex_library: span(&speex),
+        jitter_library: span(&jitter),
+        ..RuntimeConfig::default()
+    };
+    let mut context = ptr::null_mut();
+    assert_eq!(
+        unsafe { api.context_create.unwrap()(&runtime, &mut context) },
+        Status::Ok
+    );
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.set_nonblocking(true).unwrap();
+    let address = tcp.local_addr().unwrap().to_string();
+    let servers = [span(&address)];
+    let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut config = settings("K1ABC-R", "North", &servers, &[]);
+    config.transport.audio_port = udp.local_addr().unwrap().port();
+    let mut account = ptr::null_mut();
+    let mut password = String::from("fixture-password");
+    assert_eq!(
+        unsafe {
+            api.account_prepare.unwrap()(context, &config, &secrets(&password), &mut account)
+        },
+        Status::Ok
+    );
+    password.replace_range(.., "removed");
+    assert_eq!(
+        tcp.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    unsafe { api.context_destroy.unwrap()(context) };
+    assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
+    unsafe { api.account_destroy.unwrap()(account) };
+}
