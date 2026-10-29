@@ -52,6 +52,12 @@ static DESCRIPTOR: Descriptor = Descriptor {
     peer_wake: None,
     peer_set_deadline: None,
     peer_destroy: Some(peer_destroy),
+    peer_read: None,
+    peer_prepare_audio: None,
+    peer_reset_encoder: None,
+    peer_send_prepared: None,
+    peer_elapsed_ms: None,
+    peer_send_text: None,
 };
 
 /// Borrow the immutable ABI-1 table while the shared library remains loaded.

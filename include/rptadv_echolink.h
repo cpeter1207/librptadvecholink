@@ -147,6 +147,34 @@ typedef void (*rptadv_echolink_event_fn)(void *, const struct rptadv_echolink_ev
 /** Serial peer turn; negative stops notification; no peer borrow spans the call. */
 typedef int32_t (*rptadv_echolink_step_fn)(void *);
 
+/** Synchronous accepted-prefix sink into the existing product ring.
+ * Callbacks cannot reenter this QSO and are never retained by the provider. */
+struct rptadv_echolink_pcm_sink_v1 {
+    uint32_t struct_size; /**< Complete readable size. */
+    uint32_t abi_version; /**< One. */
+    void *context; /**< Borrowed callback state. */
+    /** Normalized8kHz PCM, source position, count and codec-concealed flag.
+     * Return only accepted samples. Concealed PCM bypasses DTMF detection. */
+    size_t (*audio)(void *, uint64_t, const float *, size_t, uint32_t);
+    /** Ordered unresolved loss; return only accepted source-rate samples. */
+    uint32_t (*gap)(void *, uint64_t, uint32_t);
+};
+/** Literal human sender/body spans, borrowed only for this synchronous call. */
+typedef void (*rptadv_echolink_text_fn)(void *, struct rptadv_echolink_bytes_v1, struct rptadv_echolink_bytes_v1);
+/** One copied receive turn; finite completion is not inferred from occupancy. */
+struct rptadv_echolink_read_result_v1 {
+    uint32_t struct_size; /**< Caller-supplied complete writable size. */
+    uint32_t abi_version; /**< One. */
+    uint32_t progress; /**< Idle=0, advanced=1, blocked=2, provider drained=3. */
+    uint32_t activity; /**< No edge=0, selected key=1, selected unkey=2. */
+    /** Nonzero requests product-ring finish. Keep the exact token until
+     * Drained; cancellation/error never counts as successful playout. */
+    uint32_t finish_pending;
+    uint32_t state; /**< Connecting=0, connected=1, closing=2, closed=3. */
+};
+/** Released protocol-neutral result, defined by rptadv_codec.h. */
+struct rptadv_codec_encode_result_v1;
+
 /** Immutable table; unavailable slots are not advertised as capabilities. */
 struct rptadv_echolink_descriptor_v1 {
     uint32_t struct_size; /**< Complete readable table size. */
@@ -188,6 +216,26 @@ struct rptadv_echolink_descriptor_v1 {
     /** Compatible network-group tail; release off executor after stop/detach.
      * Null QSO is harmless. Lifecycle-only callers need not expose this tail. */
     void (*peer_destroy)(struct rptadv_echolink_qso *);
+    /** Compatible prepared-media group. Report product_drained only after the
+     * exact finite token succeeds. Sink/text callbacks cannot reenter this QSO. */
+    rptadv_echolink_status (*peer_read)(struct rptadv_echolink_qso *, uint32_t,
+        const struct rptadv_echolink_pcm_sink_v1 *, rptadv_echolink_text_fn, void *,
+        struct rptadv_echolink_read_result_v1 *);
+    /** Prepare at most one complete RTP packet off audio; output is the released
+     * neutral encode result. Short capacity consumes nothing. */
+    rptadv_echolink_status (*peer_prepare_audio)(struct rptadv_echolink_qso *,
+        const float *, size_t, uint8_t *, size_t, uint32_t, struct rptadv_codec_encode_result_v1 *);
+    /** Reset segment history, retaining the connection's RTP sequence/clock. */
+    rptadv_echolink_status (*peer_reset_encoder)(struct rptadv_echolink_qso *);
+    /** Full/Pending consumes nothing; retain identical bytes for retry.
+     * Frame count/timestamp retain the product's existing pacing contract. */
+    rptadv_echolink_status (*peer_send_prepared)(struct rptadv_echolink_qso *,
+        struct rptadv_echolink_bytes_v1, uint32_t, uint32_t);
+    /** Copy monotonic elapsed milliseconds for existing product pacing. */
+    rptadv_echolink_status (*peer_elapsed_ms)(const struct rptadv_echolink_qso *, uint64_t *);
+    /** Compatible text group; never send ASL control envelopes here. */
+    rptadv_echolink_status (*peer_send_text)(struct rptadv_echolink_qso *,
+        struct rptadv_echolink_bytes_v1, struct rptadv_echolink_bytes_v1);
 };
 /** Borrow the immutable table while the DSO remains loaded. */
 const struct rptadv_echolink_descriptor_v1 *rptadv_echolink_descriptor_v1(void);

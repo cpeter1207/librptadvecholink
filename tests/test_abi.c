@@ -8,6 +8,14 @@ _Static_assert(offsetof(struct rptadv_echolink_event_v1, taken) == 32,
                "incoming ownership acknowledgement layout");
 _Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,
                "complete borrowed incoming event layout");
+_Static_assert(sizeof(struct rptadv_echolink_read_result_v1) == 24,
+               "source-rate read result layout");
+_Static_assert(offsetof(struct rptadv_echolink_read_result_v1, finish_pending) == 16,
+               "finite-completion request layout");
+_Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, peer_read) ==
+                   offsetof(struct rptadv_echolink_descriptor_v1, peer_destroy) +
+                       sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->peer_destroy),
+               "media tail preserves the network prefix");
 
 int main(int argc, char **argv)
 {
