@@ -452,7 +452,13 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         let status = unsafe {
             trace.api.peer_read.unwrap()(
                 trace.qso,
-                u32::from(trace.drained.load(Ordering::Acquire)),
+                // A retired Speex product generation discards its accepted tail;
+                // GSM proves successful playout. Neither may release before the token.
+                if trace.drained.load(Ordering::Acquire) {
+                    if trace.speex { 2 } else { 1 }
+                } else {
+                    0
+                },
                 &sink,
                 Some(text),
                 context,
@@ -713,7 +719,14 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         );
         serial.drained.store(true, Ordering::Release);
         unsafe { api.peer_wake.unwrap()(registration) };
-        wait(|| serial.unkeyed.load(Ordering::Acquire));
+        wait(|| {
+            serial.unkeyed.load(Ordering::Acquire) || serial.errors.load(Ordering::Acquire) != 0
+        });
+        assert_eq!(
+            serial.errors.load(Ordering::Acquire),
+            0,
+            "played and explicitly cancelled finite prefixes must both release the talker"
+        );
         unsafe { api.peer_stop.unwrap()(registration) };
         wait(|| serial.closed.load(Ordering::Acquire));
         let mut control = [0; 512];

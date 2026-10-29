@@ -225,8 +225,9 @@ impl Receiver {
         Ok(action.map_or(Incoming::Ignored, Incoming::Action))
     }
 
-    /// Advance one retained grant and one jitter prefix. Product drain includes
-    /// its pending input and inbound ring, not merely successful PCM publication.
+    /// Advance one retained grant and one jitter prefix. Product release means
+    /// its exact finite prefix either played or was explicitly discarded by a
+    /// retired generation, not merely successful PCM publication.
     pub fn poll(
         &mut self,
         now: Instant,

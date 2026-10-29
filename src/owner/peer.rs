@@ -382,7 +382,7 @@ pub(crate) unsafe extern "C" fn peer_read(
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
-    if drained > 1
+    if drained > 2
         || output.is_null()
         || unsafe { ptr::addr_of!((*output).struct_size).read() } < size_of::<ReadResult>() as u32
         || unsafe { ptr::addr_of!((*output).abi_version).read() } != 1
@@ -422,7 +422,7 @@ pub(crate) unsafe extern "C" fn peer_read(
         }
         let turn = match serial
             .receiver
-            .poll(Instant::now(), drained == 1, &mut Sink(sink))
+            .poll(Instant::now(), drained != 0, &mut Sink(sink))
         {
             Ok(turn) => turn,
             Err(_) => {

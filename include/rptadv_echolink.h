@@ -217,8 +217,11 @@ struct rptadv_echolink_descriptor_v1 {
     /** Compatible network-group tail; release off executor after stop/detach.
      * Null QSO is harmless. Lifecycle-only callers need not expose this tail. */
     void (*peer_destroy)(struct rptadv_echolink_qso *);
-    /** Compatible prepared-media group. Report product_drained only after the
-     * exact finite token succeeds. Sink/text callbacks cannot reenter this QSO.
+    /** Compatible prepared-media group. Completion is 0 while pending, 1 only
+     * after the exact finite token plays, or 2 when that product generation was
+     * explicitly discarded. Cancellation does not claim successful playout.
+     * A completing turn must reject new PCM/gaps; retry them on the next turn.
+     * Sink/text callbacks cannot reenter this QSO.
      * A null sink queries state without consuming PCM/text or advancing playout. */
     rptadv_echolink_status (*peer_read)(struct rptadv_echolink_qso *, uint32_t,
         const struct rptadv_echolink_pcm_sink_v1 *, rptadv_echolink_text_fn, void *,
