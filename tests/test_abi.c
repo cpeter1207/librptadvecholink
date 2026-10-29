@@ -12,8 +12,10 @@ _Static_assert(offsetof(struct rptadv_echolink_peer_info_v1, source) == 64,
                "observed incoming endpoint tail layout");
 _Static_assert(sizeof(struct rptadv_echolink_peer_info_v1) == 80,
                "complete verified identity record layout");
-_Static_assert(sizeof(struct rptadv_echolink_read_result_v1) == 24,
+_Static_assert(sizeof(struct rptadv_echolink_read_result_v1) == 28,
                "source-rate read result layout");
+_Static_assert(offsetof(struct rptadv_echolink_read_result_v1, represented_node_number) == 24,
+               "represented human sender identity tail layout");
 _Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, account_apply_prepared) ==
                    offsetof(struct rptadv_echolink_descriptor_v1, peer_send_text) +
                        sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->peer_send_text),

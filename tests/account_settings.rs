@@ -260,6 +260,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         packet: std::sync::Mutex<Vec<u8>>,
         packet_time: AtomicUsize,
         texts: AtomicUsize,
+        represented: AtomicUsize,
         pcm: AtomicUsize,
         gaps: AtomicUsize,
         keyed: AtomicBool,
@@ -417,6 +418,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             audio: Some(audio),
             gap: Some(gap),
         };
+        let texts_before = trace.texts.load(Ordering::Acquire);
         let status = unsafe {
             trace.api.peer_read.unwrap()(
                 trace.qso,
@@ -433,6 +435,11 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
                 &mut result,
             )
         };
+        if trace.texts.load(Ordering::Acquire) != texts_before {
+            trace
+                .represented
+                .store(result.represented_node_number as usize, Ordering::Release);
+        }
         if status != Status::Ok {
             trace.errors.fetch_add(1, Ordering::Release);
         }
@@ -619,6 +626,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             packet: std::sync::Mutex::new(Vec::new()),
             packet_time: AtomicUsize::new(0),
             texts: AtomicUsize::new(0),
+            represented: AtomicUsize::new(usize::MAX),
             pcm: AtomicUsize::new(0),
             gaps: AtomicUsize::new(0),
             keyed: AtomicBool::new(false),
@@ -674,7 +682,9 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
                 (std::net::Ipv4Addr::LOCALHOST, port),
             )
             .unwrap();
-        wait(|| serial.texts.load(Ordering::Acquire) == 1);
+        wait(|| serial.represented.load(Ordering::Acquire) != usize::MAX);
+        assert_eq!(serial.texts.load(Ordering::Acquire), 1);
+        assert_eq!(serial.represented.load(Ordering::Acquire), 123456);
         let mut encoded = [0; 264];
         let (media_length, _) = media.recv_from(&mut encoded).unwrap();
         assert_eq!(&encoded[..4], &[0xc0, if speex { 0x96 } else { 3 }, 0, 0]);

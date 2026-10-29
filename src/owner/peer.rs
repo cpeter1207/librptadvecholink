@@ -452,6 +452,14 @@ pub(crate) unsafe extern "C" fn peer_read(
         }
         if let Some(callback) = text {
             if let Some((sender, body)) = serial.text.take() {
+                // A conference's represented sender is not its authenticated QSO.
+                // Only a fresh, exact directory match supplies a numeric alias.
+                result.represented_node_number = peer
+                    .binding
+                    .control
+                    .directory()
+                    .by_callsign(&sender, Instant::now())
+                    .map_or(0, |entry| entry.node_number);
                 unsafe {
                     callback(
                         opaque,

@@ -176,6 +176,9 @@ struct rptadv_echolink_read_result_v1 {
      * Drained; cancellation/error never counts as successful playout. */
     uint32_t finish_pending;
     uint32_t state; /**< Connecting=0, connected=1, closing=2, closed=3. */
+    /** Fresh directory identity for this turn's single human-text callback;
+     * zero is unresolved. Never QSO authentication or command authority. */
+    uint32_t represented_node_number;
 };
 /** Released protocol-neutral result, defined by rptadv_codec.h. */
 struct rptadv_codec_encode_result_v1;

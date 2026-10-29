@@ -139,6 +139,20 @@ impl DirectorySnapshot {
             .ok_or(AdmissionError::Unknown)
     }
 
+    /// Copy a fresh represented sender, without granting endpoint authentication
+    /// or attributing a conference-relayed claim to the conference itself.
+    pub fn by_callsign(
+        &self,
+        callsign: &str,
+        now: Instant,
+    ) -> Result<DirectoryEntry, AdmissionError> {
+        self.require_fresh(now)?;
+        self.entries
+            .get(&callsign.to_ascii_uppercase())
+            .cloned()
+            .ok_or(AdmissionError::Unknown)
+    }
+
     pub(crate) fn require_fresh(&self, now: Instant) -> Result<(), AdmissionError> {
         self.published
             .and_then(|published| now.checked_duration_since(published))
@@ -307,6 +321,14 @@ impl DirectoryView {
     /// Copy the current fresh numeric identity, without reserving a QSO.
     pub fn by_node(&self, node: u32, now: Instant) -> Result<DirectoryEntry, AdmissionError> {
         self.0.load().by_node(node, now)
+    }
+    /// Resolve only represented chat identity; never replace address verification.
+    pub fn by_callsign(
+        &self,
+        callsign: &str,
+        now: Instant,
+    ) -> Result<DirectoryEntry, AdmissionError> {
+        self.0.load().by_callsign(callsign, now)
     }
     /// Recheck current callsign/address/freshness after pending host work.
     pub fn lookup(

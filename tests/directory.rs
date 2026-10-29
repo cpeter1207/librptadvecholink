@@ -10,6 +10,41 @@ use std::{
 const FULL: &[u8] = b"@@@\n2:first\nK1ABC-R\nNorth [ON 12:00]\n123456\n192.0.2.1\nK2ABC-L\nSouth [ON 12:00]\n234567\n192.0.2.1\n+++\n";
 
 #[test]
+fn represented_callsign_uses_only_an_exact_fresh_directory_identity() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    assert_eq!(
+        snapshot.by_callsign("K1ABC-R", now),
+        Err(AdmissionError::Stale)
+    );
+    snapshot.update(FULL, now).unwrap();
+    assert_eq!(
+        snapshot.by_callsign("k1abc-r", now).unwrap().node_number,
+        123456
+    );
+    for callsign in ["K1ABC", "K1ABC-L", "K1ABC-R ", "K1ABC-R suffix", "K9XYZ"] {
+        assert_eq!(
+            snapshot.by_callsign(callsign, now),
+            Err(AdmissionError::Unknown)
+        );
+    }
+    assert!(
+        snapshot
+            .by_callsign("K1ABC-R", now + Duration::from_secs(899))
+            .is_ok()
+    );
+    assert_eq!(
+        snapshot.by_callsign("K1ABC-R", now + Duration::from_secs(900)),
+        Err(AdmissionError::Stale)
+    );
+    // Representation does not relax endpoint authentication for this callsign.
+    assert_eq!(
+        snapshot.lookup("K1ABC-R", Ipv4Addr::LOCALHOST, now),
+        Err(AdmissionError::Address)
+    );
+}
+
+#[test]
 fn snapshot_tokens_keep_the_full_asl_directory_field() {
     let now = Instant::now();
     let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
