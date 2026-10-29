@@ -45,6 +45,12 @@ pub(super) struct Serial {
     writable: Option<crate::transport::driver::PeerWritable>,
     text: Option<(String, String)>,
     blocked: bool,
+    direct_datagrams: u64,
+    blocked_sends: u64,
+    proxy_admitted: u64,
+    text_admitted: u64,
+    text_rejected: u64,
+    cause_detail: [u8; 32],
 }
 
 struct Registration {
@@ -185,6 +191,12 @@ pub(crate) unsafe extern "C" fn peer_attach(
         writable: None,
         text: None,
         blocked: false,
+        direct_datagrams: 0,
+        blocked_sends: 0,
+        proxy_admitted: 0,
+        text_admitted: 0,
+        text_rejected: 0,
+        cause_detail: [0; 32],
     };
     if serial.queue_control(peer, false).is_err() {
         return Status::Invalid;
@@ -250,6 +262,16 @@ fn timers(policy: &ffi::AccountPolicy) -> Timers {
 }
 
 impl Serial {
+    fn remember(&mut self, error: &impl std::fmt::Debug) {
+        if self.cause_detail[0] == 0
+            && matches!(
+                self.receiver.state(),
+                QsoState::Connecting | QsoState::Connected
+            )
+        {
+            self.cause_detail = super::diagnostics::detail(error);
+        }
+    }
     fn queue_control(&mut self, peer: &Peer, bye: bool) -> Result<(), Status> {
         let packet = if bye {
             ControlPacket::Bye {
@@ -308,12 +330,19 @@ impl Serial {
                     },
                 );
                 match sockets.try_send(channel, destination, payload) {
-                    Ok(()) => Status::Ok,
+                    Ok(()) => {
+                        self.direct_datagrams = self.direct_datagrams.saturating_add(1);
+                        Status::Ok
+                    }
                     Err(SendError::Pending) => {
+                        self.blocked_sends = self.blocked_sends.saturating_add(1);
                         self.writable = Some(PeerWritable::Direct(Arc::clone(sockets), channel));
                         Status::Pending
                     }
-                    Err(SendError::Failed(_)) => Status::Failed,
+                    Err(SendError::Failed(error)) => {
+                        self.remember(&error);
+                        Status::Failed
+                    }
                 }
             }
             PeerTransport::Proxy(output) => {
@@ -330,8 +359,12 @@ impl Serial {
                     },
                     expires,
                 ) {
-                    Ok(()) => Status::Ok,
+                    Ok(()) => {
+                        self.proxy_admitted = self.proxy_admitted.saturating_add(1);
+                        Status::Ok
+                    }
                     Err(QueueError::Full) => {
+                        self.blocked_sends = self.blocked_sends.saturating_add(1);
                         self.writable = Some(PeerWritable::Proxy {
                             output: output.clone(),
                             kind,
@@ -350,12 +383,12 @@ impl Serial {
         let settings = peer.binding.current.load_full();
         if !Arc::ptr_eq(&self.settings, &settings) {
             let policy = &settings.as_abi().policy;
-            if self
+            if let Err(error) = self
                 .receiver
                 .reconfigure(policy.receive_gain_db, timers(policy))
-                .is_err()
-                || self.encoder.set_gain(policy.transmit_gain_db).is_err()
+                .and_then(|_| self.encoder.set_gain(policy.transmit_gain_db))
             {
+                self.remember(&error);
                 let action = self.receiver.control(QsoEvent::OwnerFailed, Instant::now());
                 self.action(peer, action);
                 return;
@@ -376,12 +409,17 @@ impl Serial {
                 }
                 Ok(Incoming::Action(action)) => Some(action),
                 Ok(_) => None,
-                Err(_) => self.receiver.control(QsoEvent::OwnerFailed, Instant::now()),
+                Err(error) => {
+                    self.remember(&error);
+                    self.receiver.control(QsoEvent::OwnerFailed, Instant::now())
+                }
             },
             PeerEvent::Close => self.receiver.control(QsoEvent::Stop, Instant::now()),
-            PeerEvent::Io(_) => self
-                .receiver
-                .control(QsoEvent::TransportLost, Instant::now()),
+            PeerEvent::Io(error) => {
+                self.remember(&error);
+                self.receiver
+                    .control(QsoEvent::TransportLost, Instant::now())
+            }
             _ => self.receiver.control(QsoEvent::Poll, Instant::now()),
         };
         self.action(peer, action);
@@ -480,7 +518,8 @@ pub(crate) unsafe extern "C" fn peer_read(
             .poll(Instant::now(), drained != 0, &mut Sink(sink))
         {
             Ok(turn) => turn,
-            Err(_) => {
+            Err(error) => {
+                serial.remember(&error);
                 serial
                     .receiver
                     .control(QsoEvent::OwnerFailed, Instant::now());
@@ -571,7 +610,10 @@ pub(crate) unsafe extern "C" fn peer_prepare_audio(
     }
     let result = match serial.encoder.prepare(input, buffer, flush == 1) {
         Ok(result) => result,
-        Err(_) => return Status::Failed,
+        Err(error) => {
+            serial.remember(&error);
+            return Status::Failed;
+        }
     };
     unsafe {
         ptr::write(
@@ -694,19 +736,104 @@ pub(crate) unsafe extern "C" fn peer_send_text(
         }
         std::str::from_utf8(unsafe { std::slice::from_raw_parts(span.data, span.length) }).ok()
     };
-    let (Some(sender), Some(body)) = (text(sender, 64), text(body, crate::wire::MAX_CHAT_BYTES))
-    else {
-        return Status::Invalid;
-    };
-    let mut packet = [0; 4170];
-    let Ok(count) = crate::wire::write_chat(sender, body, &mut packet) else {
-        return Status::Invalid;
-    };
-    match serial.receiver.state() {
-        QsoState::Connecting => Status::Pending,
-        QsoState::Closing | QsoState::Closed => Status::Closed,
-        QsoState::Connected => serial.send(peer, Channel::Audio, &packet[..count], None),
+    let status = (|| {
+        let (Some(sender), Some(body)) =
+            (text(sender, 64), text(body, crate::wire::MAX_CHAT_BYTES))
+        else {
+            return Status::Invalid;
+        };
+        let mut packet = [0; 4170];
+        let Ok(count) = crate::wire::write_chat(sender, body, &mut packet) else {
+            return Status::Invalid;
+        };
+        match serial.receiver.state() {
+            QsoState::Connecting => Status::Pending,
+            QsoState::Closing | QsoState::Closed => Status::Closed,
+            QsoState::Connected => serial.send(peer, Channel::Audio, &packet[..count], None),
+        }
+    })();
+    if status == Status::Ok {
+        serial.text_admitted = serial.text_admitted.saturating_add(1);
+    } else {
+        serial.text_rejected = serial.text_rejected.saturating_add(1);
     }
+    status
+}
+
+pub(crate) unsafe extern "C" fn peer_observe(
+    qso: *const ffi::Qso,
+    output: *mut ffi::PeerObservation,
+) -> Status {
+    if !unsafe { super::diagnostics::output(output) } {
+        return Status::Invalid;
+    }
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    // This operation shares peer_read's sole serial-owner contract. Closing state
+    // remains readable until detach, so do not hide the first cause behind live().
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_ref() }) else {
+        return Status::Pending;
+    };
+    let observed = match serial.receiver.observe(Instant::now()) {
+        Ok(observed) => observed,
+        Err(_) => return Status::Failed,
+    };
+    let jitter = observed.jitter;
+    let result = ffi::PeerObservation {
+        struct_size: size_of::<ffi::PeerObservation>() as u32,
+        abi_version: 1,
+        state: match observed.session.state {
+            QsoState::Connecting => 0,
+            QsoState::Connected => 1,
+            QsoState::Closing => 2,
+            QsoState::Closed => 3,
+        },
+        first_cause: match observed.session.first_cause {
+            None => 0,
+            Some(crate::session::Cause::LocalRequest) => 1,
+            Some(crate::session::Cause::RemoteBye) => 2,
+            Some(crate::session::Cause::ConnectExpired) => 3,
+            Some(crate::session::Cause::LivenessExpired) => 4,
+            Some(crate::session::Cause::TransportLost) => 5,
+            Some(crate::session::Cause::OwnerFailed) => 6,
+        },
+        cause_detail: serial.cause_detail,
+        codec: u32::from(observed.codec == Codec::Speex),
+        raw_receiving: u32::from(observed.session.raw_receiving),
+        selected: u32::from(observed.selected),
+        transport: u32::from(matches!(serial.transport, PeerTransport::Proxy(_))),
+        last_valid_age_ms: observed.session.last_valid_age_ms,
+        heartbeat_due_ms: observed.session.heartbeat_due_ms,
+        liveness_due_ms: observed.session.liveness_due_ms,
+        retained_age_ms: observed.retained_age_ms,
+        stale_packets: observed.stale_packets,
+        malformed_packets: observed.malformed_packets,
+        out_of_order_packets: observed.out_of_order_packets,
+        jitter: ffi::JitterObservation {
+            queued_packets: jitter.queued_packets,
+            delay_samples: jitter.delay,
+            buffered_samples: jitter.buffered_span,
+            duplicate_drops: jitter.duplicate_drops,
+            late_drops: jitter.late_drops,
+            full_drops: jitter.full_drops,
+            missing_samples: jitter.missing_span,
+            insertion_samples: jitter.insertion_span,
+            skipped_samples: jitter.skipped_span,
+            limit_resets: jitter.limit_resets,
+            overload_drops: jitter.overload_drops,
+            overload_samples: jitter.overload_span,
+        },
+        codec_plc_samples: observed.concealment.codec_samples,
+        fallback_gap_samples: observed.concealment.gap_samples,
+        direct_datagrams: serial.direct_datagrams,
+        blocked_sends: serial.blocked_sends,
+        proxy_admitted: serial.proxy_admitted,
+        text_admitted: serial.text_admitted,
+        text_rejected: serial.text_rejected,
+    };
+    unsafe { ptr::write(output, result) };
+    Status::Ok
 }
 
 pub(crate) unsafe extern "C" fn peer_stop(registration: *mut ffi::Registration) {

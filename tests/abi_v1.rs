@@ -202,3 +202,30 @@ fn unsupported_enabled_accounts_and_invalid_records_fail_closed() {
     );
     unsafe { api.context_destroy.unwrap()(context) };
 }
+#[test]
+fn observer_ports_reject_invalid_handles_and_incomplete_records() {
+    use rptadv_echolink::ffi::{AccountObservation, PeerObservation, Status};
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let mut account = AccountObservation {
+        struct_size: std::mem::size_of::<AccountObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    let mut peer = PeerObservation {
+        struct_size: std::mem::size_of::<PeerObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe {
+            api.account_observe.expect("account observer missing")(std::ptr::null(), &mut account)
+        },
+        Status::Invalid
+    );
+    assert_eq!(
+        unsafe {
+            api.peer_observe.expect("serial peer observer missing")(std::ptr::null(), &mut peer)
+        },
+        Status::Invalid
+    );
+}

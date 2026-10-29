@@ -8,6 +8,16 @@ _Static_assert(offsetof(struct rptadv_echolink_event_v1, taken) == 32,
                "incoming ownership acknowledgement layout");
 _Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,
                "complete borrowed incoming event layout");
+_Static_assert(sizeof(struct rptadv_echolink_account_observation_v1) == 264,
+               "complete account metadata layout");
+_Static_assert(sizeof(struct rptadv_echolink_peer_observation_v1) == 264,
+               "complete serial peer metadata layout");
+_Static_assert(offsetof(struct rptadv_echolink_peer_observation_v1, jitter) == 120,
+               "source-clock jitter metadata layout");
+_Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, account_observe) ==
+                   offsetof(struct rptadv_echolink_descriptor_v1, account_apply_prepared) +
+                       sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->account_apply_prepared),
+               "observer tail preserves prepared account application");
 _Static_assert(offsetof(struct rptadv_echolink_peer_info_v1, source) == 64,
                "observed incoming endpoint tail layout");
 _Static_assert(sizeof(struct rptadv_echolink_peer_info_v1) == 80,

@@ -215,12 +215,35 @@ fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
         Status::Ok
     );
     password.replace_range(.., "removed");
+    let observe = api
+        .account_observe
+        .expect("account metadata operation missing");
+    let mut status = AccountObservation {
+        struct_size: size_of::<AccountObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    assert_eq!(unsafe { observe(account, &mut status) }, Status::Ok);
+    assert_eq!(
+        (status.state, status.generation, status.available),
+        (0, 0, 0)
+    );
+    let mut prefix = [8_u32, 1];
+    assert_eq!(
+        unsafe { observe(account, prefix.as_mut_ptr().cast()) },
+        Status::Invalid
+    );
+    status.abi_version = 2;
+    assert_eq!(unsafe { observe(account, &mut status) }, Status::Invalid);
+    status.abi_version = 1;
     assert_eq!(
         tcp.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
     unsafe { api.context_destroy.unwrap()(context) };
     assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
+    assert_eq!(unsafe { observe(account, &mut status) }, Status::Ok);
+    assert_eq!((status.state, status.available), (5, 0));
     unsafe { api.account_destroy.unwrap()(account) };
 }
 
@@ -453,6 +476,25 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             trace.finish.store(true, Ordering::Release);
         }
         let closed = result.state == 3;
+        let mut observation = PeerObservation {
+            struct_size: size_of::<PeerObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
+        };
+        let mut prefix = [8_u32, 1];
+        if unsafe { trace.api.peer_observe.unwrap()(trace.qso, prefix.as_mut_ptr().cast()) }
+            != Status::Invalid
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+        if unsafe { trace.api.peer_observe.unwrap()(trace.qso, &mut observation) } != Status::Ok
+            || observation.state != result.state
+            || observation.text_admitted != 1
+            || observation.direct_datagrams == 0
+            || (closed && observation.first_cause != 1)
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
         trace.closed.store(closed, Ordering::Release);
         if unsafe { trace.api.peer_info.unwrap()(trace.qso, &mut identity) } != Status::Ok
             || identity.node_number != 123456
@@ -572,6 +614,25 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             Status::Ok
         );
         wait(|| trace.fresh.load(Ordering::Acquire));
+        let mut health = AccountObservation {
+            struct_size: size_of::<AccountObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { api.account_observe.unwrap()(account, &mut health) },
+            Status::Ok
+        );
+        assert_eq!(
+            (
+                health.state,
+                health.fresh,
+                health.registered,
+                health.available
+            ),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(health.directory_operations, 2);
         let mut outgoing = ptr::null_mut();
         assert_eq!(
             unsafe { api.dial.unwrap()(account, 654321, &mut outgoing) },

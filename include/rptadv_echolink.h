@@ -183,6 +183,91 @@ struct rptadv_echolink_read_result_v1 {
 /** Released protocol-neutral result, defined by rptadv_codec.h. */
 struct rptadv_codec_encode_result_v1;
 
+/** Serial-owner jitter counters; all sample counts use the8kHz source clock. */
+struct rptadv_echolink_jitter_observation_v1 {
+    uint32_t queued_packets; /**< Retained packets. */
+    uint32_t delay_samples; /**< Adaptive delay. */
+    uint64_t buffered_samples; /**< Retained packet duration. */
+    uint64_t duplicate_drops; /**< Duplicate packets rejected. */
+    uint64_t late_drops; /**< Packets too late for playout. */
+    uint64_t full_drops; /**< Queue-bound rejections. */
+    uint64_t missing_samples; /**< Released missing duration, not wire-loss proof. */
+    uint64_t insertion_samples; /**< Added playout delay. */
+    uint64_t skipped_samples; /**< Media skipped during delay reduction. */
+    uint64_t limit_resets; /**< Adaptive delay-limit resets. */
+    uint64_t overload_drops; /**< Packets shed during overload recovery. */
+    uint64_t overload_samples; /**< Duration shed during overload recovery. */
+};
+/** Account-wide Proxy output; individually atomic, not a transactional snapshot. */
+struct rptadv_echolink_proxy_observation_v1 {
+    uint64_t admitted; /**< Records admitted, not actual sends. */
+    uint64_t sent; /**< Complete TCP writes, not remote receipt. */
+    uint64_t expired; /**< Expired records discarded before submission. */
+    uint64_t stalls; /**< Distinct socket-not-ready episodes. */
+    uint64_t stall_ms; /**< Cumulative milliseconds including an active stall. */
+    uint64_t queued_bytes; /**< Retained payload, including partial writes. */
+    uint64_t head_age_ms; /**< Current head age; zero when no head is selected. */
+};
+/** Account control snapshot. Unknown ages/deadlines are UINT64_MAX.
+ * Does not require a QSO; no status field grants admission authority. */
+struct rptadv_echolink_account_observation_v1 {
+    uint32_t struct_size; /**< Complete writable size. */
+    uint32_t abi_version; /**< One. */
+    uint32_t state; /**< Prepared0/registering1/online2/retrying3/stopping4/stopped5/disabled6/failed7. */
+    uint32_t transport; /**< Selected direct UDP0 or standard TCP Proxy1. */
+    uint32_t node_number; /**< Full real account ID; zero when unconfigured. */
+    uint32_t fresh; /**< Nonzero for a fresh committed directory. */
+    uint32_t registered; /**< Successful login has not been logged out. */
+    uint32_t available; /**< Account-owner counters were acquired successfully. */
+    uint64_t generation; /**< Exact account generation. */
+    uint64_t first_cause; /**< None0/I/O1/Proxy2/owner3. */
+    uint8_t cause_detail[32]; /**< NUL-padded ASCII category, max31bytes; never payloads/secrets. */
+    uint64_t directory_failures; /**< Failed matching transactions. */
+    uint64_t directory_operations; /**< Started operations, including logout. */
+    uint64_t registration_age_ms; /**< Age of last successful login. */
+    uint64_t snapshot_age_ms; /**< Age of last complete publication. */
+    uint64_t retry_in_ms; /**< Remaining retry delay, or inactive. */
+    uint64_t admitted; /**< Admitted QSOs. */
+    uint64_t pending; /**< Verified retained incoming candidates. */
+    uint64_t selected_node; /**< Real selected station ID, or zero. */
+    uint64_t selected_generation; /**< Selected QSO generation, or zero. */
+    uint64_t receiving; /**< Selected raw receive activity. */
+    uint64_t suppressed_packets; /**< Valid competing talker packets suppressed. */
+    uint64_t control_overflows; /**< Talker-control credit failures. */
+    uint64_t routed_packets; /**< Packets admitted to exact peer mailboxes. */
+    uint64_t dropped_packets; /**< Unroutable or mailbox-rejected packets. */
+    uint64_t malformed_packets; /**< Wire-parser failures; subset of drops. */
+    uint64_t ingress_full_packets; /**< Full-mailbox packet drops, never hangups. */
+    struct rptadv_echolink_proxy_observation_v1 proxy; /**< Proxy output; zero in direct mode. */
+};
+/** Peer metadata, acquired only inside its sole registered serial step. */
+struct rptadv_echolink_peer_observation_v1 {
+    uint32_t struct_size; /**< Complete writable size. */
+    uint32_t abi_version; /**< One. */
+    uint32_t state; /**< Connecting0/connected1/closing2/closed3. */
+    uint32_t first_cause; /**< None0/local1/remote-BYE2/connect-expired3/liveness-expired4/transport5/owner6. */
+    uint8_t cause_detail[32]; /**< First content-free error category, NUL-padded ASCII. */
+    uint32_t codec; /**< Negotiated outbound GSM-FR0 or narrowband Speex1. */
+    uint32_t raw_receiving; /**< Session-bound packet activity. */
+    uint32_t selected; /**< Selected/draining RF activity. */
+    uint32_t transport; /**< Direct UDP0 or standard TCP Proxy1. */
+    uint64_t last_valid_age_ms; /**< Age of last valid voice/control packet. */
+    uint64_t heartbeat_due_ms; /**< Remaining heartbeat deadline, or UINT64_MAX. */
+    uint64_t liveness_due_ms; /**< Remaining setup/liveness deadline, or UINT64_MAX. */
+    uint64_t retained_age_ms; /**< Retained original datagram age; zero if none. */
+    uint64_t stale_packets; /**< Retired generation packets. */
+    uint64_t malformed_packets; /**< Invalid wire/media framing. */
+    uint64_t out_of_order_packets; /**< Lower RTP sequences, excluding equal duplicates. */
+    struct rptadv_echolink_jitter_observation_v1 jitter; /**< Actual source-clock jitter data. */
+    uint64_t codec_plc_samples; /**< Native codec PLC accepted by product. */
+    uint64_t fallback_gap_samples; /**< Ordered unresolved spans accepted for ring PLC. */
+    uint64_t direct_datagrams; /**< UDP sends accepted by socket. */
+    uint64_t blocked_sends; /**< Socket/Proxy credit-blocked attempts. */
+    uint64_t proxy_admitted; /**< Proxy queue admissions, not TCP sends. */
+    uint64_t text_admitted; /**< Human messages admitted by selected transport. */
+    uint64_t text_rejected; /**< Human messages rejected before admission. */
+};
+
 /** Immutable table; unavailable slots are not advertised as capabilities. */
 struct rptadv_echolink_descriptor_v1 {
     uint32_t struct_size; /**< Complete readable table size. */
@@ -263,6 +348,13 @@ struct rptadv_echolink_descriptor_v1 {
      * No configuration spans or credentials are reread during application. */
     rptadv_echolink_status (*account_apply_prepared)(struct rptadv_echolink_account *,
         struct rptadv_echolink_account *);
+    /** Copy account metadata off provider/audio executors. May wait on the existing
+     * account control owner; never hold a peer borrow or an account/map lock. */
+    rptadv_echolink_status (*account_observe)(const struct rptadv_echolink_account *,
+        struct rptadv_echolink_account_observation_v1 *);
+    /** Copy metadata only inside this peer's sole registered serial step. */
+    rptadv_echolink_status (*peer_observe)(const struct rptadv_echolink_qso *,
+        struct rptadv_echolink_peer_observation_v1 *);
 };
 /** Borrow the immutable table while the DSO remains loaded. */
 const struct rptadv_echolink_descriptor_v1 *rptadv_echolink_descriptor_v1(void);

@@ -21,10 +21,13 @@ use std::{
     },
     time::{Duration, Instant},
 };
+mod diagnostics;
 mod peer;
+pub(crate) use diagnostics::account_observe;
 pub(crate) use peer::{
-    peer_attach, peer_detach, peer_elapsed_ms, peer_prepare_audio, peer_read, peer_reset_encoder,
-    peer_send_prepared, peer_send_text, peer_set_deadline, peer_stop, peer_wake,
+    peer_attach, peer_detach, peer_elapsed_ms, peer_observe, peer_prepare_audio, peer_read,
+    peer_reset_encoder, peer_send_prepared, peer_send_text, peer_set_deadline, peer_stop,
+    peer_wake,
 };
 use tokio::{
     runtime::{Handle, Runtime},
