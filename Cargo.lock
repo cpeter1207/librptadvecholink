@@ -239,6 +239,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "flate2",
+ "libc",
  "libloading",
  "md-5",
  "rptadv-codec-client",

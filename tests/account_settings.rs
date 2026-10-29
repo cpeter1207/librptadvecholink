@@ -208,9 +208,7 @@ fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
     assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
 }
 
-#[test]
-fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
-    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+fn resource_context(api: &Descriptor) -> *mut Context {
     let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
     let gsm = format!("{directory}/librptadv_codec_gsm.so.1");
     let speex = format!("{directory}/librptadv_codec_speex.so.1");
@@ -227,6 +225,13 @@ fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
         unsafe { api.context_create.unwrap()(&runtime, &mut context) },
         Status::Ok
     );
+    context
+}
+
+#[test]
+fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = resource_context(api);
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     tcp.set_nonblocking(true).unwrap();
     let address = tcp.local_addr().unwrap().to_string();
@@ -250,4 +255,178 @@ fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
     unsafe { api.context_destroy.unwrap()(context) };
     assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
     unsafe { api.account_destroy.unwrap()(account) };
+}
+
+#[test]
+fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
+    use std::{
+        io::{BufRead, Write},
+        sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+    fn info() -> PeerInfo {
+        PeerInfo {
+            struct_size: size_of::<PeerInfo>() as u32,
+            abi_version: 1,
+            node_number: 0,
+            capabilities: 0,
+            account_generation: 0,
+            qso_generation: 0,
+            callsign: ByteSpan::default(),
+            local_node: ByteSpan::default(),
+        }
+    }
+    struct Trace {
+        api: &'static Descriptor,
+        fresh: AtomicBool,
+        incoming: AtomicPtr<Qso>,
+        rejected: AtomicUsize,
+        accept: AtomicBool,
+    }
+    unsafe extern "C" fn notify(context: *mut std::ffi::c_void, event: *const Event) {
+        let trace = unsafe { &*context.cast::<Trace>() };
+        let event = unsafe { &*event };
+        if event.kind == 0 && event.status == Status::Ok {
+            trace.fresh.store(true, Ordering::Release);
+        } else if event.kind == 1 {
+            let mut identity = info();
+            assert_eq!(
+                unsafe { trace.api.validate_pending.unwrap()(event.qso, &mut identity) },
+                Status::Ok
+            );
+            assert_eq!(identity.node_number, 123456);
+            if trace.accept.load(Ordering::Acquire) {
+                unsafe { event.taken.write(1) };
+                trace.incoming.store(event.qso, Ordering::Release);
+            } else {
+                trace.rejected.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+    fn wait(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "account operation did not progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = resource_context(api);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        for (index, response) in [b"OK".as_slice(), b"@@@\n2\nW1XYZ-R\nIncoming\n123456\n127.0.0.1\nN2DEF-R\nOutgoing\n654321\n127.0.0.1\n+++\n", b"OK"].into_iter().enumerate() {
+            let mut accepted = None;
+            wait(|| match listener.accept() {
+                Ok(socket) => { accepted = Some(socket.0); true },
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("listener failed: {error:?}"),
+            });
+            let mut socket = accepted.unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut reader = std::io::BufReader::new(&mut socket);
+            let mut request = Vec::new();
+            for _ in 0..[4, 1, 3][index] { assert_ne!(reader.read_until(b'\r', &mut request).unwrap(), 0); }
+            match index {
+                0 => assert!(request.starts_with(b"lK1ABC-R\xac\xacfixture-password\rONLINE1.00R(")),
+                1 => assert_eq!(request, b"F0\r"),
+                _ => assert!(request.windows(b"OFF-V3.40".len()).any(|bytes| bytes == b"OFF-V3.40")),
+            }
+            socket.write_all(response).unwrap();
+        }
+    });
+    let audio = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = audio.local_addr().unwrap().port();
+    let control = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port + 1)).unwrap();
+    let servers = [span(&address)];
+    let mut config = settings("K1ABC-R", "North", &servers, &[]);
+    config.transport.audio_port = port;
+    let mut account = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            api.account_prepare.unwrap()(
+                context,
+                &config,
+                &secrets("fixture-password"),
+                &mut account,
+            )
+        },
+        Status::Ok
+    );
+    drop((audio, control));
+    let trace = Trace {
+        api,
+        fresh: AtomicBool::new(false),
+        incoming: AtomicPtr::default(),
+        rejected: AtomicUsize::new(0),
+        accept: AtomicBool::new(true),
+    };
+    let activate = api
+        .account_activate
+        .expect("real account activation missing");
+    assert_eq!(
+        unsafe {
+            activate(
+                account,
+                Some(notify),
+                ptr::from_ref(&trace).cast_mut().cast(),
+            )
+        },
+        Status::Ok
+    );
+    unsafe { api.context_destroy.unwrap()(context) };
+    wait(|| trace.fresh.load(Ordering::Acquire));
+    let mut outgoing = ptr::null_mut();
+    assert_eq!(
+        unsafe { api.dial.unwrap()(account, 654321, &mut outgoing) },
+        Status::Ok
+    );
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut sdes = [0; 512];
+    let length = rptadv_echolink::wire::write_control(
+        &rptadv_echolink::wire::ControlPacket::Sdes {
+            source: 7,
+            callsign: "W1XYZ-R".into(),
+            station_name: "Peer".into(),
+            speex: false,
+        },
+        &mut sdes,
+    )
+    .unwrap();
+    peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
+        .unwrap();
+    wait(|| !trace.incoming.load(Ordering::Acquire).is_null());
+    let incoming = trace.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+    let mut identity = info();
+    assert_eq!(
+        unsafe { api.peer_info.unwrap()(incoming, &mut identity) },
+        Status::Ok
+    );
+    assert_ne!(identity.account_generation, 0);
+    assert_ne!(identity.qso_generation, 0);
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
+        b"W1XYZ-R"
+    );
+    unsafe { api.peer_destroy.unwrap()(incoming) };
+    trace.accept.store(false, Ordering::Release);
+    wait(|| {
+        peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
+            .unwrap();
+        trace.rejected.load(Ordering::Acquire) != 0
+    });
+    assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
+    assert_eq!(
+        unsafe { api.validate_pending.unwrap()(outgoing, &mut info()) },
+        Status::Closed
+    );
+    unsafe {
+        api.account_destroy.unwrap()(account);
+        api.peer_destroy.unwrap()(outgoing);
+    }
+    server.join().unwrap();
 }

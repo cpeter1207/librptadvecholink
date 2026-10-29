@@ -13,7 +13,7 @@ fn descriptor_exposes_a_sized_versioned_lifecycle() {
     assert_eq!(api.abi_version, 1);
     assert_eq!(&api.capability[..19], b"rptadv.echolink.v1\0");
     assert_eq!(api.capabilities, 1); // lifecycle only until network work is implemented.
-    assert!(api.account_activate.is_none());
+    assert!(api.account_activate.is_some()); // Complete network group remains unpublished.
     let client = unsafe { rptadv_peer_support::echolink::Api::open(api) }.unwrap();
     assert!(!client.network_available());
 }

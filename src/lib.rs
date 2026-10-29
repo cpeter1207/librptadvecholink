@@ -5,6 +5,7 @@ pub mod account;
 pub mod directory;
 pub mod ffi;
 pub mod media;
+mod owner;
 pub mod playout;
 pub mod receive;
 mod resources;
@@ -12,16 +13,15 @@ pub mod session;
 pub mod transport;
 pub mod wire;
 use ffi::{AccountConfig, AccountSecrets, Descriptor, RuntimeConfig, Status};
+use owner::{
+    Account, account_activate, account_destroy, account_stop, dial, peer_destroy, peer_info,
+    validate_pending,
+};
 use std::{mem::size_of, ptr, sync::Arc};
 
 struct Context {
     runtime: Arc<tokio::runtime::Runtime>,
     resources: Option<Arc<resources::Resources>>,
-}
-struct Account {
-    _runtime: Arc<tokio::runtime::Runtime>,
-    _resources: Option<Arc<resources::Resources>>,
-    _settings: Option<Arc<account::settings::PreparedSettings>>,
 }
 
 #[repr(C)]
@@ -39,19 +39,19 @@ static DESCRIPTOR: Descriptor = Descriptor {
     context_create: Some(context_create),
     context_destroy: Some(context_destroy),
     account_prepare: Some(account_prepare),
-    account_activate: None,
+    account_activate: Some(account_activate),
     account_reconfigure: None,
     account_stop: Some(account_stop),
     account_destroy: Some(account_destroy),
-    dial: None,
-    validate_pending: None,
-    peer_info: None,
+    dial: Some(dial),
+    validate_pending: Some(validate_pending),
+    peer_info: Some(peer_info),
     peer_attach: None,
     peer_stop: None,
     peer_detach: None,
     peer_wake: None,
     peer_set_deadline: None,
-    peer_destroy: None,
+    peer_destroy: Some(peer_destroy),
 };
 
 /// Borrow the immutable ABI-1 table while the shared library remains loaded.
@@ -161,26 +161,11 @@ unsafe extern "C" fn account_prepare(
             Err(status) => return status,
         }
     };
-    *output = Box::into_raw(Box::new(Account {
-        _runtime: Arc::clone(&context.runtime),
-        _resources: context.resources.as_ref().map(Arc::clone),
-        _settings: settings,
-    }))
+    *output = Box::into_raw(Box::new(Account::new(
+        Arc::clone(&context.runtime),
+        context.resources.as_ref().map(Arc::clone),
+        settings,
+    )))
     .cast();
     Status::Ok
-}
-
-unsafe extern "C" fn account_stop(account: *mut ffi::Account) -> Status {
-    if account.is_null() {
-        Status::Invalid
-    } else {
-        Status::Ok
-    }
-}
-
-unsafe extern "C" fn account_destroy(account: *mut ffi::Account) {
-    if !account.is_null() {
-        // SAFETY: caller transfers its once-owned account after callbacks have stopped.
-        drop(unsafe { Box::from_raw(account.cast::<Account>()) });
-    }
 }

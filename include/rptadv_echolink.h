@@ -159,15 +159,17 @@ struct rptadv_echolink_descriptor_v1 {
     void (*context_destroy)(struct rptadv_echolink_context *);
     /** Copy/validate configuration without login; failure clears output. */
     rptadv_echolink_status (*account_prepare)(struct rptadv_echolink_context *, const struct rptadv_echolink_account_config_v1 *, const struct rptadv_echolink_secrets_v1 *, struct rptadv_echolink_account **);
-    /** Start I/O; incoming event ownership is consumed/retained explicitly. */
+    /** Start I/O off executor; incoming ownership uses event.taken.
+     * Disabled preparation remains socket/login/callback free. */
     rptadv_echolink_status (*account_activate)(struct rptadv_echolink_account *, rptadv_echolink_event_fn, void *);
     /** Prepare/commit an account-only generation change. */
     rptadv_echolink_status (*account_reconfigure)(struct rptadv_echolink_account *, const struct rptadv_echolink_account_config_v1 *, const struct rptadv_echolink_secrets_v1 *);
-    /** Gate admissions/stop; repeated calls are harmless. */
+    /** Gate admissions and join callbacks off executor; repeated calls are harmless. */
     rptadv_echolink_status (*account_stop)(struct rptadv_echolink_account *);
-    /** Release after callback quiescence; null is harmless. */
+    /** Release off executor after callback quiescence; null is harmless. */
     void (*account_destroy)(struct rptadv_echolink_account *);
-    /** Dial a real ID; failure clears output. */
+    /** Dial a real ID off executor with the configured finite setup deadline;
+     * failure clears output. The returned QSO still requires peer attachment. */
     rptadv_echolink_status (*dial)(struct rptadv_echolink_account *, uint32_t, struct rptadv_echolink_qso **);
     /** Recheck bound pending admission; never trust a caller-set verified flag. */
     rptadv_echolink_status (*validate_pending)(const struct rptadv_echolink_qso *, struct rptadv_echolink_peer_info_v1 *);
