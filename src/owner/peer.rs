@@ -497,6 +497,20 @@ pub(crate) unsafe extern "C" fn peer_prepare_audio(
     } else {
         unsafe { std::slice::from_raw_parts_mut(buffer, capacity) }
     };
+    // SDES agreement is session-bound. Upgrade only when this call can advance
+    // coding, preserving short-output no-side-effects and already copied RTP.
+    if buffer.len() >= 264
+        && serial.receiver.codec() == Codec::Speex
+        && serial
+            .encoder
+            .upgrade_speex(peer.binding._resources.catalog())
+            .is_err()
+    {
+        serial
+            .receiver
+            .control(QsoEvent::OwnerFailed, Instant::now());
+        return Status::Failed;
+    }
     let result = match serial.encoder.prepare(input, buffer, flush == 1) {
         Ok(result) => result,
         Err(_) => return Status::Failed,
@@ -565,6 +579,67 @@ pub(crate) unsafe extern "C" fn peer_send_prepared(
     }
     let expires = now.checked_add(Duration::from_millis((200 - age.max(0)) as u64));
     serial.send(peer, Channel::Audio, packet, expires)
+}
+
+/// Clear segment coding history on its sole owner, not the connection RTP clocks.
+pub(crate) unsafe extern "C" fn peer_reset_encoder(qso: *mut ffi::Qso) -> Status {
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    match serial.encoder.reset() {
+        Ok(()) => Status::Ok,
+        Err(_) => Status::Failed,
+    }
+}
+
+/// Read the connection-relative source clock without changing media or retry age.
+pub(crate) unsafe extern "C" fn peer_elapsed_ms(qso: *const ffi::Qso, output: *mut u64) -> Status {
+    let Some(output) = (unsafe { output.as_mut() }) else {
+        return Status::Invalid;
+    };
+    *output = 0;
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    *output = peer.created.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    Status::Ok
+}
+
+/// Serialize bounded human text on the QSO owner; no ASL envelope or new queue.
+/// Full/Pending retains no input: the product retries its unchanged sender/body.
+pub(crate) unsafe extern "C" fn peer_send_text(
+    qso: *mut ffi::Qso,
+    sender: ffi::ByteSpan,
+    body: ffi::ByteSpan,
+) -> Status {
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    let text = |span: ffi::ByteSpan, maximum: usize| {
+        if span.data.is_null() || span.length == 0 || span.length > maximum {
+            return None;
+        }
+        std::str::from_utf8(unsafe { std::slice::from_raw_parts(span.data, span.length) }).ok()
+    };
+    let (Some(sender), Some(body)) = (text(sender, 64), text(body, crate::wire::MAX_CHAT_BYTES))
+    else {
+        return Status::Invalid;
+    };
+    let mut packet = [0; 4170];
+    let Ok(count) = crate::wire::write_chat(sender, body, &mut packet) else {
+        return Status::Invalid;
+    };
+    match serial.receiver.state() {
+        QsoState::Connecting => Status::Pending,
+        QsoState::Closing | QsoState::Closed => Status::Closed,
+        QsoState::Connected => serial.send(peer, Channel::Audio, &packet[..count], None),
+    }
 }
 
 pub(crate) unsafe extern "C" fn peer_stop(registration: *mut ffi::Registration) {

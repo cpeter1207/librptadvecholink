@@ -15,8 +15,8 @@ pub mod wire;
 use ffi::{AccountConfig, AccountSecrets, Descriptor, RuntimeConfig, Status};
 use owner::{
     Account, account_activate, account_destroy, account_stop, dial, peer_attach, peer_destroy,
-    peer_detach, peer_info, peer_prepare_audio, peer_read, peer_send_prepared, peer_set_deadline,
-    peer_stop, peer_wake, validate_pending,
+    peer_detach, peer_elapsed_ms, peer_info, peer_prepare_audio, peer_read, peer_reset_encoder,
+    peer_send_prepared, peer_send_text, peer_set_deadline, peer_stop, peer_wake, validate_pending,
 };
 use std::{mem::size_of, ptr, sync::Arc};
 
@@ -55,10 +55,10 @@ static DESCRIPTOR: Descriptor = Descriptor {
     peer_destroy: Some(peer_destroy),
     peer_read: Some(peer_read),
     peer_prepare_audio: Some(peer_prepare_audio),
-    peer_reset_encoder: None,
+    peer_reset_encoder: Some(peer_reset_encoder),
     peer_send_prepared: Some(peer_send_prepared),
-    peer_elapsed_ms: None,
-    peer_send_text: None,
+    peer_elapsed_ms: Some(peer_elapsed_ms),
+    peer_send_text: Some(peer_send_text),
 };
 
 /// Borrow the immutable ABI-1 table while the shared library remains loaded.

@@ -286,9 +286,12 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
     struct StepTrace {
         api: &'static Descriptor,
         qso: *mut Qso,
+        speex: bool,
         calls: AtomicUsize,
         errors: AtomicUsize,
         packet: std::sync::Mutex<Vec<u8>>,
+        packet_time: AtomicUsize,
+        texts: AtomicUsize,
         pcm: AtomicUsize,
         gaps: AtomicUsize,
         keyed: AtomicBool,
@@ -325,11 +328,26 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
     unsafe extern "C" fn quiet(_: *mut std::ffi::c_void) -> i32 {
         -1
     }
+    unsafe extern "C" fn text(context: *mut std::ffi::c_void, sender: ByteSpan, body: ByteSpan) {
+        let trace = unsafe { &*context.cast::<StepTrace>() };
+        if unsafe { std::slice::from_raw_parts(sender.data, sender.length) } != b"W1XYZ-R"
+            || unsafe { std::slice::from_raw_parts(body.data, body.length) } != b"Incoming message"
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+        trace.texts.fetch_add(1, Ordering::Release);
+    }
     unsafe extern "C" fn step(context: *mut std::ffi::c_void) -> i32 {
         let trace = unsafe { &*context.cast::<StepTrace>() };
         let mut identity = info();
         let mut result = rptadv_echolink::ffi::ReadResult::default();
         if trace.calls.load(Ordering::Acquire) == 0 {
+            if unsafe {
+                trace.api.peer_send_text.unwrap()(trace.qso, span("K1ABC-R"), span("Test message"))
+            } != Status::Ok
+            {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
             let mut encoded: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
             encoded.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
             let pcm = [0.1; 640];
@@ -365,15 +383,42 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             } != Status::Ok
                 || encoded.status != 0
                 || encoded.consumed_frames != 640
-                || encoded.encoded_bytes != 144
+                || if trace.speex {
+                    !(13..=264).contains(&encoded.encoded_bytes)
+                } else {
+                    encoded.encoded_bytes != 144
+                }
                 || encoded.packet_frames != 640
                 || encoded.source_start_frames != 0
-                || encoded.source_frames != 640
-                || packet[..4] != [0xc0, 3, 0, 0]
+                || encoded.source_frames != if trace.speex { 600 } else { 640 }
+                || packet[..4] != [0xc0, if trace.speex { 0x96 } else { 3 }, 0, 0]
             {
                 trace.errors.fetch_add(1, Ordering::Release);
             }
             *trace.packet.lock().unwrap() = packet[..encoded.encoded_bytes].to_vec();
+            let mut elapsed = 0;
+            if unsafe { trace.api.peer_elapsed_ms.unwrap()(trace.qso, &mut elapsed) } != Status::Ok
+            {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
+            trace.packet_time.store(elapsed as usize, Ordering::Release);
+            if unsafe { trace.api.peer_reset_encoder.unwrap()(trace.qso) } != Status::Ok
+                || unsafe {
+                    prepare(
+                        trace.qso,
+                        pcm.as_ptr(),
+                        pcm.len(),
+                        packet.as_mut_ptr(),
+                        packet.len(),
+                        0,
+                        ptr::from_mut(&mut encoded).cast(),
+                    )
+                } != Status::Ok
+                || packet[..4] != [0xc0, if trace.speex { 0x96 } else { 3 }, 0, 1]
+                || encoded.source_start_frames != 0
+            {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
         }
         {
             let mut pending = trace.packet.lock().unwrap();
@@ -386,7 +431,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
                             length: pending.len(),
                         },
                         640,
-                        0,
+                        trace.packet_time.load(Ordering::Acquire) as u32,
                     )
                 } {
                     Status::Ok => pending.clear(),
@@ -409,8 +454,8 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
                 trace.qso,
                 u32::from(trace.drained.load(Ordering::Acquire)),
                 &sink,
-                None,
-                ptr::null_mut(),
+                Some(text),
+                context,
                 &mut result,
             )
         };
@@ -479,13 +524,14 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
-    let context = resource_context(api);
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    let server = std::thread::spawn(move || {
-        for (index, response) in [b"OK".as_slice(), b"@@@\n2\nW1XYZ-R\nIncoming\n123456\n127.0.0.2\nN2DEF-R\nOutgoing\n654321\n127.0.0.1\n+++\n", b"OK"].into_iter().enumerate() {
+    for speex in [false, true] {
+        let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+        let context = resource_context(api);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            for (index, response) in [b"OK".as_slice(), b"@@@\n2\nW1XYZ-R\nIncoming\n123456\n127.0.0.2\nN2DEF-R\nOutgoing\n654321\n127.0.0.1\n+++\n", b"OK"].into_iter().enumerate() {
             let mut accepted = None;
             wait(|| match listener.accept() {
                 Ok(socket) => { accepted = Some(socket.0); true },
@@ -504,195 +550,212 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             }
             socket.write_all(response).unwrap();
         }
-    });
-    let audio = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let port = audio.local_addr().unwrap().port();
-    let control = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port + 1)).unwrap();
-    let servers = [span(&address)];
-    let mut config = settings("K1ABC-R", "North", &servers, &[]);
-    config.transport.audio_port = port;
-    let mut account = ptr::null_mut();
-    assert_eq!(
-        unsafe {
-            api.account_prepare.unwrap()(
-                context,
-                &config,
-                &secrets("fixture-password"),
-                &mut account,
-            )
-        },
-        Status::Ok
-    );
-    drop((audio, control));
-    let trace = Trace {
-        api,
-        fresh: AtomicBool::new(false),
-        incoming: AtomicPtr::default(),
-        rejected: AtomicUsize::new(0),
-        accept: AtomicBool::new(true),
-    };
-    let activate = api
-        .account_activate
-        .expect("real account activation missing");
-    assert_eq!(
-        unsafe {
-            activate(
-                account,
-                Some(notify),
-                ptr::from_ref(&trace).cast_mut().cast(),
-            )
-        },
-        Status::Ok
-    );
-    wait(|| trace.fresh.load(Ordering::Acquire));
-    let mut outgoing = ptr::null_mut();
-    assert_eq!(
-        unsafe { api.dial.unwrap()(account, 654321, &mut outgoing) },
-        Status::Ok
-    );
-    let peer = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
-    let media = std::net::UdpSocket::bind("127.0.0.2:5198").unwrap();
-    media
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let feedback = std::net::UdpSocket::bind("127.0.0.2:5199").unwrap();
-    feedback
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    let mut sdes = [0; 512];
-    let length = rptadv_echolink::wire::write_control(
-        &rptadv_echolink::wire::ControlPacket::Sdes {
-            source: 7,
-            callsign: "W1XYZ-R".into(),
-            station_name: "Peer".into(),
-            speex: false,
-        },
-        &mut sdes,
-    )
-    .unwrap();
-    peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
-        .unwrap();
-    wait(|| !trace.incoming.load(Ordering::Acquire).is_null());
-    let incoming = trace.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
-    let mut identity = info();
-    assert_eq!(
-        unsafe { api.peer_info.unwrap()(incoming, &mut identity) },
-        Status::Ok
-    );
-    assert_ne!(identity.account_generation, 0);
-    assert_ne!(identity.qso_generation, 0);
-    assert_eq!(
-        unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
-        b"W1XYZ-R"
-    );
-    let serial = StepTrace {
-        api,
-        qso: incoming,
-        calls: AtomicUsize::new(0),
-        errors: AtomicUsize::new(0),
-        packet: std::sync::Mutex::new(Vec::new()),
-        pcm: AtomicUsize::new(0),
-        gaps: AtomicUsize::new(0),
-        keyed: AtomicBool::new(false),
-        unkeyed: AtomicBool::new(false),
-        finish: AtomicBool::new(false),
-        drained: AtomicBool::new(false),
-        closed: AtomicBool::new(false),
-    };
-    let mut registration = ptr::null_mut();
-    api.peer_read.expect("source-rate receive bridge missing");
-    api.peer_prepare_audio
-        .expect("prepared-media ABI bridge missing");
-    api.peer_send_prepared
-        .expect("prepared send bridge missing");
-    assert_eq!(
-        unsafe {
-            api.peer_attach.expect("serial owner missing")(
-                context,
-                incoming,
-                Some(step),
-                ptr::from_ref(&serial).cast_mut().cast(),
-                &mut registration,
-            )
-        },
-        Status::Ok
-    );
-    assert!(!registration.is_null());
-    let mut retiring_registration = ptr::null_mut();
-    assert_eq!(
-        unsafe {
-            api.peer_attach.unwrap()(
-                context,
-                outgoing,
-                Some(quiet),
-                ptr::null_mut(),
-                &mut retiring_registration,
-            )
-        },
-        Status::Ok
-    );
-    unsafe { api.context_destroy.unwrap()(context) };
-    wait(|| serial.calls.load(Ordering::Acquire) >= 3);
-    let mut encoded = [0; 264];
-    let (media_length, _) = media.recv_from(&mut encoded).unwrap();
-    assert_eq!(media_length, 144);
-    assert_eq!(&encoded[..4], &[0xc0, 3, 0, 0]);
-    media
-        .send_to(
-            &encoded[..media_length],
-            (std::net::Ipv4Addr::LOCALHOST, port),
+        });
+        let audio = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = audio.local_addr().unwrap().port();
+        let control = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port + 1)).unwrap();
+        let servers = [span(&address)];
+        let mut config = settings("K1ABC-R", "North", &servers, &[]);
+        config.transport.audio_port = port;
+        let mut account = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                api.account_prepare.unwrap()(
+                    context,
+                    &config,
+                    &secrets("fixture-password"),
+                    &mut account,
+                )
+            },
+            Status::Ok
+        );
+        drop((audio, control));
+        let trace = Trace {
+            api,
+            fresh: AtomicBool::new(false),
+            incoming: AtomicPtr::default(),
+            rejected: AtomicUsize::new(0),
+            accept: AtomicBool::new(true),
+        };
+        let activate = api
+            .account_activate
+            .expect("real account activation missing");
+        assert_eq!(
+            unsafe {
+                activate(
+                    account,
+                    Some(notify),
+                    ptr::from_ref(&trace).cast_mut().cast(),
+                )
+            },
+            Status::Ok
+        );
+        wait(|| trace.fresh.load(Ordering::Acquire));
+        let mut outgoing = ptr::null_mut();
+        assert_eq!(
+            unsafe { api.dial.unwrap()(account, 654321, &mut outgoing) },
+            Status::Ok
+        );
+        let peer = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+        let media = std::net::UdpSocket::bind("127.0.0.2:5198").unwrap();
+        media
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let feedback = std::net::UdpSocket::bind("127.0.0.2:5199").unwrap();
+        feedback
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut sdes = [0; 512];
+        let length = rptadv_echolink::wire::write_control(
+            &rptadv_echolink::wire::ControlPacket::Sdes {
+                source: 7,
+                callsign: "W1XYZ-R".into(),
+                station_name: "Peer".into(),
+                speex,
+            },
+            &mut sdes,
         )
         .unwrap();
-    wait(|| serial.pcm.load(Ordering::Acquire) == 640 && serial.finish.load(Ordering::Acquire));
-    assert!(serial.keyed.load(Ordering::Acquire));
-    assert!(
-        !serial.unkeyed.load(Ordering::Acquire),
-        "must wait for the exact product finite token"
-    );
-    serial.drained.store(true, Ordering::Release);
-    unsafe { api.peer_wake.unwrap()(registration) };
-    wait(|| serial.unkeyed.load(Ordering::Acquire));
-    unsafe { api.peer_stop.unwrap()(registration) };
-    wait(|| serial.closed.load(Ordering::Acquire));
-    let mut control = [0; 512];
-    loop {
-        let (count, _) = feedback.recv_from(&mut control).unwrap();
-        if matches!(
-            rptadv_echolink::wire::parse_datagram(
-                rptadv_echolink::wire::Channel::Control,
-                &control[..count]
-            )
-            .unwrap(),
-            rptadv_echolink::wire::WirePacket::Control(
-                rptadv_echolink::wire::ControlPacket::Bye { .. }
-            )
-        ) {
-            break;
-        }
-    }
-    unsafe { api.peer_detach.unwrap()(registration) };
-    let calls = serial.calls.load(Ordering::Acquire);
-    assert_eq!(serial.errors.load(Ordering::Acquire), 0);
-    peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(30));
-    assert_eq!(serial.calls.load(Ordering::Acquire), calls);
-    unsafe { api.peer_destroy.unwrap()(incoming) };
-    trace.accept.store(false, Ordering::Release);
-    wait(|| {
         peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
             .unwrap();
-        trace.rejected.load(Ordering::Acquire) != 0
-    });
-    assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
-    assert_eq!(
-        unsafe { api.validate_pending.unwrap()(outgoing, &mut info()) },
-        Status::Closed
-    );
-    unsafe {
-        api.account_destroy.unwrap()(account);
-        api.peer_detach.unwrap()(retiring_registration);
-        api.peer_destroy.unwrap()(outgoing);
+        wait(|| !trace.incoming.load(Ordering::Acquire).is_null());
+        let incoming = trace.incoming.swap(ptr::null_mut(), Ordering::AcqRel);
+        let mut identity = info();
+        assert_eq!(
+            unsafe { api.peer_info.unwrap()(incoming, &mut identity) },
+            Status::Ok
+        );
+        assert_ne!(identity.account_generation, 0);
+        assert_ne!(identity.qso_generation, 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
+            b"W1XYZ-R"
+        );
+        let serial = StepTrace {
+            api,
+            qso: incoming,
+            speex,
+            calls: AtomicUsize::new(0),
+            errors: AtomicUsize::new(0),
+            packet: std::sync::Mutex::new(Vec::new()),
+            packet_time: AtomicUsize::new(0),
+            texts: AtomicUsize::new(0),
+            pcm: AtomicUsize::new(0),
+            gaps: AtomicUsize::new(0),
+            keyed: AtomicBool::new(false),
+            unkeyed: AtomicBool::new(false),
+            finish: AtomicBool::new(false),
+            drained: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+        };
+        let mut registration = ptr::null_mut();
+        api.peer_read.expect("source-rate receive bridge missing");
+        api.peer_prepare_audio
+            .expect("prepared-media ABI bridge missing");
+        api.peer_send_prepared
+            .expect("prepared send bridge missing");
+        api.peer_reset_encoder
+            .expect("encoder reset bridge missing");
+        api.peer_elapsed_ms.expect("source clock bridge missing");
+        api.peer_send_text.expect("human text bridge missing");
+        assert_eq!(
+            unsafe {
+                api.peer_attach.expect("serial owner missing")(
+                    context,
+                    incoming,
+                    Some(step),
+                    ptr::from_ref(&serial).cast_mut().cast(),
+                    &mut registration,
+                )
+            },
+            Status::Ok
+        );
+        assert!(!registration.is_null());
+        let mut retiring_registration = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                api.peer_attach.unwrap()(
+                    context,
+                    outgoing,
+                    Some(quiet),
+                    ptr::null_mut(),
+                    &mut retiring_registration,
+                )
+            },
+            Status::Ok
+        );
+        unsafe { api.context_destroy.unwrap()(context) };
+        wait(|| serial.calls.load(Ordering::Acquire) >= 3);
+        let mut chat = [0; 128];
+        let (count, _) = media.recv_from(&mut chat).unwrap();
+        assert_eq!(&chat[..count], b"oNDATAK1ABC-R>Test message\r\n\0");
+        media
+            .send_to(
+                b"oNDATAW1XYZ-R>Incoming message\r\n\0",
+                (std::net::Ipv4Addr::LOCALHOST, port),
+            )
+            .unwrap();
+        wait(|| serial.texts.load(Ordering::Acquire) == 1);
+        let mut encoded = [0; 264];
+        let (media_length, _) = media.recv_from(&mut encoded).unwrap();
+        assert_eq!(&encoded[..4], &[0xc0, if speex { 0x96 } else { 3 }, 0, 0]);
+        media
+            .send_to(
+                &encoded[..media_length],
+                (std::net::Ipv4Addr::LOCALHOST, port),
+            )
+            .unwrap();
+        wait(|| serial.pcm.load(Ordering::Acquire) == 640 && serial.finish.load(Ordering::Acquire));
+        assert!(serial.keyed.load(Ordering::Acquire));
+        assert!(
+            !serial.unkeyed.load(Ordering::Acquire),
+            "must wait for the exact product finite token"
+        );
+        serial.drained.store(true, Ordering::Release);
+        unsafe { api.peer_wake.unwrap()(registration) };
+        wait(|| serial.unkeyed.load(Ordering::Acquire));
+        unsafe { api.peer_stop.unwrap()(registration) };
+        wait(|| serial.closed.load(Ordering::Acquire));
+        let mut control = [0; 512];
+        loop {
+            let (count, _) = feedback.recv_from(&mut control).unwrap();
+            if matches!(
+                rptadv_echolink::wire::parse_datagram(
+                    rptadv_echolink::wire::Channel::Control,
+                    &control[..count]
+                )
+                .unwrap(),
+                rptadv_echolink::wire::WirePacket::Control(
+                    rptadv_echolink::wire::ControlPacket::Bye { .. }
+                )
+            ) {
+                break;
+            }
+        }
+        unsafe { api.peer_detach.unwrap()(registration) };
+        let calls = serial.calls.load(Ordering::Acquire);
+        assert_eq!(serial.errors.load(Ordering::Acquire), 0);
+        peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(serial.calls.load(Ordering::Acquire), calls);
+        unsafe { api.peer_destroy.unwrap()(incoming) };
+        trace.accept.store(false, Ordering::Release);
+        wait(|| {
+            peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
+                .unwrap();
+            trace.rejected.load(Ordering::Acquire) != 0
+        });
+        assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
+        assert_eq!(
+            unsafe { api.validate_pending.unwrap()(outgoing, &mut info()) },
+            Status::Closed
+        );
+        unsafe {
+            api.account_destroy.unwrap()(account);
+            api.peer_detach.unwrap()(retiring_registration);
+            api.peer_destroy.unwrap()(outgoing);
+        }
+        server.join().unwrap();
     }
-    server.join().unwrap();
 }

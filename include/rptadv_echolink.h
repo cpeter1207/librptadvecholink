@@ -224,7 +224,8 @@ struct rptadv_echolink_descriptor_v1 {
         const struct rptadv_echolink_pcm_sink_v1 *, rptadv_echolink_text_fn, void *,
         struct rptadv_echolink_read_result_v1 *);
     /** Prepare at most one complete RTP packet off audio; output is the released
-     * neutral encode result. Capacity below 264 consumes nothing and reports that bound. */
+     * neutral encode result. Capacity below 264 consumes nothing and reports that bound.
+     * Authenticated Speex agreement upgrades coding without resetting RTP timing. */
     rptadv_echolink_status (*peer_prepare_audio)(struct rptadv_echolink_qso *,
         const float *, size_t, uint8_t *, size_t, uint32_t, struct rptadv_codec_encode_result_v1 *);
     /** Reset segment history, retaining the connection's RTP sequence/clock. */
@@ -236,7 +237,9 @@ struct rptadv_echolink_descriptor_v1 {
         struct rptadv_echolink_bytes_v1, uint32_t, uint32_t);
     /** Copy monotonic elapsed milliseconds for existing product pacing. */
     rptadv_echolink_status (*peer_elapsed_ms)(const struct rptadv_echolink_qso *, uint64_t *);
-    /** Compatible text group; never send ASL control envelopes here. */
+    /** Compatible text group; never send ASL control envelopes here.
+     * Sender/body are bounded UTF-8 (64/4096 bytes), copied only during the call.
+     * Full/Pending consume nothing; retry the unchanged message. */
     rptadv_echolink_status (*peer_send_text)(struct rptadv_echolink_qso *,
         struct rptadv_echolink_bytes_v1, struct rptadv_echolink_bytes_v1);
 };
