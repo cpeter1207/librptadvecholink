@@ -25,6 +25,7 @@ pub struct Control {
     stop: watch::Sender<bool>,
     notify: Notify,
     pending: AtomicBool,
+    close: AtomicBool,
 }
 
 impl Default for Control {
@@ -33,6 +34,7 @@ impl Default for Control {
             stop: watch::channel(false).0,
             notify: Notify::new(),
             pending: AtomicBool::new(false),
+            close: AtomicBool::new(false),
         }
     }
 }
@@ -48,6 +50,13 @@ impl Control {
         *self.stop.borrow()
     }
 
+    /// Ask the serial QSO owner to send BYE and drain accepted media. This is
+    /// not a quiescence barrier; final detach still uses the independent stop.
+    pub fn request_close(&self) {
+        self.close.store(true, Ordering::Release);
+        self.wake();
+    }
+
     /// Coalesce product/egress work without creating a new task or entering an audio callback.
     pub fn wake(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {
@@ -60,6 +69,8 @@ impl Control {
 pub enum PeerEvent {
     /// Initial or coalesced product wake.
     Wake,
+    /// Graceful local close; the owner remains runnable through BYE/media drain.
+    Close,
     /// Admitted packet with its original arrival, endpoint and generation.
     Packet(Datagram),
     /// The owner's actual advertised deadline is due.
@@ -147,6 +158,9 @@ impl PeerDriver {
                 let stopped = *stopping.borrow();
                 if stopped {
                     break;
+                }
+                if active.close.swap(false, Ordering::AcqRel) {
+                    event = PeerEvent::Close;
                 }
                 active.pending.store(false, Ordering::Release);
                 let Some(wait) = step(event) else {

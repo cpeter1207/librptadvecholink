@@ -122,6 +122,48 @@ fn deadline_progresses_without_incoming_packets() {
 }
 
 #[test]
+fn reentrant_graceful_close_keeps_the_owner_until_its_drain_deadline() {
+    let runtime = runtime();
+    let (_sender, receiver) = channel(1).unwrap();
+    let control = Arc::new(Control::default());
+    let close = Arc::clone(&control);
+    let (done, finished) = std::sync::mpsc::channel();
+    let mut deadline = None;
+    let driver = PeerDriver::attach(
+        Arc::clone(&runtime),
+        Arc::clone(&control),
+        receiver,
+        move |event| {
+            match event {
+                PeerEvent::Wake => close.request_close(),
+                PeerEvent::Close => {
+                    assert!(deadline.is_none(), "one coalesced graceful close");
+                    deadline = Some(Instant::now() + Duration::from_millis(20));
+                }
+                PeerEvent::Deadline => {
+                    assert!(deadline.is_some());
+                    done.send(()).unwrap();
+                    return None;
+                }
+                _ => panic!("unexpected fixture event"),
+            }
+            Some(PeerWait {
+                receive: false,
+                deadline,
+                ..PeerWait::default()
+            })
+        },
+    );
+    finished.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        !control.is_stopped(),
+        "graceful close is not a teardown barrier"
+    );
+    driver.detach();
+    assert!(control.is_stopped());
+}
+
+#[test]
 fn callback_can_stop_before_attach_returns_and_detach_releases_captured_state() {
     struct Retained(Arc<AtomicBool>);
     impl Drop for Retained {
