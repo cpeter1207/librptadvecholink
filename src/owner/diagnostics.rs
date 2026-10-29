@@ -58,6 +58,8 @@ pub(crate) unsafe extern "C" fn account_observe(
         if let Some(settings) = &state.settings {
             result.node_number = settings.as_abi().node_number;
             result.transport = settings.as_abi().transport.kind;
+            let callsign = settings.callsign().as_bytes(); // Validated at most15 ASCII bytes.
+            result.callsign[..callsign.len()].copy_from_slice(callsign);
         }
         (
             result,

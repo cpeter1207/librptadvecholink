@@ -239,6 +239,7 @@ struct rptadv_echolink_account_observation_v1 {
     uint64_t malformed_packets; /**< Wire-parser failures; subset of drops. */
     uint64_t ingress_full_packets; /**< Full-mailbox packet drops, never hangups. */
     struct rptadv_echolink_proxy_observation_v1 proxy; /**< Proxy output; zero in direct mode. */
+    uint8_t callsign[16]; /**< Complete NUL-padded configured callsign; no QSO required. */
 };
 /** Peer metadata, acquired only inside its sole registered serial step. */
 struct rptadv_echolink_peer_observation_v1 {

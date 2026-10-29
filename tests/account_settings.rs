@@ -224,6 +224,8 @@ fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {
         ..Default::default()
     };
     assert_eq!(unsafe { observe(account, &mut status) }, Status::Ok);
+    assert_eq!(&status.callsign[..7], b"K1ABC-R");
+    assert!(status.callsign[7..].iter().all(|byte| *byte == 0));
     assert_eq!(
         (status.state, status.generation, status.available),
         (0, 0, 0)
