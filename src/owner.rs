@@ -327,73 +327,130 @@ pub(crate) unsafe extern "C" fn account_reconfigure(
     let Ok(_operation) = account.operation.lock() else {
         return Status::Failed;
     };
-    let (old, binding, activated) = {
-        let Ok(state) = account.state.lock() else {
+    account.apply_settings(next)
+}
+
+impl Account {
+    /// Commit an already validated snapshot while the caller owns operation.
+    /// Never hold state or driver locks across network work or host callbacks.
+    fn apply_settings(&self, next: Option<Arc<PreparedSettings>>) -> Status {
+        let (old, binding, activated) = {
+            let Ok(state) = self.state.lock() else {
+                return Status::Failed;
+            };
+            if state.stopped {
+                return Status::Closed;
+            }
+            (
+                state.settings.as_ref().map(Arc::clone),
+                state
+                    .active
+                    .as_ref()
+                    .map(|active| Arc::clone(&active.binding)),
+                state.activated,
+            )
+        };
+        if let (Some(old), Some(next), Some(binding)) = (&old, &next, &binding) {
+            if !old.requires_handoff(next) && binding.live.load(Ordering::Acquire) {
+                if let Err(error) = self
+                    .runtime
+                    .block_on(binding.control.reconfigure(Arc::clone(next)))
+                {
+                    return network_status(error);
+                }
+                self.state.lock().unwrap().settings = Some(Arc::clone(next));
+                binding.current.store(Arc::clone(next));
+                // Wake existing serial owners; control must never access their codec state.
+                let drivers: Vec<_> = binding
+                    .drivers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .collect();
+                for driver in drivers {
+                    driver.wake();
+                }
+                return Status::Ok;
+            }
+        }
+        let active = self.state.lock().unwrap().active.take();
+        if let Some(active) = active {
+            let status = self.retire(active);
+            if status != Status::Ok {
+                return status;
+            }
+        }
+        let replacement = if activated {
+            next.as_ref()
+                .map(|settings| self.start(Arc::clone(settings)))
+                .transpose()
+        } else {
+            Ok(None)
+        };
+        match replacement {
+            Ok(active) => {
+                let mut state = self.state.lock().unwrap();
+                state.settings = next;
+                state.active = active;
+                Status::Ok
+            }
+            Err(status) => {
+                let restored = old.and_then(|settings| self.start(settings).ok());
+                self.state.lock().unwrap().active = restored;
+                status
+            }
+        }
+    }
+}
+
+/// Exchange only provider-owned settings with a never-activated same-context
+/// candidate. Ordered lifecycle locks prevent two inverse commits deadlocking;
+/// state locks are released before the existing commit can invoke callbacks.
+pub(crate) unsafe extern "C" fn account_apply_prepared(
+    target: *mut ffi::Account,
+    prepared: *mut ffi::Account,
+) -> Status {
+    if Handle::try_current().is_ok() || target == prepared {
+        return Status::Invalid;
+    }
+    let (Some(target), Some(prepared)) = (unsafe { target.cast::<Account>().as_ref() }, unsafe {
+        prepared.cast::<Account>().as_ref()
+    }) else {
+        return Status::Invalid;
+    };
+    if !Arc::ptr_eq(&target.runtime, &prepared.runtime) {
+        return Status::Invalid;
+    }
+    let (first, second) = if ptr::from_ref(target).addr() < ptr::from_ref(prepared).addr() {
+        (target, prepared)
+    } else {
+        (prepared, target)
+    };
+    let (Ok(_first), Ok(_second)) = (first.operation.lock(), second.operation.lock()) else {
+        return Status::Failed;
+    };
+    let next = {
+        let Ok(state) = prepared.state.lock() else {
             return Status::Failed;
         };
         if state.stopped {
             return Status::Closed;
         }
-        (
-            state.settings.as_ref().map(Arc::clone),
-            state
-                .active
-                .as_ref()
-                .map(|active| Arc::clone(&active.binding)),
-            state.activated,
-        )
+        if state.activated || state.generation != 0 {
+            return Status::Invalid;
+        }
+        state.settings.clone()
     };
-    if let (Some(old), Some(next), Some(binding)) = (&old, &next, &binding) {
-        if !old.requires_handoff(next) && binding.live.load(Ordering::Acquire) {
-            if let Err(error) = account
-                .runtime
-                .block_on(binding.control.reconfigure(Arc::clone(next)))
-            {
-                return network_status(error);
-            }
-            account.state.lock().unwrap().settings = Some(Arc::clone(next));
-            binding.current.store(Arc::clone(next));
-            // Wake existing serial owners; control must never access their codec state.
-            let drivers: Vec<_> = binding
-                .drivers
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(Weak::upgrade)
-                .collect();
-            for driver in drivers {
-                driver.wake();
-            }
-            return Status::Ok;
-        }
-    }
-    let active = account.state.lock().unwrap().active.take();
-    if let Some(active) = active {
-        let status = account.retire(active);
-        if status != Status::Ok {
-            return status;
-        }
-    }
-    let replacement = if activated {
-        next.as_ref()
-            .map(|settings| account.start(Arc::clone(settings)))
-            .transpose()
-    } else {
-        Ok(None)
+    let old = match target.state.lock() {
+        Ok(state) => state.settings.clone(),
+        Err(_) => return Status::Failed,
     };
-    match replacement {
-        Ok(active) => {
-            let mut state = account.state.lock().unwrap();
-            state.settings = next;
-            state.active = active;
-            Status::Ok
-        }
-        Err(status) => {
-            let restored = old.and_then(|settings| account.start(settings).ok());
-            account.state.lock().unwrap().active = restored;
-            status
-        }
+    let status = target.apply_settings(next);
+    if status == Status::Ok {
+        prepared.state.lock().unwrap().settings = old;
     }
+    status
 }
 
 async fn bridge(

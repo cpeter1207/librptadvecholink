@@ -30,6 +30,83 @@ fn port_pair() -> u16 {
     }
     panic!("no loopback port pair available");
 }
+
+#[test]
+fn prepared_snapshot_exchange_is_context_bound_and_requires_an_inactive_candidate() {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let apply = api
+        .account_apply_prepared
+        .expect("prepared apply operation missing");
+    let mut first = ptr::null_mut();
+    let mut second = ptr::null_mut();
+    let config = RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { api.context_create.unwrap()(&config, &mut first) },
+        Status::Ok
+    );
+    assert_eq!(
+        unsafe { api.context_create.unwrap()(&config, &mut second) },
+        Status::Ok
+    );
+    let prepare = |context| {
+        let mut account = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                api.account_prepare.unwrap()(
+                    context,
+                    &AccountConfig::default(),
+                    ptr::null(),
+                    &mut account,
+                )
+            },
+            Status::Ok
+        );
+        account
+    };
+    let target = prepare(first);
+    let candidate = prepare(first);
+    let spare = prepare(first);
+    let other = prepare(second);
+    for (left, right, status) in [
+        (ptr::null_mut(), candidate, Status::Invalid),
+        (target, ptr::null_mut(), Status::Invalid),
+        (target, target, Status::Invalid),
+        (target, other, Status::Invalid),
+        (target, candidate, Status::Ok),
+        (candidate, target, Status::Ok),
+    ] {
+        assert_eq!(unsafe { apply(left, right) }, status);
+    }
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(
+        executor.block_on(async { unsafe { apply(target, candidate) } }),
+        Status::Invalid
+    );
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(candidate, None, ptr::null_mut()) },
+        Status::Ok
+    );
+    assert_eq!(unsafe { apply(target, candidate) }, Status::Invalid);
+    assert_eq!(unsafe { api.account_stop.unwrap()(candidate) }, Status::Ok);
+    assert_eq!(unsafe { apply(target, candidate) }, Status::Closed);
+    assert_eq!(unsafe { api.account_stop.unwrap()(target) }, Status::Ok);
+    assert_eq!(unsafe { apply(target, spare) }, Status::Closed);
+    assert_eq!(unsafe { apply(target, other) }, Status::Invalid);
+    assert_eq!(unsafe { apply(candidate, target) }, Status::Closed);
+    unsafe {
+        api.account_destroy.unwrap()(target);
+        api.account_destroy.unwrap()(candidate);
+        api.account_destroy.unwrap()(spare);
+        api.account_destroy.unwrap()(other);
+        api.context_destroy.unwrap()(first);
+        api.context_destroy.unwrap()(second);
+    }
+}
 unsafe extern "C" fn event(context: *mut std::ffi::c_void, event: *const Event) {
     let event = unsafe { &*event };
     if event.kind == 0 && event.status == Status::Ok {
@@ -145,7 +222,9 @@ fn exclusive_reload_quiesces_retained_peers_and_restores_configuration_on_bind_f
         wait(|| step.release.load(Ordering::Acquire));
         0
     }
-    for failed_replacement in [false, true] {
+    for (failed_replacement, prepared_update) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
         let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -287,14 +366,38 @@ fn exclusive_reload_quiesces_retained_peers_and_restores_configuration_on_bind_f
         }
         let address = account as usize;
         let config_address = ptr::from_ref(&config) as usize;
+        let mut prepared = ptr::null_mut();
+        if prepared_update {
+            let mut password = String::from("replacement-password");
+            assert_eq!(
+                unsafe {
+                    api.account_prepare.unwrap()(
+                        context,
+                        &config,
+                        &secrets(&password),
+                        &mut prepared,
+                    )
+                },
+                Status::Ok
+            );
+            password.clear();
+        }
+        let prepared_address = prepared as usize;
         let (done, result) = std::sync::mpsc::channel();
         let updating = std::thread::spawn(move || {
             let status = unsafe {
-                api.account_reconfigure.unwrap()(
-                    address as *mut Account,
-                    config_address as *const AccountConfig,
-                    &secrets("replacement-password"),
-                )
+                if prepared_update {
+                    api.account_apply_prepared.unwrap()(
+                        address as *mut Account,
+                        prepared_address as *mut Account,
+                    )
+                } else {
+                    api.account_reconfigure.unwrap()(
+                        address as *mut Account,
+                        config_address as *const AccountConfig,
+                        &secrets("replacement-password"),
+                    )
+                }
             };
             done.send(status).unwrap();
         });
@@ -362,6 +465,7 @@ fn exclusive_reload_quiesces_retained_peers_and_restores_configuration_on_bind_f
         assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
         unsafe {
             api.account_destroy.unwrap()(account);
+            api.account_destroy.unwrap()(prepared);
             api.context_destroy.unwrap()(context);
         }
         server.join().unwrap();
@@ -370,6 +474,12 @@ fn exclusive_reload_quiesces_retained_peers_and_restores_configuration_on_bind_f
 
 #[test]
 fn live_gain_reload_wakes_existing_owner_without_replacing_its_generation() {
+    for prepared_update in [false, true] {
+        live_gain_reload(prepared_update);
+    }
+}
+
+fn live_gain_reload(prepared_update: bool) {
     struct Trace {
         api: &'static Descriptor,
         qso: usize,
@@ -484,8 +594,22 @@ fn live_gain_reload_wakes_existing_owner_without_replacing_its_generation() {
     wait(|| trace.calls.load(Ordering::Acquire) == 1);
     let original = trace.packet.lock().unwrap().clone();
     config.policy.transmit_gain_db = 0.0;
+    let mut prepared = ptr::null_mut();
+    if prepared_update {
+        assert_eq!(
+            unsafe { api.account_prepare.unwrap()(context, &config, &keys, &mut prepared) },
+            Status::Ok
+        );
+    }
     assert_eq!(
-        unsafe { api.account_reconfigure.unwrap()(account, &config, &keys) },
+        unsafe {
+            if prepared_update {
+                config.policy.transmit_gain_db = -20.0;
+                api.account_apply_prepared.unwrap()(account, prepared)
+            } else {
+                api.account_reconfigure.unwrap()(account, &config, &keys)
+            }
+        },
         Status::Ok
     );
     wait(|| trace.calls.load(Ordering::Acquire) >= 2);
@@ -518,6 +642,21 @@ fn live_gain_reload_wakes_existing_owner_without_replacing_its_generation() {
         1,
         "gain-only update re-registered the account"
     );
+    if prepared_update {
+        assert_eq!(
+            unsafe { api.account_apply_prepared.unwrap()(account, prepared) },
+            Status::Ok
+        );
+        wait(|| trace.calls.load(Ordering::Acquire) >= 3);
+        let restored = trace.packet.lock().unwrap().clone();
+        assert_eq!(&restored[12..], &original[12..]);
+        assert_eq!(&restored[2..4], &[0, 2], "rollback reset RTP sequence");
+        assert_eq!(
+            online.load(Ordering::Acquire),
+            1,
+            "live rollback reconnected"
+        );
+    }
     unsafe {
         api.peer_detach.unwrap()(registration);
         api.peer_destroy.unwrap()(qso);
@@ -525,6 +664,7 @@ fn live_gain_reload_wakes_existing_owner_without_replacing_its_generation() {
     assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
     unsafe {
         api.account_destroy.unwrap()(account);
+        api.account_destroy.unwrap()(prepared);
         api.context_destroy.unwrap()(context);
     }
     server.join().unwrap();

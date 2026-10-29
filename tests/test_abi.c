@@ -14,6 +14,10 @@ _Static_assert(sizeof(struct rptadv_echolink_peer_info_v1) == 80,
                "complete verified identity record layout");
 _Static_assert(sizeof(struct rptadv_echolink_read_result_v1) == 24,
                "source-rate read result layout");
+_Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, account_apply_prepared) ==
+                   offsetof(struct rptadv_echolink_descriptor_v1, peer_send_text) +
+                       sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->peer_send_text),
+               "prepared apply preserves the preceding text group");
 _Static_assert(offsetof(struct rptadv_echolink_read_result_v1, finish_pending) == 16,
                "finite-completion request layout");
 _Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, peer_read) ==
@@ -49,9 +53,15 @@ int main(int argc, char **argv)
     struct rptadv_echolink_account *account = NULL;
     assert(api->account_prepare(context, &account_config, NULL, &account) == RPTADV_ECHOLINK_OK);
     assert(account != NULL);
+    struct rptadv_echolink_account *prepared = NULL;
+    assert(api->account_prepare(context, &account_config, NULL, &prepared) == RPTADV_ECHOLINK_OK);
+    assert(api->account_apply_prepared != NULL);
+    assert(api->account_apply_prepared(account, prepared) == RPTADV_ECHOLINK_OK);
+    assert(api->account_apply_prepared(account, prepared) == RPTADV_ECHOLINK_OK);
     api->context_destroy(context);
     assert(api->account_stop(account) == RPTADV_ECHOLINK_OK);
     api->account_destroy(account);
+    api->account_destroy(prepared);
     api->account_destroy(NULL);
     return 0;
 }

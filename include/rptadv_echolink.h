@@ -253,6 +253,13 @@ struct rptadv_echolink_descriptor_v1 {
      * Full/Pending consume nothing; retry the unchanged message. */
     rptadv_echolink_status (*peer_send_text)(struct rptadv_echolink_qso *,
         struct rptadv_echolink_bytes_v1, struct rptadv_echolink_bytes_v1);
+    /** Apply an inactive, never-activated same-context prepared snapshot off executor.
+     * Distinct handles remain caller-owned. Success exchanges its settings with
+     * the target's old settings for rollback. Failure keeps the candidate and
+     * restores prior configuration/reconnect intent, not old calls or online state.
+     * No configuration spans or credentials are reread during application. */
+    rptadv_echolink_status (*account_apply_prepared)(struct rptadv_echolink_account *,
+        struct rptadv_echolink_account *);
 };
 /** Borrow the immutable table while the DSO remains loaded. */
 const struct rptadv_echolink_descriptor_v1 *rptadv_echolink_descriptor_v1(void);
