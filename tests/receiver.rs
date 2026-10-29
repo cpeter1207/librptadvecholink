@@ -150,6 +150,44 @@ fn setup(providers: &Providers, now: Instant) -> (Coordinator, Receiver, u64) {
 }
 
 #[test]
+fn incoming_initial_sdes_establishes_once_without_waiting_for_another_heartbeat() {
+    run(async {
+        use rptadv_echolink::transport::routing::RouteResult;
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (_coordinator, mut receiver, _) = setup(&providers, now);
+        let mut directory = DirectorySnapshot::new(Duration::from_secs(900));
+        directory
+            .update(b"@@@\n1\nK1ABC-R\nTest\n1\n192.0.2.1\n+++\n", now)
+            .unwrap();
+        let mut router = Router::new(
+            Account::new(2, vec![], vec![]).unwrap(),
+            2,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let RouteResult::Pending(initial) = router.receive(
+            &directory,
+            Channel::Control,
+            "192.0.2.1:5199".parse().unwrap(),
+            now,
+            &sdes(),
+        ) else {
+            panic!("fixture must pass real directory routing");
+        };
+        let mut wrong = initial.clone();
+        wrong.source = "192.0.2.2:5199".parse().unwrap();
+        assert_eq!(receiver.initial(&wrong), None);
+        assert_eq!(receiver.state(), QsoState::Connecting);
+        assert_eq!(receiver.codec(), Codec::GsmFr);
+        assert_eq!(receiver.initial(&initial), Some(QsoAction::Connected));
+        assert_eq!(receiver.state(), QsoState::Connected);
+        assert_eq!(receiver.codec(), Codec::Speex);
+        assert_eq!(receiver.initial(&initial), None);
+    });
+}
+
+#[test]
 fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
     run(async {
         let providers = Providers::new();

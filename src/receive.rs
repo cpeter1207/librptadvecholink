@@ -7,7 +7,7 @@ use crate::{
     media::{CodecChoice, MediaError},
     playout::{PcmSink, Playout, Progress, Reception},
     session::{Packet, Qso, QsoAction, QsoEvent, QsoState},
-    transport::mailbox::Datagram,
+    transport::{mailbox::Datagram, routing::PendingHandshake},
     wire::{Codec, ControlPacket, WirePacket, parse_datagram},
 };
 use std::{net::IpAddr, time::Instant};
@@ -93,6 +93,36 @@ impl Receiver {
     /// Negotiated egress format; receive still selects each packet's own codec.
     pub fn codec(&self) -> Codec {
         self.codecs.codec()
+    }
+
+    /// Consume the router-verified incoming establishment on its original arrival
+    /// time. The owner calls this once when moving the admitted connection into
+    /// its receiver; it must not wait for a second remote heartbeat. QSO identity
+    /// checks still precede codec negotiation and connection publication.
+    pub fn initial(&mut self, initial: &PendingHandshake) -> Option<QsoAction> {
+        let IpAddr::V4(address) = initial.source.ip() else {
+            return None;
+        };
+        let ControlPacket::Sdes {
+            source, callsign, ..
+        } = &initial.control
+        else {
+            return None;
+        };
+        let action = self.control(
+            QsoEvent::Packet {
+                address,
+                packet: Packet::Sdes {
+                    source: *source,
+                    callsign: callsign.clone(),
+                },
+            },
+            initial.arrived,
+        );
+        if action == Some(QsoAction::Connected) {
+            self.codecs.observe_sdes(&initial.control);
+        }
+        action
     }
 
     /// Apply local/transport events without inventing packet-error hangups.
