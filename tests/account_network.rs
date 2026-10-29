@@ -133,9 +133,21 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             network.remove(123456, connection.connection.generation).unwrap();
             peer.send_to(&bytes[..count], sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
             assert_eq!(incoming.connection.ingress.recv().await.unwrap().payload(), &bytes[..count]);
+            // A cancelled dial/admission must relinquish its route even when
+            // its reply was delivered immediately before cancellation.
+            drop(incoming);
+            let mut replacement = tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    match commands.dial(123456).await {
+                        Ok(peer) => break peer,
+                        Err(NetworkError::Admission(rptadv_echolink::account::Admission::Duplicate)) => tokio::task::yield_now().await,
+                        Err(error) => panic!("unexpected admission outcome: {error:?}"),
+                    }
+                }
+            }).await.expect("abandoned route was not retired");
             network.stop().await.unwrap();
             assert!(matches!(commands.dial(123456).await, Err(NetworkError::Stopped)));
-            assert!(incoming.connection.ingress.recv().await.is_none());
+            assert!(replacement.connection.ingress.recv().await.is_none());
             directory.await.unwrap();
         }).await.unwrap();
     });

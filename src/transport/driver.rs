@@ -42,6 +42,11 @@ impl Control {
         self.stop.send_replace(true);
     }
 
+    /// Inspect teardown on a non-audio owner; shutdown never implies packet loss.
+    pub fn is_stopped(&self) -> bool {
+        *self.stop.borrow()
+    }
+
     /// Coalesce product/egress work without creating a new task or entering an audio callback.
     pub fn wake(&self) {
         if !self.pending.swap(true, Ordering::AcqRel) {

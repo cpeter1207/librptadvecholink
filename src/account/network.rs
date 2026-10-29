@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{Notify, mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -92,6 +92,9 @@ impl Transport {
 
 /// Exact route ownership transferred to one peer worker; no driver is retained on Tokio.
 pub struct PeerConnection {
+    /// Keep through final peer detach. Dropping retires the exact route even
+    /// when a successful dial reply races cancellation; never transfer it to audio.
+    pub lease: ConnectionLease,
     /// Verified identity, initial handshake and unique receive consumer.
     pub connection: Connection,
     /// Nonblocking first-talker requests to this account's serialized owner.
@@ -100,6 +103,19 @@ pub struct PeerConnection {
     pub control: Arc<Control>,
     /// Only the selected transport is available to this peer's outgoing owner.
     pub transport: PeerTransport,
+}
+
+/// Unique route lifetime, independent of a potentially full command channel.
+/// Drop signals the existing account owner; it neither waits nor spawns work.
+pub struct ConnectionLease {
+    control: Arc<Control>,
+    retired: Arc<Notify>,
+}
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.control.stop();
+        self.retired.notify_one();
+    }
 }
 
 enum Command {
@@ -235,6 +251,7 @@ impl AccountNetwork {
         let (commands, receiver) = mpsc::channel(capacity);
         let (events, output) = mpsc::channel(capacity);
         let (stopping, stop) = watch::channel(false);
+        let retired = Arc::new(Notify::new());
         let owner = Owner {
             settings,
             transport,
@@ -247,6 +264,7 @@ impl AccountNetwork {
             commands: receiver,
             events,
             stop,
+            retired,
         };
         let task = runtime.spawn(owner.run());
         Ok((
@@ -359,6 +377,7 @@ struct Owner {
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<NetworkEvent>,
     stop: watch::Receiver<bool>,
+    retired: Arc<Notify>,
 }
 
 impl Owner {
@@ -389,6 +408,7 @@ impl Owner {
                 .min();
             tokio::select! {
                 _ = self.stop.changed() => break,
+                _ = self.retired.notified() => self.reap_retired(),
                 command = self.commands.recv() => match command {
                     Some(command) => self.command(command),
                     None => break,
@@ -464,6 +484,18 @@ impl Owner {
         });
     }
 
+    fn reap_retired(&mut self) {
+        let coordinator = &mut self.coordinator;
+        self.peers.retain(|&(node, generation), control| {
+            if control.is_stopped() {
+                coordinator.remove(node, generation);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn received(
         &mut self,
         class: Channel,
@@ -525,6 +557,10 @@ impl Owner {
         let identity = (connection.identity.node_number, connection.generation);
         let control = Arc::new(Control::default());
         let peer = PeerConnection {
+            lease: ConnectionLease {
+                control: Arc::clone(&control),
+                retired: Arc::clone(&self.retired),
+            },
             talker: self
                 .coordinator
                 .port(identity.0, identity.1, Arc::clone(&control)),
