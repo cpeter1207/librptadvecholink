@@ -3,14 +3,15 @@
 use crate::{
     account::{
         directory::DirectoryState,
-        network::{AccountNetwork, NetworkControl, NetworkError, NetworkEvent, PeerConnection},
+        network::{AccountNetwork, ConnectionLease, NetworkControl, NetworkError, NetworkEvent},
         settings::PreparedSettings,
     },
-    directory::AdmissionError,
+    directory::{AdmissionError, DirectoryEntry},
     ffi::{self, ByteSpan, Event, EventFn, PeerInfo, Status},
     resources::Resources,
 };
 use std::{
+    cell::UnsafeCell,
     ffi::c_void,
     mem::size_of,
     ptr,
@@ -19,6 +20,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
+};
+mod peer;
+pub(crate) use peer::{
+    peer_attach, peer_detach, peer_prepare_audio, peer_read, peer_send_prepared, peer_set_deadline,
+    peer_stop, peer_wake,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -53,10 +59,22 @@ struct Binding {
     first_failure: Mutex<Option<NetworkError>>,
 }
 struct Peer {
-    binding: Arc<Binding>,
-    connection: PeerConnection,
+    identity: DirectoryEntry,
+    generation: u64,
+    control: Arc<crate::transport::driver::Control>,
+    _lease: ConnectionLease,
+    pending: Mutex<Option<peer::Prepared>>,
+    serial: UnsafeCell<Option<peer::Serial>>,
     created: Instant,
+    // Fields drop in declaration order: codec/jitter contexts and sockets must
+    // retire before their DSO and runtime ownership, including after account drop.
+    binding: Arc<Binding>,
 }
+// Before attach, pending owns the unique endpoints. Attach publishes serial once;
+// only its one PeerDriver step and synchronous reentrant host calls access it.
+// Identity/control remain independently readable. Detach joins before reclamation.
+unsafe impl Send for Peer {}
+unsafe impl Sync for Peer {}
 
 #[derive(Clone, Copy)]
 struct Callback {
@@ -226,21 +244,17 @@ async fn bridge(
                         continue;
                     }
                 };
-                let peer = Peer {
-                    created: pending.arrived,
-                    binding: Arc::clone(&binding),
-                    connection,
-                };
+                let peer = Peer::new(Arc::clone(&binding), connection, pending.arrived);
                 if peer.validate() != Status::Ok || *stopping.borrow() {
                     continue;
                 }
-                let generation = peer.connection.connection.generation;
-                let qso = Box::into_raw(Box::new(peer)).cast();
+                let generation = peer.generation;
+                let qso = Arc::into_raw(Arc::new(peer)).cast_mut().cast();
                 let mut taken = 0;
                 callback.emit(1, Status::Pending, qso, generation, &mut taken);
                 if taken != 1 {
                     // No host claim: the unique lease retires even a full-command-channel route.
-                    drop(unsafe { Box::from_raw(qso.cast::<Peer>()) });
+                    drop(unsafe { Arc::from_raw(qso.cast::<Peer>()) });
                 }
             }
             NetworkEvent::Directory { state, fresh, .. } => {
@@ -354,23 +368,19 @@ pub(crate) unsafe extern "C" fn dial(
         Ok(Err(error)) => return network_status(error),
         Err(_) => return Status::Failed,
     };
-    let peer = Peer {
-        binding,
-        connection,
-        created: Instant::now(),
-    };
+    let peer = Peer::new(binding, connection, Instant::now());
     let valid = peer.validate();
     if valid != Status::Ok {
         return valid;
     }
-    *output = Box::into_raw(Box::new(peer)).cast();
+    *output = Arc::into_raw(Arc::new(peer)).cast_mut().cast();
     Status::Ok
 }
 
 impl Peer {
     fn validate(&self) -> Status {
         if !self.binding.live.load(Ordering::Acquire)
-            || self.connection.control.is_stopped()
+            || self.control.is_stopped()
             || self.created.elapsed()
                 >= Duration::from_millis(
                     self.binding
@@ -383,7 +393,7 @@ impl Peer {
         {
             return Status::Closed;
         }
-        let identity = &self.connection.connection.identity;
+        let identity = &self.identity;
         match self.binding.control.directory().lookup(
             &identity.callsign,
             identity.address,
@@ -420,7 +430,7 @@ pub(crate) unsafe extern "C" fn peer_info(qso: *const ffi::Qso, output: *mut Pee
     {
         return Status::Invalid;
     }
-    let identity = &peer.connection.connection.identity;
+    let identity = &peer.identity;
     let local = peer.binding.settings.local_node();
     let result = PeerInfo {
         struct_size: size_of::<PeerInfo>() as u32,
@@ -428,7 +438,7 @@ pub(crate) unsafe extern "C" fn peer_info(qso: *const ffi::Qso, output: *mut Pee
         node_number: identity.node_number,
         capabilities: 0,
         account_generation: peer.binding.generation,
-        qso_generation: peer.connection.connection.generation,
+        qso_generation: peer.generation,
         callsign: ByteSpan {
             data: identity.callsign.as_ptr(),
             length: identity.callsign.len(),
@@ -447,6 +457,6 @@ pub(crate) unsafe extern "C" fn peer_destroy(qso: *mut ffi::Qso) {
     // Foreign teardown is control-only/off-executor; never drop a final Runtime
     // or future PeerDriver join on one of its own worker threads.
     if !qso.is_null() && Handle::try_current().is_err() {
-        drop(unsafe { Box::from_raw(qso.cast::<Peer>()) });
+        drop(unsafe { Arc::from_raw(qso.cast::<Peer>()) });
     }
 }

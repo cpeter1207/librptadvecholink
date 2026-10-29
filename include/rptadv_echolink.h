@@ -203,9 +203,10 @@ struct rptadv_echolink_descriptor_v1 {
     rptadv_echolink_status (*validate_pending)(const struct rptadv_echolink_qso *, struct rptadv_echolink_peer_info_v1 *);
     /** Copy immutable identity/capabilities. */
     rptadv_echolink_status (*peer_info)(const struct rptadv_echolink_qso *, struct rptadv_echolink_peer_info_v1 *);
-    /** Borrow serial peer ownership; callback may run before return. */
+    /** Attach off executor; callback may run before return and reenter serial operations.
+     * Registration retains runtime/resources through final off-executor detach. */
     rptadv_echolink_status (*peer_attach)(struct rptadv_echolink_context *, struct rptadv_echolink_qso *, rptadv_echolink_step_fn, void *, struct rptadv_echolink_registration **);
-    /** Nonblocking callback-safe stop. */
+    /** Nonblocking graceful close/BYE request, not a final quiescence barrier. */
     void (*peer_stop)(struct rptadv_echolink_registration *);
     /** Wait off executor for quiescence before releasing the context/peer. */
     void (*peer_detach)(struct rptadv_echolink_registration *);
@@ -217,18 +218,20 @@ struct rptadv_echolink_descriptor_v1 {
      * Null QSO is harmless. Lifecycle-only callers need not expose this tail. */
     void (*peer_destroy)(struct rptadv_echolink_qso *);
     /** Compatible prepared-media group. Report product_drained only after the
-     * exact finite token succeeds. Sink/text callbacks cannot reenter this QSO. */
+     * exact finite token succeeds. Sink/text callbacks cannot reenter this QSO.
+     * A null sink queries state without consuming PCM/text or advancing playout. */
     rptadv_echolink_status (*peer_read)(struct rptadv_echolink_qso *, uint32_t,
         const struct rptadv_echolink_pcm_sink_v1 *, rptadv_echolink_text_fn, void *,
         struct rptadv_echolink_read_result_v1 *);
     /** Prepare at most one complete RTP packet off audio; output is the released
-     * neutral encode result. Short capacity consumes nothing. */
+     * neutral encode result. Capacity below 264 consumes nothing and reports that bound. */
     rptadv_echolink_status (*peer_prepare_audio)(struct rptadv_echolink_qso *,
         const float *, size_t, uint8_t *, size_t, uint32_t, struct rptadv_codec_encode_result_v1 *);
     /** Reset segment history, retaining the connection's RTP sequence/clock. */
     rptadv_echolink_status (*peer_reset_encoder)(struct rptadv_echolink_qso *);
     /** Full/Pending consumes nothing; retain identical bytes for retry.
-     * Frame count/timestamp retain the product's existing pacing contract. */
+     * Frame count/timestamp retain the product's existing pacing contract.
+     * Empty zero-frame markers require no wire packet; voice spans are 640 frames. */
     rptadv_echolink_status (*peer_send_prepared)(struct rptadv_echolink_qso *,
         struct rptadv_echolink_bytes_v1, uint32_t, uint32_t);
     /** Copy monotonic elapsed milliseconds for existing product pacing. */

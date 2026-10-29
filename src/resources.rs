@@ -11,9 +11,9 @@ use std::{ffi::c_void, path::PathBuf, slice, str};
 pub(crate) struct Resources {
     // Ownership anchors, not new codec/jitter implementations. The network
     // capability remains unpublished until the full account/QSO API is wired.
-    _catalog: CodecCatalog,
+    catalog: CodecCatalog,
     _jitter: Library,
-    _jitter_descriptor: *const c_void,
+    jitter_descriptor: *const c_void,
 }
 // SAFETY: immutable library/catalog descriptors may be read concurrently.
 // Mutable codec/jitter instances are separately constructed per exclusive owner;
@@ -22,6 +22,15 @@ unsafe impl Send for Resources {}
 unsafe impl Sync for Resources {}
 
 impl Resources {
+    /// Borrow the startup-validated catalog; peer state retains this resource owner.
+    pub(crate) fn catalog(&self) -> &CodecCatalog {
+        &self.catalog
+    }
+
+    /// Descriptor code stays loaded through every derived peer jitter instance.
+    pub(crate) fn jitter_descriptor(&self) -> *const c_void {
+        self.jitter_descriptor
+    }
     /// Caller spans remain readable for the call; own library handles before publication.
     pub(crate) unsafe fn load(config: &RuntimeConfig) -> Result<Option<Self>, Status> {
         let gsm = unsafe { path(config.gsm_library) }?;
@@ -62,9 +71,9 @@ impl Resources {
                 .map_err(|_| Status::Failed)?,
         );
         Ok(Some(Self {
-            _catalog: catalog,
+            catalog,
             _jitter: library,
-            _jitter_descriptor: descriptor,
+            jitter_descriptor: descriptor,
         }))
     }
 }

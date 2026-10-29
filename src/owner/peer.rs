@@ -1,0 +1,607 @@
+//! Serial C registration: one receive owner, no peer borrow across a host callback.
+use super::{Binding, Peer};
+use crate::{
+    account::{
+        coordination::TalkerPort,
+        network::{PeerConnection, PeerTransport},
+    },
+    ffi::{self, ReadResult, Status, StepFn},
+    media::{CodecChoice, PreparedMedia},
+    playout::{PcmSink, Playout, Progress},
+    receive::{Incoming, Receiver},
+    session::{Qso, QsoAction, QsoEvent, QsoState, Timers},
+    transport::{
+        driver::{PeerDriver, PeerEvent, PeerWait},
+        mailbox::Consumer,
+        routing::PendingHandshake,
+    },
+    wire::{Channel, Codec, ControlPacket, ProxyKind, ProxyRecord, write_control},
+};
+use std::{
+    ffi::c_void,
+    mem::size_of,
+    net::SocketAddr,
+    ptr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::runtime::Handle;
+
+pub(super) struct Prepared {
+    ingress: Consumer,
+    initial: Option<PendingHandshake>,
+    talker: TalkerPort,
+    transport: PeerTransport,
+}
+
+/// Only the registered serial executor may access this state, including reentrant calls.
+pub(super) struct Serial {
+    deadline: Option<Instant>,
+    receiver: Receiver,
+    encoder: PreparedMedia,
+    transport: PeerTransport,
+    control: Option<Vec<u8>>,
+    writable: Option<crate::transport::driver::PeerWritable>,
+    text: Option<(String, String)>,
+    blocked: bool,
+}
+
+struct Registration {
+    // Join before dropping the retained peer, whose resources include the runtime.
+    driver: PeerDriver,
+    peer: Arc<Peer>,
+}
+
+#[derive(Clone, Copy)]
+struct Callback {
+    function: StepFn,
+    context: *mut c_void,
+}
+// The host retains its thread-safe context until off-executor detach returns.
+unsafe impl Send for Callback {}
+impl Callback {
+    fn call(self) -> i32 {
+        unsafe { (self.function)(self.context) }
+    }
+}
+
+impl Peer {
+    pub(super) fn new(binding: Arc<Binding>, connection: PeerConnection, created: Instant) -> Self {
+        let PeerConnection {
+            lease,
+            connection,
+            talker,
+            control,
+            transport,
+        } = connection;
+        Self {
+            binding,
+            identity: connection.identity,
+            generation: connection.generation,
+            control,
+            _lease: lease,
+            pending: std::sync::Mutex::new(Some(Prepared {
+                ingress: connection.ingress,
+                initial: connection.initial,
+                talker,
+                transport,
+            })),
+            serial: std::cell::UnsafeCell::new(None),
+            created,
+        }
+    }
+}
+
+pub(crate) unsafe extern "C" fn peer_attach(
+    context: *mut ffi::Context,
+    qso: *mut ffi::Qso,
+    callback: Option<StepFn>,
+    opaque: *mut c_void,
+    output: *mut *mut ffi::Registration,
+) -> Status {
+    let Some(output) = (unsafe { output.as_mut() }) else {
+        return Status::Invalid;
+    };
+    *output = ptr::null_mut();
+    let (Some(context), Some(peer), Some(callback)) = (
+        unsafe { context.cast::<crate::Context>().as_ref() },
+        unsafe { qso.cast::<Peer>().as_ref() },
+        callback,
+    ) else {
+        return Status::Invalid;
+    };
+    if Handle::try_current().is_ok() || !Arc::ptr_eq(&context.runtime, &peer.binding.runtime) {
+        return Status::Invalid;
+    }
+    let valid = peer.validate();
+    if valid != Status::Ok {
+        return valid;
+    }
+    let Ok(mut pending) = peer.pending.lock() else {
+        return Status::Failed;
+    };
+    let Some(prepared) = pending.take() else {
+        return Status::Invalid;
+    };
+    let resources = &peer.binding._resources;
+    let policy = &peer.binding.settings.as_abi().policy;
+    let playout = match unsafe {
+        Playout::new(
+            resources.catalog(),
+            Codec::GsmFr,
+            policy.receive_gain_db,
+            resources.jitter_descriptor(),
+            peer.created,
+        )
+    } {
+        Ok(playout) => playout,
+        Err(_) => return Status::Failed,
+    };
+    let encoder = match PreparedMedia::new(
+        resources.catalog(),
+        policy.transmit_gain_db,
+        0,
+        peer.binding.settings.as_abi().node_number,
+    ) {
+        Ok(encoder) => encoder,
+        Err(_) => return Status::Failed,
+    };
+    let codecs = match CodecChoice::new(resources.catalog()) {
+        Ok(codecs) => codecs,
+        Err(_) => return Status::Failed,
+    };
+    let Some(qso_state) = Qso::new(
+        peer.identity.clone(),
+        peer.generation,
+        Timers {
+            heartbeat: Duration::from_millis(policy.heartbeat_interval_ms.into()),
+            liveness: Duration::from_millis(policy.heartbeat_timeout_ms.into()),
+            connect: Duration::from_millis(policy.connect_timeout_ms.into()),
+        },
+        peer.created,
+    ) else {
+        return Status::Invalid;
+    };
+    let mut receiver = Receiver::new(qso_state, playout, codecs, prepared.talker);
+    if let Some(initial) = &prepared.initial {
+        receiver.initial(initial);
+    }
+    let mut serial = Serial {
+        deadline: None,
+        receiver,
+        encoder,
+        transport: prepared.transport,
+        control: None,
+        writable: None,
+        text: None,
+        blocked: false,
+    };
+    if serial.queue_control(peer, false).is_err() {
+        return Status::Invalid;
+    }
+    unsafe {
+        *peer.serial.get() = Some(serial);
+    }
+    drop(pending);
+    // The caller's QSO ownership remains intact; the registration/task retain another lease.
+    unsafe {
+        Arc::increment_strong_count(qso.cast::<Peer>());
+    }
+    let peer = unsafe { Arc::from_raw(qso.cast::<Peer>()) };
+    let active = Arc::clone(&peer);
+    let callback = Callback {
+        function: callback,
+        context: opaque,
+    };
+    let driver = PeerDriver::attach(
+        Arc::clone(&peer.binding.runtime),
+        Arc::clone(&peer.control),
+        prepared.ingress,
+        move |event| {
+            {
+                let serial = unsafe { (*active.serial.get()).as_mut() }?;
+                serial.event(&active, event);
+            }
+            if callback.call() < 0 {
+                return None;
+            }
+            // End all prior borrows before callback.call: it may reenter this QSO.
+            let serial = unsafe { (*active.serial.get()).as_mut() }?;
+            let now = Instant::now();
+            serial.flush_control(&active);
+            Some(PeerWait {
+                receive: !serial.blocked && serial.receiver.can_receive() && serial.text.is_none(),
+                deadline: [serial.deadline, serial.receiver.deadline(now)]
+                    .into_iter()
+                    .flatten()
+                    .min(),
+                writable: serial.writable.take(),
+            })
+        },
+    );
+    *output = Box::into_raw(Box::new(Registration { driver, peer })).cast();
+    Status::Ok
+}
+
+impl Serial {
+    fn queue_control(&mut self, peer: &Peer, bye: bool) -> Result<(), Status> {
+        let packet = if bye {
+            ControlPacket::Bye {
+                source: peer.binding.settings.as_abi().node_number,
+                reason: Vec::new(),
+            }
+        } else {
+            ControlPacket::Sdes {
+                source: peer.binding.settings.as_abi().node_number,
+                callsign: peer.binding.settings.callsign().into(),
+                station_name: peer.binding.settings.directory_login().description.into(),
+                speex: peer
+                    .binding
+                    ._resources
+                    .catalog()
+                    .profile(rptadv_codec_client::ProfileId::Speex)
+                    .is_some(),
+            }
+        };
+        let mut output = [0; 512];
+        let count = write_control(&packet, &mut output).map_err(|_| Status::Invalid)?;
+        self.control = Some(output[..count].to_vec());
+        Ok(())
+    }
+
+    fn action(&mut self, peer: &Peer, action: Option<QsoAction>) {
+        let bye = match action {
+            Some(QsoAction::Heartbeat) if self.control.is_none() => false,
+            Some(QsoAction::Closing { send_bye: true, .. }) => true,
+            _ => return,
+        };
+        if self.queue_control(peer, bye).is_err() {
+            self.receiver.control(QsoEvent::OwnerFailed, Instant::now());
+        }
+    }
+
+    fn send(
+        &mut self,
+        peer: &Peer,
+        channel: Channel,
+        payload: &[u8],
+        expires: Option<Instant>,
+    ) -> Status {
+        use crate::transport::{direct::SendError, driver::PeerWritable, proxy::QueueError};
+        match &self.transport {
+            PeerTransport::Direct(sockets) => {
+                let destination = SocketAddr::new(
+                    peer.identity.address.into(),
+                    if channel == Channel::Audio {
+                        5198
+                    } else {
+                        5199
+                    },
+                );
+                match sockets.try_send(channel, destination, payload) {
+                    Ok(()) => Status::Ok,
+                    Err(SendError::Pending) => {
+                        self.writable = Some(PeerWritable::Direct(Arc::clone(sockets), channel));
+                        Status::Pending
+                    }
+                    Err(SendError::Failed(_)) => Status::Failed,
+                }
+            }
+            PeerTransport::Proxy(output) => {
+                let kind = if channel == Channel::Audio {
+                    ProxyKind::UdpData
+                } else {
+                    ProxyKind::UdpControl
+                };
+                match output.try_queue(
+                    ProxyRecord {
+                        kind,
+                        address: peer.identity.address,
+                        payload,
+                    },
+                    expires,
+                ) {
+                    Ok(()) => Status::Ok,
+                    Err(QueueError::Full) => {
+                        self.writable = Some(PeerWritable::Proxy {
+                            output: output.clone(),
+                            kind,
+                            payload_bytes: payload.len(),
+                        });
+                        Status::Full
+                    }
+                    Err(QueueError::Invalid) => Status::Invalid,
+                    Err(QueueError::Closed) => Status::Closed,
+                }
+            }
+        }
+    }
+
+    fn event(&mut self, peer: &Peer, event: PeerEvent) {
+        if self
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.deadline = None;
+        }
+        let action = match event {
+            PeerEvent::Packet(packet) => match self.receiver.packet(packet) {
+                Ok(Incoming::Text { sender, body }) => {
+                    self.text = Some((sender, body));
+                    None
+                }
+                Ok(Incoming::Action(action)) => Some(action),
+                Ok(_) => None,
+                Err(_) => self.receiver.control(QsoEvent::OwnerFailed, Instant::now()),
+            },
+            PeerEvent::Close => self.receiver.control(QsoEvent::Stop, Instant::now()),
+            PeerEvent::Io(_) => self
+                .receiver
+                .control(QsoEvent::TransportLost, Instant::now()),
+            _ => self.receiver.control(QsoEvent::Poll, Instant::now()),
+        };
+        self.action(peer, action);
+        self.flush_control(peer);
+    }
+
+    fn flush_control(&mut self, peer: &Peer) {
+        if let Some(packet) = self.control.take() {
+            match self.send(peer, Channel::Control, &packet, None) {
+                Status::Ok => {}
+                Status::Pending | Status::Full => self.control = Some(packet),
+                _ => {
+                    self.receiver
+                        .control(QsoEvent::TransportLost, Instant::now());
+                }
+            }
+        }
+    }
+}
+
+struct Sink<'a>(&'a ffi::PcmSink);
+impl PcmSink for Sink<'_> {
+    fn audio(&mut self, start: u64, pcm: &[f32]) -> usize {
+        unsafe { self.0.audio.unwrap()(self.0.context, start, pcm.as_ptr(), pcm.len(), 0) }
+    }
+    fn concealed(&mut self, start: u64, pcm: &[f32]) -> usize {
+        unsafe { self.0.audio.unwrap()(self.0.context, start, pcm.as_ptr(), pcm.len(), 1) }
+    }
+    fn gap(&mut self, start: u64, count: u32) -> u32 {
+        unsafe { self.0.gap.unwrap()(self.0.context, start, count) }
+    }
+}
+
+pub(crate) unsafe extern "C" fn peer_read(
+    qso: *mut ffi::Qso,
+    drained: u32,
+    sink: *const ffi::PcmSink,
+    text: Option<ffi::TextFn>,
+    opaque: *mut c_void,
+    output: *mut ReadResult,
+) -> Status {
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    if drained > 1
+        || output.is_null()
+        || unsafe { ptr::addr_of!((*output).struct_size).read() } < size_of::<ReadResult>() as u32
+        || unsafe { ptr::addr_of!((*output).abi_version).read() } != 1
+    {
+        return Status::Invalid;
+    }
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    let mut result = ReadResult::default();
+    if !sink.is_null() {
+        if unsafe { ptr::addr_of!((*sink).struct_size).read() } < size_of::<ffi::PcmSink>() as u32
+            || unsafe { ptr::addr_of!((*sink).abi_version).read() } != 1
+        {
+            return Status::Invalid;
+        }
+        let sink = unsafe { &*sink };
+        if sink.audio.is_none() || sink.gap.is_none() {
+            return Status::Invalid;
+        }
+        if let Some(callback) = text {
+            if let Some((sender, body)) = serial.text.take() {
+                unsafe {
+                    callback(
+                        opaque,
+                        ffi::ByteSpan {
+                            data: sender.as_ptr(),
+                            length: sender.len(),
+                        },
+                        ffi::ByteSpan {
+                            data: body.as_ptr(),
+                            length: body.len(),
+                        },
+                    )
+                };
+            }
+        }
+        let turn = match serial
+            .receiver
+            .poll(Instant::now(), drained == 1, &mut Sink(sink))
+        {
+            Ok(turn) => turn,
+            Err(_) => {
+                serial
+                    .receiver
+                    .control(QsoEvent::OwnerFailed, Instant::now());
+                return Status::Failed;
+            }
+        };
+        serial.blocked = matches!(turn.progress, Progress::Blocked);
+        result.progress = match turn.progress {
+            Progress::Idle(_) => 0,
+            Progress::Advanced => 1,
+            Progress::Blocked => 2,
+            Progress::Drained => 3,
+        };
+        result.activity = match turn.activity {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        };
+        serial.action(peer, turn.action);
+    }
+    result.finish_pending = u32::from(serial.receiver.product_finish_pending());
+    result.state = match serial.receiver.state() {
+        QsoState::Connecting => 0,
+        QsoState::Connected => 1,
+        QsoState::Closing => 2,
+        QsoState::Closed => 3,
+    };
+    unsafe {
+        ptr::write(output, result);
+    }
+    Status::Ok
+}
+
+/// Translate the released codec result record, never the private Rust convenience layout.
+pub(crate) unsafe extern "C" fn peer_prepare_audio(
+    qso: *mut ffi::Qso,
+    pcm: *const f32,
+    frames: usize,
+    buffer: *mut u8,
+    capacity: usize,
+    flush: u32,
+    output: *mut c_void,
+) -> Status {
+    let output = output.cast::<rptadv_codec_client::EncodeResultRaw>();
+    if output.is_null()
+        || unsafe { ptr::addr_of!((*output).struct_size).read() }
+            < size_of::<rptadv_codec_client::EncodeResultRaw>() as u32
+        || flush > 1
+        || frames > isize::MAX as usize / size_of::<f32>()
+        || (frames != 0 && pcm.is_null())
+        || capacity > isize::MAX as usize
+        || (capacity != 0 && buffer.is_null())
+    {
+        return Status::Invalid;
+    }
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    let input = if frames == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pcm, frames) }
+    };
+    let buffer = if capacity == 0 {
+        &mut []
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(buffer, capacity) }
+    };
+    let result = match serial.encoder.prepare(input, buffer, flush == 1) {
+        Ok(result) => result,
+        Err(_) => return Status::Failed,
+    };
+    unsafe {
+        ptr::write(
+            output,
+            rptadv_codec_client::EncodeResultRaw {
+                struct_size: size_of::<rptadv_codec_client::EncodeResultRaw>() as u32,
+                status: result.status.as_raw(),
+                consumed_frames: result.consumed_frames,
+                encoded_bytes: result.encoded_bytes,
+                source_start_frames: result.source_start_frames,
+                source_frames: result.source_frames,
+                packet_frames: result.packet_frames,
+                required_capacity: if result.status == rptadv_codec_client::Status::OutputFull {
+                    264
+                } else {
+                    0
+                },
+            },
+        );
+    }
+    Status::Ok
+}
+
+/// Submit complete prepared voice, preserving retry bytes and original source age.
+/// Empty zero-frame markers finish local pacing; EchoLink has no wire key/unkey.
+pub(crate) unsafe extern "C" fn peer_send_prepared(
+    qso: *mut ffi::Qso,
+    packet: ffi::ByteSpan,
+    frames: u32,
+    timestamp: u32,
+) -> Status {
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    if frames == 0 && packet.length == 0 {
+        return Status::Ok;
+    }
+    if frames != 640 || packet.data.is_null() || !(12..=264).contains(&packet.length) {
+        return Status::Invalid;
+    }
+    let packet = unsafe { std::slice::from_raw_parts(packet.data, packet.length) };
+    if !matches!(
+        crate::wire::parse_datagram(Channel::Audio, packet),
+        Ok(crate::wire::WirePacket::Voice(_))
+    ) {
+        return Status::Invalid;
+    }
+    match serial.receiver.state() {
+        QsoState::Connecting => return Status::Pending,
+        QsoState::Closing | QsoState::Closed => return Status::Closed,
+        QsoState::Connected => {}
+    }
+    // The shared product expires native media after 200 ms. Preserve that source
+    // budget in the Proxy queue rather than granting a new lifetime on admission.
+    let now = Instant::now();
+    let age = (now.saturating_duration_since(peer.created).as_millis() as u32)
+        .wrapping_sub(timestamp) as i32;
+    if age >= 200 {
+        return Status::Ok;
+    }
+    let expires = now.checked_add(Duration::from_millis((200 - age.max(0)) as u64));
+    serial.send(peer, Channel::Audio, packet, expires)
+}
+
+pub(crate) unsafe extern "C" fn peer_stop(registration: *mut ffi::Registration) {
+    if let Some(registration) = unsafe { registration.cast::<Registration>().as_ref() } {
+        registration.peer.control.request_close();
+    }
+}
+
+pub(crate) unsafe extern "C" fn peer_wake(registration: *mut ffi::Registration) {
+    if let Some(registration) = unsafe { registration.cast::<Registration>().as_ref() } {
+        registration.peer.control.wake();
+    }
+}
+
+pub(crate) unsafe extern "C" fn peer_detach(registration: *mut ffi::Registration) {
+    if !registration.is_null() && Handle::try_current().is_err() {
+        let registration = unsafe { Box::from_raw(registration.cast::<Registration>()) };
+        registration.driver.detach();
+        // peer remains retained until the join has completed.
+    }
+}
+
+pub(crate) unsafe extern "C" fn peer_set_deadline(qso: *mut ffi::Qso, relative: u64) -> Status {
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    // Serialized host operation only, never a radio callback or concurrent control call.
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    serial.deadline = if relative == u64::MAX {
+        None
+    } else {
+        let Some(deadline) = Instant::now().checked_add(Duration::from_nanos(relative)) else {
+            return Status::Invalid;
+        };
+        Some(deadline)
+    };
+    Status::Ok
+}

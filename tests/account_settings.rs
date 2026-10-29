@@ -283,6 +283,171 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         rejected: AtomicUsize,
         accept: AtomicBool,
     }
+    struct StepTrace {
+        api: &'static Descriptor,
+        qso: *mut Qso,
+        calls: AtomicUsize,
+        errors: AtomicUsize,
+        packet: std::sync::Mutex<Vec<u8>>,
+        pcm: AtomicUsize,
+        gaps: AtomicUsize,
+        keyed: AtomicBool,
+        unkeyed: AtomicBool,
+        finish: AtomicBool,
+        drained: AtomicBool,
+        closed: AtomicBool,
+    }
+    unsafe extern "C" fn audio(
+        context: *mut std::ffi::c_void,
+        start: u64,
+        pcm: *const f32,
+        count: usize,
+        concealed: u32,
+    ) -> usize {
+        let trace = unsafe { &*context.cast::<StepTrace>() };
+        if start != trace.pcm.load(Ordering::Acquire) as u64
+            || concealed != 0
+            || unsafe { std::slice::from_raw_parts(pcm, count) }
+                .iter()
+                .any(|value| !value.is_finite())
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+        let accepted = count.min(73);
+        trace.pcm.fetch_add(accepted, Ordering::Release);
+        accepted
+    }
+    unsafe extern "C" fn gap(context: *mut std::ffi::c_void, _: u64, count: u32) -> u32 {
+        let trace = unsafe { &*context.cast::<StepTrace>() };
+        trace.gaps.fetch_add(count as usize, Ordering::Release);
+        count
+    }
+    unsafe extern "C" fn quiet(_: *mut std::ffi::c_void) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn step(context: *mut std::ffi::c_void) -> i32 {
+        let trace = unsafe { &*context.cast::<StepTrace>() };
+        let mut identity = info();
+        let mut result = rptadv_echolink::ffi::ReadResult::default();
+        if trace.calls.load(Ordering::Acquire) == 0 {
+            let mut encoded: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
+            encoded.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
+            let pcm = [0.1; 640];
+            let prepare = trace.api.peer_prepare_audio.unwrap();
+            if unsafe {
+                prepare(
+                    trace.qso,
+                    pcm.as_ptr(),
+                    pcm.len(),
+                    ptr::null_mut(),
+                    0,
+                    0,
+                    ptr::from_mut(&mut encoded).cast(),
+                )
+            } != Status::Ok
+                || encoded.status != 2
+                || encoded.required_capacity != 264
+                || encoded.consumed_frames != 0
+            {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
+            let mut packet = [0; 264];
+            if unsafe {
+                prepare(
+                    trace.qso,
+                    pcm.as_ptr(),
+                    pcm.len(),
+                    packet.as_mut_ptr(),
+                    packet.len(),
+                    0,
+                    ptr::from_mut(&mut encoded).cast(),
+                )
+            } != Status::Ok
+                || encoded.status != 0
+                || encoded.consumed_frames != 640
+                || encoded.encoded_bytes != 144
+                || encoded.packet_frames != 640
+                || encoded.source_start_frames != 0
+                || encoded.source_frames != 640
+                || packet[..4] != [0xc0, 3, 0, 0]
+            {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
+            *trace.packet.lock().unwrap() = packet[..encoded.encoded_bytes].to_vec();
+        }
+        {
+            let mut pending = trace.packet.lock().unwrap();
+            if !pending.is_empty() {
+                match unsafe {
+                    trace.api.peer_send_prepared.unwrap()(
+                        trace.qso,
+                        ByteSpan {
+                            data: pending.as_ptr(),
+                            length: pending.len(),
+                        },
+                        640,
+                        0,
+                    )
+                } {
+                    Status::Ok => pending.clear(),
+                    Status::Pending | Status::Full => {}
+                    _ => {
+                        trace.errors.fetch_add(1, Ordering::Release);
+                    }
+                }
+            }
+        }
+        let sink = PcmSink {
+            struct_size: size_of::<PcmSink>() as u32,
+            abi_version: 1,
+            context,
+            audio: Some(audio),
+            gap: Some(gap),
+        };
+        let status = unsafe {
+            trace.api.peer_read.unwrap()(
+                trace.qso,
+                u32::from(trace.drained.load(Ordering::Acquire)),
+                &sink,
+                None,
+                ptr::null_mut(),
+                &mut result,
+            )
+        };
+        if status != Status::Ok {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+        if result.activity == 1 {
+            trace.keyed.store(true, Ordering::Release);
+        }
+        if result.activity == 2 {
+            trace.unkeyed.store(true, Ordering::Release);
+        }
+        if result.finish_pending == 1 {
+            trace.finish.store(true, Ordering::Release);
+        }
+        let closed = result.state == 3;
+        trace.closed.store(closed, Ordering::Release);
+        if unsafe { trace.api.peer_info.unwrap()(trace.qso, &mut identity) } != Status::Ok
+            || identity.node_number != 123456
+            || unsafe {
+                trace.api.peer_read.unwrap()(
+                    trace.qso,
+                    0,
+                    ptr::null(),
+                    None,
+                    ptr::null_mut(),
+                    &mut result,
+                )
+            } != Status::Ok
+            || (result.state != 1 && result.state != 2 && result.state != 3)
+            || unsafe { trace.api.peer_set_deadline.unwrap()(trace.qso, 20_000_000) } != Status::Ok
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+        trace.calls.fetch_add(1, Ordering::Release);
+        if closed { -1 } else { 0 }
+    }
     unsafe extern "C" fn notify(context: *mut std::ffi::c_void, event: *const Event) {
         let trace = unsafe { &*context.cast::<Trace>() };
         let event = unsafe { &*event };
@@ -303,6 +468,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             }
         }
     }
+    #[track_caller]
     fn wait(mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !ready() {
@@ -319,7 +485,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let server = std::thread::spawn(move || {
-        for (index, response) in [b"OK".as_slice(), b"@@@\n2\nW1XYZ-R\nIncoming\n123456\n127.0.0.1\nN2DEF-R\nOutgoing\n654321\n127.0.0.1\n+++\n", b"OK"].into_iter().enumerate() {
+        for (index, response) in [b"OK".as_slice(), b"@@@\n2\nW1XYZ-R\nIncoming\n123456\n127.0.0.2\nN2DEF-R\nOutgoing\n654321\n127.0.0.1\n+++\n", b"OK"].into_iter().enumerate() {
             let mut accepted = None;
             wait(|| match listener.accept() {
                 Ok(socket) => { accepted = Some(socket.0); true },
@@ -378,14 +544,21 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         },
         Status::Ok
     );
-    unsafe { api.context_destroy.unwrap()(context) };
     wait(|| trace.fresh.load(Ordering::Acquire));
     let mut outgoing = ptr::null_mut();
     assert_eq!(
         unsafe { api.dial.unwrap()(account, 654321, &mut outgoing) },
         Status::Ok
     );
-    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let peer = std::net::UdpSocket::bind("127.0.0.2:0").unwrap();
+    let media = std::net::UdpSocket::bind("127.0.0.2:5198").unwrap();
+    media
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let feedback = std::net::UdpSocket::bind("127.0.0.2:5199").unwrap();
+    feedback
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     let mut sdes = [0; 512];
     let length = rptadv_echolink::wire::write_control(
         &rptadv_echolink::wire::ControlPacket::Sdes {
@@ -412,6 +585,98 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
         b"W1XYZ-R"
     );
+    let serial = StepTrace {
+        api,
+        qso: incoming,
+        calls: AtomicUsize::new(0),
+        errors: AtomicUsize::new(0),
+        packet: std::sync::Mutex::new(Vec::new()),
+        pcm: AtomicUsize::new(0),
+        gaps: AtomicUsize::new(0),
+        keyed: AtomicBool::new(false),
+        unkeyed: AtomicBool::new(false),
+        finish: AtomicBool::new(false),
+        drained: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
+    };
+    let mut registration = ptr::null_mut();
+    api.peer_read.expect("source-rate receive bridge missing");
+    api.peer_prepare_audio
+        .expect("prepared-media ABI bridge missing");
+    api.peer_send_prepared
+        .expect("prepared send bridge missing");
+    assert_eq!(
+        unsafe {
+            api.peer_attach.expect("serial owner missing")(
+                context,
+                incoming,
+                Some(step),
+                ptr::from_ref(&serial).cast_mut().cast(),
+                &mut registration,
+            )
+        },
+        Status::Ok
+    );
+    assert!(!registration.is_null());
+    let mut retiring_registration = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            api.peer_attach.unwrap()(
+                context,
+                outgoing,
+                Some(quiet),
+                ptr::null_mut(),
+                &mut retiring_registration,
+            )
+        },
+        Status::Ok
+    );
+    unsafe { api.context_destroy.unwrap()(context) };
+    wait(|| serial.calls.load(Ordering::Acquire) >= 3);
+    let mut encoded = [0; 264];
+    let (media_length, _) = media.recv_from(&mut encoded).unwrap();
+    assert_eq!(media_length, 144);
+    assert_eq!(&encoded[..4], &[0xc0, 3, 0, 0]);
+    media
+        .send_to(
+            &encoded[..media_length],
+            (std::net::Ipv4Addr::LOCALHOST, port),
+        )
+        .unwrap();
+    wait(|| serial.pcm.load(Ordering::Acquire) == 640 && serial.finish.load(Ordering::Acquire));
+    assert!(serial.keyed.load(Ordering::Acquire));
+    assert!(
+        !serial.unkeyed.load(Ordering::Acquire),
+        "must wait for the exact product finite token"
+    );
+    serial.drained.store(true, Ordering::Release);
+    unsafe { api.peer_wake.unwrap()(registration) };
+    wait(|| serial.unkeyed.load(Ordering::Acquire));
+    unsafe { api.peer_stop.unwrap()(registration) };
+    wait(|| serial.closed.load(Ordering::Acquire));
+    let mut control = [0; 512];
+    loop {
+        let (count, _) = feedback.recv_from(&mut control).unwrap();
+        if matches!(
+            rptadv_echolink::wire::parse_datagram(
+                rptadv_echolink::wire::Channel::Control,
+                &control[..count]
+            )
+            .unwrap(),
+            rptadv_echolink::wire::WirePacket::Control(
+                rptadv_echolink::wire::ControlPacket::Bye { .. }
+            )
+        ) {
+            break;
+        }
+    }
+    unsafe { api.peer_detach.unwrap()(registration) };
+    let calls = serial.calls.load(Ordering::Acquire);
+    assert_eq!(serial.errors.load(Ordering::Acquire), 0);
+    peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(serial.calls.load(Ordering::Acquire), calls);
     unsafe { api.peer_destroy.unwrap()(incoming) };
     trace.accept.store(false, Ordering::Release);
     wait(|| {
@@ -426,6 +691,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
     );
     unsafe {
         api.account_destroy.unwrap()(account);
+        api.peer_detach.unwrap()(retiring_registration);
         api.peer_destroy.unwrap()(outgoing);
     }
     server.join().unwrap();

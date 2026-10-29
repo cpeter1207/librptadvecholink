@@ -14,8 +14,9 @@ pub mod transport;
 pub mod wire;
 use ffi::{AccountConfig, AccountSecrets, Descriptor, RuntimeConfig, Status};
 use owner::{
-    Account, account_activate, account_destroy, account_stop, dial, peer_destroy, peer_info,
-    validate_pending,
+    Account, account_activate, account_destroy, account_stop, dial, peer_attach, peer_destroy,
+    peer_detach, peer_info, peer_prepare_audio, peer_read, peer_send_prepared, peer_set_deadline,
+    peer_stop, peer_wake, validate_pending,
 };
 use std::{mem::size_of, ptr, sync::Arc};
 
@@ -46,16 +47,16 @@ static DESCRIPTOR: Descriptor = Descriptor {
     dial: Some(dial),
     validate_pending: Some(validate_pending),
     peer_info: Some(peer_info),
-    peer_attach: None,
-    peer_stop: None,
-    peer_detach: None,
-    peer_wake: None,
-    peer_set_deadline: None,
+    peer_attach: Some(peer_attach),
+    peer_stop: Some(peer_stop),
+    peer_detach: Some(peer_detach),
+    peer_wake: Some(peer_wake),
+    peer_set_deadline: Some(peer_set_deadline),
     peer_destroy: Some(peer_destroy),
-    peer_read: None,
-    peer_prepare_audio: None,
+    peer_read: Some(peer_read),
+    peer_prepare_audio: Some(peer_prepare_audio),
     peer_reset_encoder: None,
-    peer_send_prepared: None,
+    peer_send_prepared: Some(peer_send_prepared),
     peer_elapsed_ms: None,
     peer_send_text: None,
 };
