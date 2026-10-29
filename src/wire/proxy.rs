@@ -21,6 +21,18 @@ pub enum ProxyKind {
     /// One-byte authentication/access status.
     System = 7,
 }
+impl ProxyKind {
+    /// The same kind-specific bound governs parser and retained-send readiness.
+    pub(crate) fn valid_length(self, length: usize) -> bool {
+        match self {
+            Self::TcpOpen | Self::TcpClose => length == 0,
+            Self::TcpStatus => length == 4,
+            Self::System => length == 1,
+            Self::TcpData => (1..=65_536).contains(&length),
+            Self::UdpData | Self::UdpControl => (1..=MAX_DATAGRAM).contains(&length),
+        }
+    }
+}
 /// Borrowed complete Proxy record, valid only during emit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProxyRecord<'a> {
@@ -66,14 +78,7 @@ fn header(bytes: &[u8]) -> Result<(ProxyKind, usize), WireError> {
         7 => ProxyKind::System,
         _ => return Err(WireError::Unsupported),
     };
-    let valid = match kind {
-        ProxyKind::TcpOpen | ProxyKind::TcpClose => length == 0,
-        ProxyKind::TcpStatus => length == 4,
-        ProxyKind::System => length == 1,
-        ProxyKind::TcpData => (1..=65_536).contains(&length),
-        ProxyKind::UdpData | ProxyKind::UdpControl => (1..=MAX_DATAGRAM).contains(&length),
-    };
-    if !valid {
+    if !kind.valid_length(length) {
         return Err(WireError::Malformed);
     }
     Ok((kind, length))

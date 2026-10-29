@@ -328,3 +328,120 @@ fn concurrent_proxy_senders_share_one_slot_budget_and_wake_the_existing_writer()
         assert_eq!(first.try_queue(control, None), Err(QueueError::Closed));
     });
 }
+
+#[test]
+fn proxy_writability_waits_for_the_same_packet_budget_without_reserving_credit() {
+    run(async {
+        let (stream, _sink) = tokio::io::duplex(1);
+        let mut writer = ProxyWriter::new(stream);
+        let output = writer.output();
+        let now = Instant::now();
+        let large = [0; 65507];
+        for _ in 0..3 {
+            output
+                .try_queue(
+                    ProxyRecord {
+                        kind: ProxyKind::UdpData,
+                        address: Ipv4Addr::LOCALHOST,
+                        payload: &large,
+                    },
+                    Some(now),
+                )
+                .unwrap();
+        }
+        let ready = output.writable(ProxyKind::UdpData, 100);
+        tokio::pin!(ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut ready)
+                .await
+                .is_err()
+        );
+        // Slots remain, but only87 media bytes fit. A slot-only wait spins here.
+        assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut ready)
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(writer.queued_bytes(), 131014);
+        // Readiness consumes no slot or byte allowance and cancellation is harmless.
+        assert_eq!(output.writable(ProxyKind::UdpData, 65507).await, Ok(()));
+        output
+            .try_queue(
+                ProxyRecord {
+                    kind: ProxyKind::UdpData,
+                    address: Ipv4Addr::LOCALHOST,
+                    payload: &large,
+                },
+                Some(now),
+            )
+            .unwrap();
+        assert_eq!(writer.queued_bytes(), 196521);
+        assert_eq!(
+            output.writable(ProxyKind::TcpClose, 1).await,
+            Err(QueueError::Invalid)
+        );
+    });
+}
+
+#[test]
+fn proxy_writability_observes_media_reserve_and_writer_closure() {
+    run(async {
+        let (stream, _sink) = tokio::io::duplex(1);
+        let mut writer = ProxyWriter::new(stream);
+        let output = writer.output();
+        let now = Instant::now();
+        for _ in 0..56 {
+            output
+                .try_queue(
+                    ProxyRecord {
+                        kind: ProxyKind::UdpData,
+                        address: Ipv4Addr::LOCALHOST,
+                        payload: b"a",
+                    },
+                    Some(now),
+                )
+                .unwrap();
+        }
+        assert_eq!(output.writable(ProxyKind::UdpControl, 1).await, Ok(()));
+        let ready = output.writable(ProxyKind::UdpData, 1);
+        tokio::pin!(ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut ready)
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut ready)
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        output
+            .try_queue(
+                ProxyRecord {
+                    kind: ProxyKind::UdpData,
+                    address: Ipv4Addr::LOCALHOST,
+                    payload: b"a",
+                },
+                Some(now),
+            )
+            .unwrap();
+        let closed = output.writable(ProxyKind::UdpData, 1);
+        tokio::pin!(closed);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut closed)
+                .await
+                .is_err()
+        );
+        drop(writer);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut closed)
+                .await
+                .unwrap(),
+            Err(QueueError::Closed)
+        );
+    });
+}

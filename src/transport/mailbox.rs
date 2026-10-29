@@ -30,6 +30,16 @@ pub enum PushError {
 pub(crate) struct Budget(AtomicU64);
 
 impl Budget {
+    /// Test the same combined byte budget without reserving any credit.
+    pub(crate) fn available_for(&self, length: usize, media: bool) -> bool {
+        Self::fits(self.0.load(Ordering::Acquire), length, media)
+    }
+
+    fn fits(old: u64, length: usize, media: bool) -> bool {
+        let total = (old >> 32) as usize + length;
+        let media_bytes = (old as u32) as usize + if media { length } else { 0 };
+        total <= TOTAL_BYTES && media_bytes <= MEDIA_BYTES
+    }
     pub(crate) fn reserve(
         self: &Arc<Self>,
         length: usize,
@@ -39,9 +49,7 @@ impl Budget {
         let amount = ((length as u64) << 32) | if media { length as u64 } else { 0 };
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                let total = (old >> 32) as usize + length;
-                let media_bytes = (old as u32) as usize + if media { length } else { 0 };
-                (total <= TOTAL_BYTES && media_bytes <= MEDIA_BYTES).then_some(old + amount)
+                Self::fits(old, length, media).then_some(old + amount)
             })
             .map_err(|_| PushError::Full)?;
         Ok(Charge {

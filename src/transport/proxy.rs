@@ -19,7 +19,7 @@ use tokio::{
         TcpStream,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 
 /// Content-free transport/authentication failure; no credentials or payload bodies.
@@ -182,6 +182,16 @@ struct Queued {
     _charge: Charge,
     _slot: OwnedSemaphorePermit,
     _media_slot: Option<OwnedSemaphorePermit>,
+    // Rust drops fields in declaration order. Notify only after every retained
+    // byte/slot charge above is released, not while a waiter still sees it full.
+    _retired: CreditProgress,
+}
+
+struct CreditProgress(Arc<Notify>);
+impl Drop for CreditProgress {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
 }
 
 /// Nonblocking multi-peer handoff to the sole Proxy writer. All clones and the
@@ -192,6 +202,7 @@ pub struct ProxyOutput {
     slots: Arc<Semaphore>,
     media_slots: Arc<Semaphore>,
     budget: Arc<Budget>,
+    progress: Arc<Notify>,
 }
 
 impl ProxyOutput {
@@ -204,10 +215,14 @@ impl ProxyOutput {
     ) -> Result<(), QueueError> {
         let header = record.header().map_err(|_| QueueError::Invalid)?;
         let media = record.kind == ProxyKind::UdpData;
+        // Declare before credits so failed admission releases them before wake.
+        // On success this moves into the queued record's last-drop field.
+        let retired;
         let permit = self.sender.try_reserve().map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => QueueError::Full,
             mpsc::error::TrySendError::Closed(_) => QueueError::Closed,
         })?;
+        retired = CreditProgress(Arc::clone(&self.progress));
         let slot = Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| QueueError::Full)?;
@@ -234,8 +249,40 @@ impl ProxyOutput {
             _charge: charge,
             _slot: slot,
             _media_slot: media_slot,
+            _retired: retired,
         });
         Ok(())
+    }
+
+    /// Wait only after a Full send for this same kind/length, without copying
+    /// PCM, reserving budget, polling a timer, or blocking another peer. Ready
+    /// is advisory: concurrent senders may win its credit before try_queue.
+    pub async fn writable(&self, kind: ProxyKind, payload_bytes: usize) -> Result<(), QueueError> {
+        if !kind.valid_length(payload_bytes) {
+            return Err(QueueError::Invalid);
+        }
+        loop {
+            let progress = self.progress.notified();
+            tokio::pin!(progress);
+            // Register before checking all four conditions; retirement between
+            // this snapshot and await must not be lost.
+            progress.as_mut().enable();
+            if self.sender.is_closed() {
+                return Err(QueueError::Closed);
+            }
+            let media = kind == ProxyKind::UdpData;
+            if self.sender.capacity() != 0
+                && self.slots.available_permits() != 0
+                && (!media || self.media_slots.available_permits() != 0)
+                && self.budget.available_for(payload_bytes, media)
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = progress => {},
+                _ = self.sender.closed() => return Err(QueueError::Closed),
+            }
+        }
     }
 }
 
@@ -260,6 +307,7 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
                 slots: Arc::new(Semaphore::new(64)),
                 media_slots: Arc::new(Semaphore::new(56)),
                 budget: Arc::new(Budget::default()),
+                progress: Arc::new(Notify::new()),
             },
         }
     }
