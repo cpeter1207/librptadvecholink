@@ -51,6 +51,16 @@ pub enum Progress {
     Drained,
 }
 
+/// Source samples accepted by the product sink, not generated samples retried
+/// after backpressure. Counters survive ordinary burst resets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Concealment {
+    /// Native codec PLC samples; never presented to the DTMF detector.
+    pub codec_samples: u64,
+    /// Ordered unresolved samples handed to shared-ring fallback PLC.
+    pub gap_samples: u64,
+}
+
 /// One peer worker owns this object and both capabilities. No radio callback calls it.
 /// Storage holds only one decoded packet and one fetched decision, never another PCM ring.
 pub struct Playout {
@@ -76,9 +86,14 @@ pub struct Playout {
     skipped: u64,
     ending: bool,
     announced: bool,
+    concealment: Concealment,
 }
 
 impl Playout {
+    /// Copy published concealment provenance on the sole playout owner.
+    pub fn concealment(&self) -> Concealment {
+        self.concealment
+    }
     /// Compose the retained 160/180/500 ms jitter policy and an always-PLC-enabled codec.
     /// Gain is applied once after decode/concealment; all work is off radio callbacks.
     /// `codec` is only the initial PLC hint, not a receive-format restriction. Each
@@ -129,6 +144,7 @@ impl Playout {
             skipped: 0,
             ending: false,
             announced: false,
+            concealment: Concealment::default(),
         })
     }
 
@@ -311,6 +327,15 @@ impl Playout {
             .output
             .checked_add(accepted as u64)
             .ok_or(MediaError::Contract)?;
+        if self.concealed {
+            self.concealment.codec_samples = self
+                .concealment
+                .codec_samples
+                .saturating_add(accepted as u64);
+        } else if self.count == 0 {
+            self.concealment.gap_samples =
+                self.concealment.gap_samples.saturating_add(accepted as u64);
+        }
         if self.position == self.count && self.gap == 0 && self.prefix == 0 && self.remaining == 0 {
             self.commit(now)?;
             return Ok(Progress::Advanced);

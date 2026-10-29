@@ -39,6 +39,29 @@ pub struct Turn {
     pub action: Option<QsoAction>,
 }
 
+/// Read-only serial-owner metadata. Jitter values use the 8 kHz source clock;
+/// ring fallback concealment is observed separately by the product.
+pub struct Observation {
+    /// QSO state and original liveness anchors.
+    pub session: crate::session::Observation,
+    /// Negotiated outbound format, not a receive packet restriction.
+    pub codec: Codec,
+    /// This connection currently supplies selected/draining RF audio.
+    pub selected: bool,
+    /// Age of a retained original datagram; zero when none is retained.
+    pub retained_age_ms: u64,
+    /// Packets rejected before parsing because their route generation retired.
+    pub stale_packets: u64,
+    /// Wire or media framing failures, never automatic hangups.
+    pub malformed_packets: u64,
+    /// Lower RTP sequences observed within a selected burst, excluding duplicates.
+    pub out_of_order_packets: u64,
+    /// Actual packet-jitter adapter counters and source-sample delay.
+    pub jitter: rptadv_jitter_client::Observation,
+    /// Concealment and fallback spans actually accepted by the product sink.
+    pub concealment: crate::playout::Concealment,
+}
+
 /// Exactly one serial worker owns this object. Host notification occurs only after
 /// ending its mutable borrow. The PCM sink only publishes to the existing product
 /// ring; it must not reenter this owner. Outgoing encoding remains independently owned.
@@ -53,6 +76,9 @@ pub struct Receiver {
     ending: bool,
     highest_sequence: Option<u16>,
     playout_deadline: Option<Instant>,
+    stale_packets: u64,
+    malformed_packets: u64,
+    out_of_order_packets: u64,
 }
 
 impl Receiver {
@@ -69,7 +95,27 @@ impl Receiver {
             ending: false,
             highest_sequence: None,
             playout_deadline: None,
+            stale_packets: 0,
+            malformed_packets: 0,
+            out_of_order_packets: 0,
         }
+    }
+
+    /// Copy only on this connection's serial owner, never from an audio callback.
+    pub fn observe(&self, now: Instant) -> Result<Observation, MediaError> {
+        Ok(Observation {
+            session: self.qso.observe(now),
+            codec: self.codec(),
+            selected: self.selected,
+            retained_age_ms: self.pending.as_ref().map_or(0, |packet| {
+                crate::session::ms(now.saturating_duration_since(packet.arrived()))
+            }),
+            stale_packets: self.stale_packets,
+            malformed_packets: self.malformed_packets,
+            out_of_order_packets: self.out_of_order_packets,
+            jitter: self.playout.observe()?,
+            concealment: self.playout.concealment(),
+        })
     }
 
     /// No new packet may replace the retained one or enter a closing generation.
@@ -154,6 +200,7 @@ impl Receiver {
     /// A retained input is a caller contract error, never silently overwritten.
     pub fn packet(&mut self, packet: Datagram) -> Result<Incoming, MediaError> {
         if packet.generation() != self.qso.generation() {
+            self.stale_packets = self.stale_packets.saturating_add(1);
             return Ok(Incoming::Ignored);
         }
         if !self.can_receive() {
@@ -167,6 +214,7 @@ impl Receiver {
             return Ok(Incoming::Ignored);
         };
         let Ok(wire) = parse_datagram(packet.class(), packet.payload()) else {
+            self.malformed_packets = self.malformed_packets.saturating_add(1);
             return Ok(Incoming::Ignored);
         };
         if let WirePacket::Voice(voice) = &wire {
@@ -194,7 +242,11 @@ impl Receiver {
             WirePacket::Control(ControlPacket::Bye { source, .. }) => {
                 Packet::Bye { source: *source }
             }
-            WirePacket::Voice(voice) if self.playout.validate(voice)? => {
+            WirePacket::Voice(voice) => {
+                if !self.playout.validate(voice)? {
+                    self.malformed_packets = self.malformed_packets.saturating_add(1);
+                    return Ok(Incoming::Ignored);
+                }
                 Packet::Voice { source: voice.ssrc }
             }
             WirePacket::Chat { .. } => Packet::Chat,
@@ -280,6 +332,12 @@ impl Receiver {
                 Reception::Busy => {}
                 Reception::Invalid => return Err(MediaError::Contract),
                 Reception::Admitted(_) => {
+                    if self
+                        .highest_sequence
+                        .is_some_and(|last| (voice.sequence.wrapping_sub(last) as i16) < 0)
+                    {
+                        self.out_of_order_packets = self.out_of_order_packets.saturating_add(1);
+                    }
                     if self
                         .highest_sequence
                         .is_none_or(|last| voice.sequence.wrapping_sub(last) as i16 > 0)

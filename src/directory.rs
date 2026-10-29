@@ -63,6 +63,11 @@ pub struct DirectorySnapshot {
 }
 
 impl DirectorySnapshot {
+    /// Age of the last complete publication, not the latest attempted refresh.
+    pub fn age_ms(&self, now: Instant) -> Option<u64> {
+        self.published
+            .map(|time| crate::session::ms(now.saturating_duration_since(time)))
+    }
     /// Change the validated freshness budget without renewing the publication
     /// time or erasing the last complete entries/server token.
     pub(crate) fn set_freshness(&mut self, freshness: Duration) {

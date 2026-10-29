@@ -8,9 +8,15 @@ use super::mailbox::{Budget, Charge};
 use crate::wire::{ProxyDecoder, ProxyKind, ProxyRecord, WireError};
 use md5::{Digest, Md5};
 use std::{
+    future::poll_fn,
     io::ErrorKind,
     net::SocketAddr,
-    sync::Arc,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::Poll,
     time::{Duration, Instant},
 };
 use tokio::{
@@ -179,12 +185,83 @@ struct Queued {
     wire: Vec<u8>,
     offset: usize,
     expires: Option<Instant>,
+    admitted: u64,
     _charge: Charge,
     _slot: OwnedSemaphorePermit,
     _media_slot: Option<OwnedSemaphorePermit>,
     // Rust drops fields in declaration order. Notify only after every retained
     // byte/slot charge above is released, not while a waiter still sees it full.
     _retired: CreditProgress,
+}
+
+/// Copied account-wide TCP output counters. Sent means a complete framed write,
+/// not queue admission or proof that the remote station received the datagram.
+/// Concurrent fields are individually atomic, not a transactional snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProxyObservation {
+    /// Records admitted to the bounded account writer.
+    pub admitted: u64,
+    /// Complete records accepted by the TCP stream.
+    pub sent: u64,
+    /// Never-submitted media records discarded at their original deadline.
+    pub expired: u64,
+    /// Distinct socket-not-ready episodes, including canceled partial writes.
+    pub stalls: u64,
+    /// Cumulative socket-not-ready duration, including the current episode.
+    pub stall_ms: u64,
+    /// Retained payload bytes, including partially submitted records.
+    pub queued_bytes: u64,
+    /// Age of the current head record, zero when no record has been picked.
+    pub head_age_ms: u64,
+}
+
+struct Metrics {
+    origin: Instant,
+    admitted: AtomicU64,
+    sent: AtomicU64,
+    expired: AtomicU64,
+    stalls: AtomicU64,
+    stall_ns: AtomicU64,
+    stalled_at: AtomicU64,
+    head: AtomicU64,
+}
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+            admitted: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
+            stalls: AtomicU64::new(0),
+            stall_ns: AtomicU64::new(0),
+            stalled_at: AtomicU64::new(0),
+            head: AtomicU64::new(0),
+        }
+    }
+}
+impl Metrics {
+    fn stamp(&self) -> u64 {
+        (self
+            .origin
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX - 1)) as u64)
+            + 1
+    }
+    // Only the sole writer changes the current stall, including after cancellation.
+    fn stall(&self) {
+        if self.stalled_at.load(Ordering::Relaxed) == 0 {
+            self.stalled_at.store(self.stamp(), Ordering::Relaxed);
+            self.stalls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn resume(&self) {
+        let since = self.stalled_at.swap(0, Ordering::Relaxed);
+        if since != 0 {
+            self.stall_ns
+                .fetch_add(self.stamp().saturating_sub(since), Ordering::Relaxed);
+        }
+    }
 }
 
 struct CreditProgress(Arc<Notify>);
@@ -203,9 +280,39 @@ pub struct ProxyOutput {
     media_slots: Arc<Semaphore>,
     budget: Arc<Budget>,
     progress: Arc<Notify>,
+    metrics: Arc<Metrics>,
 }
 
 impl ProxyOutput {
+    /// Read metadata from any control owner without borrowing the TCP writer.
+    pub fn observe(&self) -> ProxyObservation {
+        let metrics = &self.metrics;
+        let now = metrics.stamp();
+        let stalled_at = metrics.stalled_at.load(Ordering::Relaxed);
+        let head = metrics.head.load(Ordering::Relaxed);
+        ProxyObservation {
+            admitted: metrics.admitted.load(Ordering::Relaxed),
+            sent: metrics.sent.load(Ordering::Relaxed),
+            expired: metrics.expired.load(Ordering::Relaxed),
+            stalls: metrics.stalls.load(Ordering::Relaxed),
+            stall_ms: metrics
+                .stall_ns
+                .load(Ordering::Relaxed)
+                .saturating_add(if stalled_at == 0 {
+                    0
+                } else {
+                    now.saturating_sub(stalled_at)
+                })
+                / 1_000_000,
+            queued_bytes: self.budget.retained_bytes() as u64,
+            head_age_ms: if head == 0 {
+                0
+            } else {
+                now.saturating_sub(head) / 1_000_000
+            },
+        }
+    }
+
     /// Reserve before copying; only UDP data is media. Pass its existing age deadline,
     /// not a new time stamp. Control never expires or replaces an already submitted frame.
     pub fn try_queue(
@@ -246,11 +353,13 @@ impl ProxyOutput {
             wire,
             offset: 0,
             expires: if media { expires } else { None },
+            admitted: self.metrics.stamp(),
             _charge: charge,
             _slot: slot,
             _media_slot: media_slot,
             _retired: retired,
         });
+        self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -294,6 +403,14 @@ pub struct ProxyWriter<S> {
     current: Option<Queued>,
 }
 
+impl<S> Drop for ProxyWriter<S> {
+    fn drop(&mut self) {
+        // Retiring transport is not an ongoing socket stall or a successful send.
+        self.output.metrics.resume();
+        self.output.metrics.head.store(0, Ordering::Relaxed);
+    }
+}
+
 impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
     /// Prepare bounded accounting outside any real-time callback.
     pub fn new(stream: S) -> Self {
@@ -308,6 +425,7 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
                 media_slots: Arc::new(Semaphore::new(56)),
                 budget: Arc::new(Budget::default()),
                 progress: Arc::new(Notify::new()),
+                metrics: Arc::new(Metrics::default()),
             },
         }
     }
@@ -349,21 +467,36 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
         let Some(front) = self.current.as_mut() else {
             return Ok(FlushOutcome::Empty);
         };
+        let metrics = &self.output.metrics;
+        metrics.head.store(front.admitted, Ordering::Relaxed);
         if front.offset == 0 && front.expires.is_some_and(|deadline| now >= deadline) {
+            metrics.expired.fetch_add(1, Ordering::Relaxed);
+            metrics.head.store(0, Ordering::Relaxed);
             self.current = None;
             return Ok(FlushOutcome::Skipped);
         }
         while front.offset < front.wire.len() {
-            let count = self
-                .stream
-                .write(&front.wire[front.offset..])
-                .await
-                .map_err(io_error)?;
+            let count = poll_fn(|cx| {
+                match Pin::new(&mut self.stream).poll_write(cx, &front.wire[front.offset..]) {
+                    Poll::Pending => {
+                        metrics.stall();
+                        Poll::Pending
+                    }
+                    Poll::Ready(result) => {
+                        metrics.resume();
+                        Poll::Ready(result)
+                    }
+                }
+            })
+            .await
+            .map_err(io_error)?;
             if count == 0 {
                 return Err(ProxyError::Io(ErrorKind::WriteZero));
             }
             front.offset += count;
         }
+        metrics.sent.fetch_add(1, Ordering::Relaxed);
+        metrics.head.store(0, Ordering::Relaxed);
         self.current = None;
         Ok(FlushOutcome::Sent)
     }

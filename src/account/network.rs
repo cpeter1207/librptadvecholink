@@ -77,6 +77,42 @@ pub enum PeerTransport {
     Proxy(ProxyOutput),
 }
 
+/// Copied metadata from the existing account owner. No credentials, message
+/// bodies, payload bytes or admission authority are exported.
+#[derive(Clone, Copy, Debug)]
+pub struct Observation {
+    /// Registration/refresh state, independent of existing QSO liveness.
+    pub directory: super::directory::Observation,
+    /// Last complete directory publication remains within its allowed age.
+    pub fresh: bool,
+    /// Age of the last complete directory publication; absent before one exists.
+    pub snapshot_age_ms: Option<u64>,
+    /// Direct UDP=0, selected standard TCP Proxy=1.
+    pub transport: u32,
+    /// Currently admitted QSOs, not incoming candidates.
+    pub admitted: usize,
+    /// Retained, verified but not yet accepted incoming handshakes.
+    pub pending: usize,
+    /// Exact selected station/generation, including its draining tail.
+    pub selected: Option<(u32, u64)>,
+    /// Selected raw receive activity, distinct from final drained unkey.
+    pub receiving: bool,
+    /// Valid competing talker packets suppressed by account policy.
+    pub suppressed_packets: u64,
+    /// Account talker-control credit failures, not network loss.
+    pub control_overflows: u64,
+    /// Packets admitted to an exact connection mailbox.
+    pub routed_packets: u64,
+    /// Unroutable, unverified, malformed or mailbox-rejected packets.
+    pub dropped_packets: u64,
+    /// Wire-parser failures, a subset of dropped packets.
+    pub malformed_packets: u64,
+    /// Packets shed by a full peer mailbox, never a hangup.
+    pub ingress_full_packets: u64,
+    /// Actual Proxy writer metadata; absent in direct mode.
+    pub proxy: Option<crate::transport::proxy::ProxyObservation>,
+}
+
 enum Transport {
     Direct(Arc<DirectSockets>),
     Proxy(ProxySession),
@@ -122,6 +158,7 @@ enum Command {
     Dial(u32, oneshot::Sender<Result<PeerConnection, NetworkError>>),
     Accept(u64, oneshot::Sender<Result<PeerConnection, NetworkError>>),
     Remove(u32, u64),
+    Observe(oneshot::Sender<Result<Observation, NetworkError>>),
     Reconfigure(
         Arc<PreparedSettings>,
         oneshot::Sender<Result<(), NetworkError>>,
@@ -269,6 +306,9 @@ impl AccountNetwork {
             events,
             stop,
             retired,
+            routed_packets: 0,
+            dropped_packets: 0,
+            ingress_full_packets: 0,
         };
         let task = runtime.spawn(owner.run());
         Ok((
@@ -324,6 +364,11 @@ impl AccountNetwork {
 }
 
 impl NetworkControl {
+    /// Query on the existing bounded account command channel. This copies on
+    /// that owner without a sampler/task, locks, or borrowing any peer state.
+    pub async fn observe(&self) -> Result<Observation, NetworkError> {
+        self.request(Command::Observe).await
+    }
     async fn request<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<Result<T, NetworkError>>) -> Command,
@@ -397,9 +442,45 @@ struct Owner {
     events: mpsc::Sender<NetworkEvent>,
     stop: watch::Receiver<bool>,
     retired: Arc<Notify>,
+    routed_packets: u64,
+    dropped_packets: u64,
+    ingress_full_packets: u64,
 }
 
 impl Owner {
+    fn observe(&mut self) -> Observation {
+        let now = Instant::now();
+        let router = self.coordinator.router();
+        let (admitted, pending, selected, receiving, suppressed_packets, malformed_packets) = (
+            router.account.admitted(),
+            router.pending_count(),
+            router.account.selected(),
+            router.account.receiving(),
+            router.account.suppressed_packets(),
+            router.malformed_packets(),
+        );
+        let proxy = match &self.transport {
+            Transport::Direct(_) => None,
+            Transport::Proxy(session) => Some(session.output().observe()),
+        };
+        Observation {
+            directory: self.directory.observe(now),
+            fresh: self.snapshot.require_fresh(now).is_ok(),
+            snapshot_age_ms: self.snapshot.age_ms(now),
+            transport: u32::from(proxy.is_some()),
+            admitted,
+            pending,
+            selected,
+            receiving,
+            suppressed_packets,
+            malformed_packets,
+            control_overflows: self.coordinator.overflows(),
+            routed_packets: self.routed_packets,
+            dropped_packets: self.dropped_packets,
+            ingress_full_packets: self.ingress_full_packets,
+            proxy,
+        }
+    }
     async fn run(mut self) {
         let mut audio = vec![0; MAX_DATAGRAM];
         let mut control = vec![0; MAX_DATAGRAM];
@@ -535,12 +616,24 @@ impl Owner {
     }
 
     fn route(&mut self, class: Channel, source: SocketAddr, arrived: Instant, bytes: &[u8]) {
-        if let RouteResult::Pending(pending) =
-            self.coordinator
-                .router()
-                .receive(&self.snapshot, class, source, arrived, bytes)
+        match self
+            .coordinator
+            .router()
+            .receive(&self.snapshot, class, source, arrived, bytes)
         {
-            let _ = self.events.try_send(NetworkEvent::Pending(pending));
+            RouteResult::Pending(pending) => {
+                let _ = self.events.try_send(NetworkEvent::Pending(pending));
+            }
+            RouteResult::Routed => self.routed_packets = self.routed_packets.saturating_add(1),
+            outcome => {
+                self.dropped_packets = self.dropped_packets.saturating_add(1);
+                if matches!(
+                    outcome,
+                    RouteResult::Backpressure(crate::transport::mailbox::PushError::Full)
+                ) {
+                    self.ingress_full_packets = self.ingress_full_packets.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -567,6 +660,10 @@ impl Owner {
             }
             Command::Reconfigure(settings, reply) => {
                 let _ = reply.send(self.reconfigure(settings));
+                return;
+            }
+            Command::Observe(reply) => {
+                let _ = reply.send(Ok(self.observe()));
                 return;
             }
         };

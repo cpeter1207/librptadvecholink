@@ -118,6 +118,24 @@ pub enum QsoAction {
     },
 }
 
+/// Metadata copied by the sole QSO owner. Ages and remaining deadlines are
+/// monotonic milliseconds; u64::MAX means an inactive deadline.
+#[derive(Clone, Copy, Debug)]
+pub struct Observation {
+    /// Exact lifecycle state, including finite tail drainage.
+    pub state: QsoState,
+    /// First close cause; cleanup cannot replace it.
+    pub first_cause: Option<Cause>,
+    /// Valid packet burst guard, not selected RF activity.
+    pub raw_receiving: bool,
+    /// Time since the last valid session-bound voice/control packet.
+    pub last_valid_age_ms: u64,
+    /// Time until the next sent heartbeat, or inactive.
+    pub heartbeat_due_ms: u64,
+    /// Time until setup/liveness expires, or inactive.
+    pub liveness_due_ms: u64,
+}
+
 /// Provider-owned session identity and liveness, never a host-supplied verification flag.
 pub struct Qso {
     peer: DirectoryEntry,
@@ -134,6 +152,30 @@ pub struct Qso {
 }
 
 impl Qso {
+    /// Copy diagnostics without renewing a deadline or advancing state.
+    pub fn observe(&self, now: Instant) -> Observation {
+        let active = matches!(self.state, QsoState::Connecting | QsoState::Connected);
+        let remaining = |anchor: Instant, period: Duration| {
+            if active {
+                ms(period.saturating_sub(now.saturating_duration_since(anchor)))
+            } else {
+                u64::MAX
+            }
+        };
+        let (anchor, period) = if self.state == QsoState::Connecting {
+            (self.created, self.timers.connect)
+        } else {
+            (self.last_valid, self.timers.liveness)
+        };
+        Observation {
+            state: self.state,
+            first_cause: self.first_cause,
+            raw_receiving: self.raw_receiving(now),
+            last_valid_age_ms: ms(now.saturating_duration_since(self.last_valid)),
+            heartbeat_due_ms: remaining(self.last_heartbeat, self.timers.heartbeat),
+            liveness_due_ms: remaining(anchor, period),
+        }
+    }
     /// Retain a fresh directory copy; establishing SDES remains mandatory.
     pub fn new(
         peer: DirectoryEntry,
@@ -310,6 +352,10 @@ impl Qso {
         self.state = QsoState::Closing;
         Some(QsoAction::Closing { cause, send_bye })
     }
+}
+
+pub(crate) fn ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn matches_source(known: Option<u32>, source: u32) -> bool {

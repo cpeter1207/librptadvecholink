@@ -137,6 +137,7 @@ pub struct Router {
     next: u64,
     pending: BTreeMap<u64, PendingHandshake>,
     routes: BTreeMap<Ipv4Addr, Vec<Route>>,
+    malformed: u64,
 }
 
 impl Router {
@@ -161,12 +162,18 @@ impl Router {
             next: 0,
             pending: BTreeMap::new(),
             routes: BTreeMap::new(),
+            malformed: 0,
         })
     }
 
     /// Current retained setup records; there is no task or payload ring per unknown packet.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Wire-parser failures only, distinct from unverified or unsupported input.
+    pub fn malformed_packets(&self) -> u64 {
+        self.malformed
     }
 
     fn generation(&mut self) -> Result<u64, Admission> {
@@ -194,6 +201,7 @@ impl Router {
             return RouteResult::Dropped;
         };
         let Ok(packet) = parse_datagram(channel, bytes) else {
+            self.malformed = self.malformed.saturating_add(1);
             return RouteResult::Dropped;
         };
         if let Some(routes) = self.routes.get_mut(endpoint.ip()) {

@@ -354,6 +354,14 @@ fn ordered_server_failover_obeys_retry_deadlines_and_ignores_old_completions() {
             .is_some()
     );
     assert_eq!(owner.state(), DirectoryState::Retrying);
+    let later = now + Duration::from_secs(10);
+    let status = owner.observe(later);
+    assert_eq!(status.state, DirectoryState::Retrying);
+    assert!(!status.registered);
+    assert_eq!((status.operations, status.failures), (1, 1));
+    assert_eq!(status.retry_in_ms, Some(10000));
+    assert_eq!(status.registration_age_ms, None);
+    assert_eq!(snapshot.age_ms(later), None);
     assert!(
         owner
             .poll(&snapshot, now + Duration::from_secs(19))
@@ -505,6 +513,13 @@ fn outage_retains_good_snapshot_and_live_calls() {
     assert_eq!(snapshot.by_node(123456, now).unwrap().callsign, "K1ABC-R");
     assert_eq!(call.state(), QsoState::Connected);
     assert_eq!(owner.state(), DirectoryState::Retrying);
+    let later = now + Duration::from_secs(10);
+    let status = owner.observe(later);
+    assert!(status.registered);
+    assert_eq!((status.operations, status.failures), (2, 1));
+    assert_eq!(status.retry_in_ms, Some(10000));
+    assert_eq!(status.registration_age_ms, Some(10000));
+    assert_eq!(snapshot.age_ms(later), Some(10000));
 }
 
 #[test]

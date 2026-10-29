@@ -313,6 +313,21 @@ fn missing_audio_uses_native_codec_plc_before_ring_fallback_and_never_runs_past_
         };
         drain(&mut playout, origin, &mut sink);
         assert_eq!(sink.next, 1920);
+        let counts = playout.concealment();
+        assert_eq!(
+            (counts.codec_samples, counts.gap_samples),
+            if codec == Codec::GsmFr {
+                (0, 640)
+            } else {
+                (640, 0)
+            }
+        );
+        playout.reset().unwrap();
+        assert_eq!(
+            playout.concealment(),
+            counts,
+            "burst reset must not erase cumulative published counters"
+        );
         if codec == Codec::GsmFr {
             assert_eq!(
                 sink.gaps, 640,

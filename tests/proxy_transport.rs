@@ -152,10 +152,52 @@ fn proxy_reader_preserves_remote_ip_and_audio_control_across_every_header_split(
 }
 
 #[test]
+fn dropping_a_stalled_writer_retires_its_live_stall_without_claiming_a_send() {
+    run(async {
+        let (stream, _sink) = tokio::io::duplex(1);
+        let mut writer = ProxyWriter::new(stream);
+        let output = writer.output();
+        output
+            .try_queue(
+                ProxyRecord {
+                    kind: ProxyKind::UdpData,
+                    address: Ipv4Addr::LOCALHOST,
+                    payload: b"a",
+                },
+                None,
+            )
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), writer.flush_next())
+                .await
+                .is_err()
+        );
+        drop(writer);
+        let retired = output.observe();
+        assert_eq!(
+            (
+                retired.sent,
+                retired.expired,
+                retired.queued_bytes,
+                retired.head_age_ms
+            ),
+            (0, 0, 0, 0)
+        );
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        assert_eq!(
+            output.observe().stall_ms,
+            retired.stall_ms,
+            "closed socket is no longer a live stall"
+        );
+    });
+}
+
+#[test]
 fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
     run(async {
         let (output, mut sink) = tokio::io::duplex(7);
         let mut writer = ProxyWriter::new(output);
+        let observer = writer.output();
         let now = Instant::now();
         writer
             .try_queue(
@@ -172,6 +214,17 @@ fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
                 .await
                 .is_err()
         );
+        let stalled = observer.observe();
+        assert_eq!(stalled.admitted, 1);
+        assert_eq!(
+            stalled.sent, 0,
+            "queued/partial bytes are not a sent record"
+        );
+        assert_eq!(stalled.expired, 0);
+        assert_eq!(stalled.stalls, 1);
+        assert!(stalled.stall_ms >= 5);
+        assert_eq!(stalled.queued_bytes, 5);
+        assert!(stalled.head_age_ms >= 5);
         let mut first = [0; 7];
         sink.read_exact(&mut first).await.unwrap();
         writer
@@ -215,6 +268,13 @@ fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
             .concat()
         );
         assert_eq!(writer.queued_bytes(), 0);
+        let completed = observer.observe();
+        assert_eq!(
+            (completed.admitted, completed.sent, completed.expired),
+            (2, 2, 0)
+        );
+        assert_eq!(completed.queued_bytes, 0);
+        assert!(completed.stall_ms >= stalled.stall_ms);
     });
 }
 
@@ -262,6 +322,8 @@ fn proxy_output_reserves_control_bytes_and_sheds_only_unsent_expired_media() {
             assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Skipped);
         }
         assert_eq!(writer.queued_bytes(), 65507);
+        let stats = writer.output().observe();
+        assert_eq!((stats.admitted, stats.sent, stats.expired), (4, 0, 3));
         assert_eq!(
             writer.try_queue(
                 ProxyRecord {

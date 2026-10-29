@@ -148,6 +148,23 @@ pub enum DirectoryFailure {
     Snapshot(DirectoryError),
 }
 
+/// Credential-free registration health copied on the account owner.
+#[derive(Clone, Copy, Debug)]
+pub struct Observation {
+    /// Current registration/refresh state, not public reachability.
+    pub state: DirectoryState,
+    /// A successful registration has not yet been logged out.
+    pub registered: bool,
+    /// Failed matching transactions; stale completion tokens do not count.
+    pub failures: u64,
+    /// Started operations, including finite logout attempts.
+    pub operations: u64,
+    /// Remaining retry delay, absent outside retry backoff.
+    pub retry_in_ms: Option<u64>,
+    /// Age of the last successful login, absent before success.
+    pub registration_age_ms: Option<u64>,
+}
+
 /// Completion tokens never wrap and accidentally identify an old operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScheduleError {
@@ -173,6 +190,25 @@ pub struct DirectoryControl {
 }
 
 impl DirectoryControl {
+    /// Inspect the original monotonic anchors without renewing or polling them.
+    pub fn observe(&self, now: Instant) -> Observation {
+        Observation {
+            state: self.state,
+            registered: self.registered,
+            failures: self.failures,
+            operations: self.next_id,
+            retry_in_ms: self.retry_since.map(|since| {
+                crate::session::ms(
+                    self.policy
+                        .retry
+                        .saturating_sub(now.saturating_duration_since(since)),
+                )
+            }),
+            registration_age_ms: self
+                .last_registration
+                .map(|last| crate::session::ms(now.saturating_duration_since(last))),
+        }
+    }
     /// Reject missing servers and timings outside the configuration's positive-u32-ms range.
     pub fn new(servers: Vec<String>, policy: DirectoryPolicy) -> Option<Self> {
         if !valid_policy(&servers, policy) {

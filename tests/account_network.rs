@@ -106,6 +106,11 @@ fn live_policy_and_metadata_update_preserves_the_existing_route() {
             let (network, mut events) = AccountNetwork::direct(Arc::clone(&initial), Arc::clone(&sockets), || (9, 3)).unwrap();
             while !matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) {}
             let commands = network.control();
+            let online = commands.observe().await.unwrap();
+            assert!(online.fresh);
+            assert!(online.directory.registered);
+            assert_eq!(online.admitted, 0, "account health exists before a QSO");
+            assert_eq!(online.directory.operations, 2);
             let mut connection = commands.dial(123456).await.unwrap();
             let generation = connection.connection.generation;
             let mut candidate = unsafe { std::ptr::read(initial.as_abi()) };
@@ -119,10 +124,15 @@ fn live_policy_and_metadata_update_preserves_the_existing_route() {
             commands.reconfigure(changed).await.unwrap();
             renewal.await.unwrap();
             let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            remote.send_to(b"malformed", sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
             let mut bytes = [0; 1024];
             let count = write_control(&ControlPacket::Sdes { source: 0, callsign: "K1ABC-R".into(), station_name: "Peer".into(), speex: false }, &mut bytes).unwrap();
             remote.send_to(&bytes[..count], sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
             assert_eq!(connection.connection.ingress.recv().await.unwrap().payload(), &bytes[..count]);
+            let live = commands.observe().await.unwrap();
+            assert_eq!((live.admitted, live.routed_packets, live.malformed_packets), (1, 1, 1));
+            assert_eq!(live.directory.failures, 0);
+            assert!(live.fresh);
             assert_eq!(connection.connection.generation, generation);
             candidate.callsign = span("N1OTHER-R");
             let exclusive = Arc::new(unsafe { PreparedSettings::copy(&candidate, &secrets) }.unwrap());

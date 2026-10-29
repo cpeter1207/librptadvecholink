@@ -150,6 +150,55 @@ fn setup(providers: &Providers, now: Instant) -> (Coordinator, Receiver, u64) {
 }
 
 #[test]
+fn receive_observation_preserves_first_cause_and_separates_raw_from_selected_audio() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        receiver
+            .packet(datagram(generation + 1, Channel::Audio, now, b"bad"))
+            .unwrap();
+        receiver
+            .packet(datagram(generation, Channel::Audio, now, b"bad"))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        let bytes = &encoder.packet().unwrap().bytes;
+        receiver
+            .packet(datagram(generation, Channel::Audio, now, bytes))
+            .unwrap();
+        let pending = receiver.observe(now + Duration::from_millis(25)).unwrap();
+        assert_eq!(pending.session.state, QsoState::Connected);
+        assert_eq!(pending.session.first_cause, None);
+        assert!(pending.session.raw_receiving);
+        assert!(!pending.selected);
+        assert_eq!((pending.stale_packets, pending.malformed_packets), (1, 1));
+        assert_eq!(pending.retained_age_ms, 25);
+        assert_eq!(pending.session.last_valid_age_ms, 25);
+        assert_eq!(pending.session.heartbeat_due_ms, 9975);
+        assert_eq!(pending.session.liveness_due_ms, 99975);
+        let mut sink = Sink {
+            limit: 640,
+            ..Sink::default()
+        };
+        receiver.poll(now, false, &mut sink).unwrap();
+        coordinator.service().await;
+        receiver.poll(now, false, &mut sink).unwrap();
+        assert!(receiver.observe(now).unwrap().selected);
+        receiver.control(QsoEvent::TransportLost, now);
+        receiver.control(QsoEvent::Stop, now);
+        let closed = receiver.observe(now + Duration::from_secs(1)).unwrap();
+        assert_eq!(closed.session.first_cause, Some(Cause::TransportLost));
+        assert_eq!(closed.session.state, QsoState::Closing);
+        assert!(!closed.session.raw_receiving);
+        assert_eq!(closed.session.heartbeat_due_ms, u64::MAX);
+    });
+}
+
+#[test]
 fn incoming_initial_sdes_establishes_once_without_waiting_for_another_heartbeat() {
     run(async {
         use rptadv_echolink::transport::routing::RouteResult;
