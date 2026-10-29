@@ -83,6 +83,13 @@ impl Receiver {
         self.qso.state()
     }
 
+    /// All accepted source PCM has been published, but the product still owns
+    /// its finite tail. Publish one end marker per burst before waiting for
+    /// product-ring drainage; raw guard expiry is not permission to discard PCM.
+    pub fn product_finish_pending(&self) -> bool {
+        self.selected && self.ending && self.pending.is_none() && self.playout.drained()
+    }
+
     /// Negotiated egress format; receive still selects each packet's own codec.
     pub fn codec(&self) -> Codec {
         self.codecs.codec()

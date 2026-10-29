@@ -155,6 +155,7 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
         let providers = Providers::new();
         let now = Instant::now();
         let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        assert!(!receiver.product_finish_pending());
         assert!(matches!(
             receiver
                 .packet(datagram(generation, Channel::Control, now, &sdes()))
@@ -203,6 +204,10 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
             receiver.poll(later, false, &mut sink).unwrap();
         }
         assert_eq!(sink.samples, 640);
+        assert!(
+            receiver.product_finish_pending(),
+            "finite source end must reach the product before waiting for its ring drain"
+        );
         coordinator.service().await;
         assert_eq!(
             coordinator.poll(later),
@@ -216,6 +221,7 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
             receiver.poll(later, true, &mut sink).unwrap().activity,
             Some(false)
         );
+        assert!(!receiver.product_finish_pending());
         assert_eq!(
             receiver.poll(later, true, &mut sink).unwrap().activity,
             None
