@@ -54,7 +54,9 @@ impl Control {
     /// not a quiescence barrier; final detach still uses the independent stop.
     pub fn request_close(&self) {
         self.close.store(true, Ordering::Release);
-        self.wake();
+        // A product wake may already be consumed while its pending bit is
+        // still set. Closing must supply its own permit in that window.
+        self.notify.notify_one();
     }
 
     /// Coalesce product/egress work without creating a new task or entering an audio callback.
