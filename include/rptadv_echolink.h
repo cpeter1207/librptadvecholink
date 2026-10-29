@@ -124,7 +124,9 @@ struct rptadv_echolink_peer_info_v1 {
     uint32_t struct_size; /**< Caller-provided writable size. */
     uint32_t abi_version; /**< One. */
     uint32_t node_number; /**< Complete real EchoLink ID. */
-    uint32_t capabilities; /**< Per-connection capabilities. */
+    /** Supported descriptor subset: network=2, source/prepared media=4, text=8.
+     * Intersect with complete advertised descriptor groups; omit lifecycle bit1. */
+    uint32_t capabilities;
     uint64_t account_generation; /**< Owning account generation. */
     uint64_t qso_generation; /**< Exact connection generation. */
     struct rptadv_echolink_bytes_v1 callsign; /**< Provider-validated callsign. */
@@ -138,7 +140,7 @@ struct rptadv_echolink_event_v1 {
     uint32_t struct_size; /**< Complete record size. */
     uint32_t kind; /**< Status=0, pending QSO=1, terminal QSO=2. */
     struct rptadv_echolink_qso *qso; /**< Provider-owned pending/live QSO or null. */
-    uint64_t generation; /**< Account/QSO generation appropriate to kind. */
+    uint64_t generation; /**< Account generation for kind0; QSO generation for kinds1/2. */
     rptadv_echolink_status status; /**< Value-free operation/termination status. */
     /** Incoming-only writable acknowledgement initialized to zero. Set to one
      * before returning only to accept QSO ownership, released by peer_destroy.

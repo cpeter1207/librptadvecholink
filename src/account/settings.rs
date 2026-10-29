@@ -188,6 +188,27 @@ impl PreparedSettings {
     pub fn as_abi(&self) -> &AccountConfig {
         &self.config
     }
+
+    /// Identity, credentials or the active transport require an account handoff.
+    /// Inactive Direct/Proxy fields are irrelevant; policy and metadata remain live.
+    pub fn requires_handoff(&self, next: &Self) -> bool {
+        self.local_node() != next.local_node()
+            || self.callsign() != next.callsign()
+            || self.config.node_number != next.config.node_number
+            || self.directory_login().password != next.directory_login().password
+            || self.config.transport.kind != next.config.transport.kind
+            || match self.config.transport.kind {
+                0 => {
+                    self.bind_address() != next.bind_address()
+                        || self.config.transport.audio_port != next.config.transport.audio_port
+                }
+                _ => {
+                    self.proxy_host() != next.proxy_host()
+                        || self.config.transport.proxy_port != next.config.transport.proxy_port
+                        || self.proxy_password() != next.proxy_password()
+                }
+            }
+    }
     /// Owning controller identity.
     pub fn local_node(&self) -> &str {
         self.known(self.config.local_node)

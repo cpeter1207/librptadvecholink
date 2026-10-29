@@ -80,6 +80,62 @@ fn secrets(password: &str) -> AccountSecrets {
 }
 
 #[test]
+fn exclusive_update_classification_uses_only_the_selected_transport() {
+    let servers = [span("directory.example.invalid")];
+    let other_servers = [span("replacement.example.invalid")];
+    for transport in [0, 1] {
+        let mut config = settings("K1ABC-R", "Site", &servers, &[]);
+        config.transport.kind = transport;
+        let baseline =
+            unsafe { PreparedSettings::copy(&config, &secrets("fixture-password")) }.unwrap();
+        for (field, direct, proxy) in [
+            (0, false, false),
+            (1, false, false),
+            (2, false, false),
+            (3, true, true),
+            (4, true, true),
+            (5, true, true),
+            (6, true, true),
+            (7, true, false),
+            (8, true, false),
+            (9, false, true),
+            (10, false, true),
+            (11, false, true),
+            (12, true, true),
+        ] {
+            let mut candidate = unsafe { ptr::read(&config) };
+            let mut keys = secrets("fixture-password");
+            match field {
+                0 => candidate.station.name = span("Updated metadata"),
+                1 => candidate.policy.receive_gain_db = -6.0,
+                2 => {
+                    candidate.transport.directory_servers = StringList {
+                        items: other_servers.as_ptr(),
+                        count: 1,
+                    }
+                }
+                3 => candidate.callsign = span("K2ABC-R"),
+                4 => candidate.local_node = span("524951"),
+                5 => candidate.node_number = 1,
+                6 => keys.directory_password = span("changed-directory-password"),
+                7 => candidate.transport.bind_address = span("127.0.0.2"),
+                8 => candidate.transport.audio_port = 5200,
+                9 => candidate.transport.proxy_host = span("new.proxy.example.invalid"),
+                10 => candidate.transport.proxy_port = 8101,
+                11 => keys.proxy_password = span("changed-proxy-password"),
+                _ => candidate.transport.kind = 1 - transport,
+            }
+            let candidate = unsafe { PreparedSettings::copy(&candidate, &keys) }.unwrap();
+            assert_eq!(
+                baseline.requires_handoff(&candidate),
+                if transport == 0 { direct } else { proxy },
+                "transport {transport}, changed field {field}"
+            );
+        }
+    }
+}
+
+#[test]
 fn prepared_config_outlives_all_caller_buffers_and_moves_to_an_account_worker() {
     let prepared = {
         let mut call = String::from("K1ABC-R");

@@ -122,6 +122,10 @@ enum Command {
     Dial(u32, oneshot::Sender<Result<PeerConnection, NetworkError>>),
     Accept(u64, oneshot::Sender<Result<PeerConnection, NetworkError>>),
     Remove(u32, u64),
+    Reconfigure(
+        Arc<PreparedSettings>,
+        oneshot::Sender<Result<(), NetworkError>>,
+    ),
 }
 
 /// Owns a task on the existing Tokio runtime, never a new runtime/thread per account or peer.
@@ -233,12 +237,7 @@ impl AccountNetwork {
         let coordinator = Coordinator::new(router).ok_or(NetworkError::Invalid)?;
         let directory = DirectoryControl::new(
             settings.directory_servers().map(str::to_owned).collect(),
-            DirectoryPolicy {
-                operation_timeout: Duration::from_millis(policy.directory_timeout_ms.into()),
-                registration_refresh: Duration::from_millis(policy.registration_refresh_ms.into()),
-                directory_refresh: Duration::from_millis(policy.directory_refresh_ms.into()),
-                retry: Duration::from_millis(policy.directory_retry_ms.into()),
-            },
+            directory_policy(&settings),
         )
         .ok_or(NetworkError::Invalid)?;
         let snapshot =
@@ -313,10 +312,10 @@ impl AccountNetwork {
 }
 
 impl NetworkControl {
-    async fn request(
+    async fn request<T>(
         &self,
-        command: impl FnOnce(oneshot::Sender<Result<PeerConnection, NetworkError>>) -> Command,
-    ) -> Result<PeerConnection, NetworkError> {
+        command: impl FnOnce(oneshot::Sender<Result<T, NetworkError>>) -> Command,
+    ) -> Result<T, NetworkError> {
         if *self.stopping.borrow() {
             return Err(NetworkError::Stopped);
         }
@@ -333,6 +332,14 @@ impl NetworkControl {
     /// Request an outbound route through the fresh directory; never block an executor thread.
     pub async fn dial(&self, node: u32) -> Result<PeerConnection, NetworkError> {
         self.request(|reply| Command::Dial(node, reply)).await
+    }
+
+    /// Commit nonexclusive settings on this same bounded account owner. Existing
+    /// routes, directory jobs and talker state survive; identity/socket changes
+    /// require the outer account's quiescent handoff instead.
+    pub async fn reconfigure(&self, settings: Arc<PreparedSettings>) -> Result<(), NetworkError> {
+        self.request(|reply| Command::Reconfigure(settings, reply))
+            .await
     }
 
     /// Read-only current directory for final provider-bound host admission.
@@ -546,6 +553,10 @@ impl Owner {
                 }
                 return;
             }
+            Command::Reconfigure(settings, reply) => {
+                let _ = reply.send(self.reconfigure(settings));
+                return;
+            }
         };
         let connection = match connection {
             Ok(connection) => connection,
@@ -573,6 +584,29 @@ impl Owner {
         } else {
             self.coordinator.remove(identity.0, identity.1);
         }
+    }
+
+    fn reconfigure(&mut self, settings: Arc<PreparedSettings>) -> Result<(), NetworkError> {
+        if self.settings.requires_handoff(&settings) {
+            return Err(NetworkError::Invalid);
+        }
+        let previous = self.settings.directory_login();
+        let next = settings.directory_login();
+        let refresh = previous.description != next.description || previous.email != next.email;
+        if !self.directory.reconfigure(
+            settings.directory_servers().map(str::to_owned).collect(),
+            directory_policy(&settings),
+            refresh,
+        ) {
+            return Err(NetworkError::Stopped);
+        }
+        self.coordinator.router().update_policy(&settings);
+        self.snapshot.set_freshness(Duration::from_millis(
+            settings.as_abi().policy.directory_freshness_ms.into(),
+        ));
+        self.view.publish(&self.snapshot);
+        self.settings = settings;
+        Ok(())
     }
 
     fn directory_work(&self, job: DirectoryJob) -> DirectoryWork {
@@ -616,5 +650,15 @@ impl Owner {
             .unwrap_or(Err(TransactionError::Timeout));
             (job.id, result)
         })
+    }
+}
+
+fn directory_policy(settings: &PreparedSettings) -> DirectoryPolicy {
+    let policy = &settings.as_abi().policy;
+    DirectoryPolicy {
+        operation_timeout: Duration::from_millis(policy.directory_timeout_ms.into()),
+        registration_refresh: Duration::from_millis(policy.registration_refresh_ms.into()),
+        directory_refresh: Duration::from_millis(policy.directory_refresh_ms.into()),
+        retry: Duration::from_millis(policy.directory_retry_ms.into()),
     }
 }

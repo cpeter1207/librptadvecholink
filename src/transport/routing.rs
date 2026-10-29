@@ -140,6 +140,15 @@ pub struct Router {
 }
 
 impl Router {
+    /// Keep routes, pending tokens and generation history while replacing the
+    /// already-validated future admission limits and setup timeout.
+    pub(crate) fn update_policy(&mut self, settings: &crate::account::settings::PreparedSettings) {
+        self.account.update_policy(settings);
+        self.maximum_pending = settings.as_abi().policy.max_pending_handshakes as usize;
+        self.setup_timeout =
+            Duration::from_millis(settings.as_abi().policy.connect_timeout_ms.into());
+    }
+
     /// Configure a separate positive pending-handshake budget and setup timeout.
     pub fn new(account: Account, maximum_pending: u32, setup_timeout: Duration) -> Option<Self> {
         if maximum_pending == 0 || setup_timeout.is_zero() {

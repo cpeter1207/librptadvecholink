@@ -8,6 +8,75 @@ use rptadv_echolink::{
 use std::time::{Duration, Instant};
 
 #[test]
+fn live_settings_update_preserves_inflight_tokens_and_renews_changed_metadata() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    snapshot
+        .update(b"@@@\n1:old\nK1ABC-R\nSite\n123456\n192.0.2.1\n+++\n", now)
+        .unwrap();
+    let mut owner = DirectoryControl::new(vec!["first".into()], policy()).unwrap();
+    let old = owner.poll(&snapshot, now).unwrap().unwrap();
+    let changed = DirectoryPolicy {
+        operation_timeout: Duration::from_secs(15),
+        registration_refresh: Duration::from_secs(600),
+        directory_refresh: Duration::from_secs(120),
+        ..policy()
+    };
+    assert!(owner.reconfigure(vec!["second".into()], changed, true));
+    assert!(
+        owner.poll(&snapshot, now).unwrap().is_none(),
+        "never overlap directory transactions"
+    );
+    assert!(
+        owner
+            .finish(old.id, Ok(b"OK"), &mut snapshot, now)
+            .is_none()
+    );
+    let renewed = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert_eq!(
+        renewed.operation,
+        Operation::Register,
+        "an old registration response must not erase the queued metadata renewal"
+    );
+    assert_eq!(renewed.server, "second");
+    assert_eq!(renewed.timeout, Duration::from_secs(15));
+    assert_ne!(old.id, renewed.id);
+    assert!(
+        owner
+            .finish(old.id, Err(TransactionError::Rejected), &mut snapshot, now)
+            .is_none()
+    );
+    assert!(
+        owner
+            .finish(renewed.id, Ok(b"OK"), &mut snapshot, now)
+            .is_none()
+    );
+    let fetch = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert_eq!(
+        fetch.operation,
+        Operation::Snapshot {
+            snapshot_id: "old".into()
+        }
+    );
+    owner.finish(fetch.id, Ok(b"DDD\n0:new\n+++\n+++\n"), &mut snapshot, now);
+    assert_eq!(snapshot.by_node(123456, now).unwrap().callsign, "K1ABC-R");
+    assert_eq!(owner.state(), DirectoryState::Online);
+    assert_eq!(owner.deadline(now), Some(now + Duration::from_secs(120)));
+    assert!(!owner.reconfigure(vec![], changed, true));
+    assert!(!owner.reconfigure(
+        vec!["bad".into()],
+        DirectoryPolicy {
+            retry: Duration::ZERO,
+            ..changed
+        },
+        true
+    ));
+    assert_eq!(owner.deadline(now), Some(now + Duration::from_secs(120)));
+    owner.stop().unwrap();
+    assert!(!owner.reconfigure(vec!["second".into()], changed, true));
+}
+
+#[test]
 fn directory_requests_follow_reference_login_logout_and_snapshot_framing() {
     use rptadv_echolink::account::directory::DirectoryLogin;
     let login = DirectoryLogin {

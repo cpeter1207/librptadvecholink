@@ -165,6 +165,7 @@ pub struct DirectoryControl {
     next_id: u64,
     registered: bool,
     must_register: bool,
+    register_again: bool,
     last_registration: Option<Instant>,
     last_snapshot: Option<Instant>,
     retry_since: Option<Instant>,
@@ -174,16 +175,7 @@ pub struct DirectoryControl {
 impl DirectoryControl {
     /// Reject missing servers and timings outside the configuration's positive-u32-ms range.
     pub fn new(servers: Vec<String>, policy: DirectoryPolicy) -> Option<Self> {
-        if servers.is_empty()
-            || [
-                policy.operation_timeout,
-                policy.registration_refresh,
-                policy.directory_refresh,
-                policy.retry,
-            ]
-            .iter()
-            .any(|value| value.is_zero() || *value > Duration::from_millis(u32::MAX.into()))
-        {
+        if !valid_policy(&servers, policy) {
             return None;
         }
         Some(Self {
@@ -195,11 +187,46 @@ impl DirectoryControl {
             next_id: 0,
             registered: false,
             must_register: true,
+            register_again: false,
             last_registration: None,
             last_snapshot: None,
             retry_since: None,
             failures: 0,
         })
+    }
+
+    /// Update server/timing policy without cancelling a borrowed transaction,
+    /// resetting its completion token, or discarding a committed snapshot. A
+    /// metadata/server change requests renewal after any current registration.
+    /// Invalid or stopped updates leave the old schedule untouched.
+    pub fn reconfigure(
+        &mut self,
+        servers: Vec<String>,
+        policy: DirectoryPolicy,
+        refresh: bool,
+    ) -> bool {
+        if !valid_policy(&servers, policy)
+            || matches!(
+                self.state,
+                DirectoryState::Stopping | DirectoryState::Stopped
+            )
+        {
+            return false;
+        }
+        let changed_servers = servers != self.servers;
+        if changed_servers {
+            self.servers = servers;
+            self.server = 0;
+        }
+        self.policy = policy;
+        if refresh || changed_servers {
+            self.must_register = true;
+            self.register_again |= self
+                .pending
+                .as_ref()
+                .is_some_and(|job| job.operation == Operation::Register);
+        }
+        true
     }
 
     /// Metadata-only health; it does not claim that remote clients can reach this account.
@@ -312,7 +339,7 @@ impl DirectoryControl {
             self.state = DirectoryState::Online;
             if pending.operation == Operation::Register {
                 self.registered = true;
-                self.must_register = false;
+                self.must_register = std::mem::take(&mut self.register_again);
                 self.last_registration = Some(now);
             } else {
                 self.last_snapshot = Some(now);
@@ -357,6 +384,7 @@ impl DirectoryControl {
         self.next_id = id;
         if operation == Operation::Register {
             self.state = DirectoryState::Registering;
+            self.register_again = false;
         }
         let job = DirectoryJob {
             id,
@@ -367,4 +395,16 @@ impl DirectoryControl {
         self.pending = Some(job.clone());
         Ok(job)
     }
+}
+
+fn valid_policy(servers: &[String], policy: DirectoryPolicy) -> bool {
+    !servers.is_empty()
+        && [
+            policy.operation_timeout,
+            policy.registration_refresh,
+            policy.directory_refresh,
+            policy.retry,
+        ]
+        .iter()
+        .all(|value| !value.is_zero() && *value <= Duration::from_millis(u32::MAX.into()))
 }

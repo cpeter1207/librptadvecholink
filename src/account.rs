@@ -56,6 +56,14 @@ pub struct Account {
 }
 
 impl Account {
+    /// Apply validated admission policy without changing established generations
+    /// or the selected talker's timers. New calls use the new deny-first policy.
+    pub(crate) fn update_policy(&mut self, settings: &settings::PreparedSettings) {
+        self.maximum = settings.as_abi().policy.max_stations;
+        self.allow = settings.allow().map(str::to_ascii_uppercase).collect();
+        self.deny = settings.deny().map(str::to_ascii_uppercase).collect();
+    }
+
     /// Configure a positive station budget and normalized callsign policy.
     pub fn new(maximum: u32, allow: Vec<String>, deny: Vec<String>) -> Option<Self> {
         if maximum == 0 {

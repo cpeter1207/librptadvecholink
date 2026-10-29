@@ -63,6 +63,12 @@ pub struct DirectorySnapshot {
 }
 
 impl DirectorySnapshot {
+    /// Change the validated freshness budget without renewing the publication
+    /// time or erasing the last complete entries/server token.
+    pub(crate) fn set_freshness(&mut self, freshness: Duration) {
+        self.freshness = freshness;
+    }
+
     /// Start without trusted records; freshness is checked only for new admission.
     pub fn new(freshness: Duration) -> Self {
         Self {

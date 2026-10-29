@@ -77,6 +77,69 @@ fn settings_at(
 }
 
 #[test]
+fn live_policy_and_metadata_update_preserves_the_existing_route() {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server = listener.local_addr().unwrap().to_string();
+            let (renewed, renewal) = tokio::sync::oneshot::channel();
+            let directory = tokio::spawn(async move {
+                let mut renewed = Some(renewed);
+                for (request, response) in [
+                    (b"lN0CALL-R\xac\xacfixture-password\rONLINE1.00R(9: 3)\rTest site\rop@example.invalid\r".as_slice(), b"OK".as_slice()),
+                    (b"F0\r", b"@@@\n1\nK1ABC-R\nPeer\n123456\n127.0.0.1\n+++\n"),
+                    (b"lN0CALL-R\xac\xacfixture-password\rONLINE1.00R(9: 3)\rUpdated site\rop@example.invalid\r", b"OK"),
+                    (b"lN0CALL-R\xac\xacfixture-password\rOFF-V3.40\rUpdated site\r", b"OK"),
+                ] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut actual = vec![0; request.len()];
+                    socket.read_exact(&mut actual).await.unwrap();
+                    assert_eq!(actual, request);
+                    socket.write_all(response).await.unwrap();
+                    if request.windows(12).any(|bytes| bytes == b"Updated site") {
+                        if let Some(ready) = renewed.take() { ready.send(()).unwrap(); }
+                    }
+                }
+            });
+            let sockets = Arc::new(DirectSockets::bind("127.0.0.1:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()).await.unwrap());
+            let initial = settings(&server, 300_000, 0);
+            let (network, mut events) = AccountNetwork::direct(Arc::clone(&initial), Arc::clone(&sockets), || (9, 3)).unwrap();
+            while !matches!(events.recv().await.unwrap(), NetworkEvent::Directory { fresh: true, .. }) {}
+            let commands = network.control();
+            let mut connection = commands.dial(123456).await.unwrap();
+            let generation = connection.connection.generation;
+            let mut candidate = unsafe { std::ptr::read(initial.as_abi()) };
+            candidate.station.name = span("Updated site");
+            candidate.policy.directory_freshness_ms = 600_000;
+            let deny = [span("K*")];
+            candidate.policy.deny = StringList { items: deny.as_ptr(), count: deny.len() };
+            let secrets = AccountSecrets { struct_size: size_of::<AccountSecrets>() as u32, abi_version: 1,
+                directory_password: span("fixture-password"), proxy_password: ByteSpan::default() };
+            let changed = Arc::new(unsafe { PreparedSettings::copy(&candidate, &secrets) }.unwrap());
+            commands.reconfigure(changed).await.unwrap();
+            renewal.await.unwrap();
+            let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut bytes = [0; 1024];
+            let count = write_control(&ControlPacket::Sdes { source: 0, callsign: "K1ABC-R".into(), station_name: "Peer".into(), speex: false }, &mut bytes).unwrap();
+            remote.send_to(&bytes[..count], sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
+            assert_eq!(connection.connection.ingress.recv().await.unwrap().payload(), &bytes[..count]);
+            assert_eq!(connection.connection.generation, generation);
+            candidate.callsign = span("N1OTHER-R");
+            let exclusive = Arc::new(unsafe { PreparedSettings::copy(&candidate, &secrets) }.unwrap());
+            assert_eq!(commands.reconfigure(exclusive).await, Err(NetworkError::Invalid),
+                "live owner updates cannot silently change the account identity");
+            assert!(matches!(commands.dial(123456).await, Err(NetworkError::Admission(rptadv_echolink::account::Admission::Denied))));
+            assert_eq!(commands.directory().by_node(123456, std::time::Instant::now()).unwrap().callsign, "K1ABC-R");
+            assert_eq!(commands.directory().by_node(123456, std::time::Instant::now() + Duration::from_secs(601)),
+                Err(rptadv_echolink::directory::AdmissionError::Stale));
+            network.stop().await.unwrap();
+            assert!(connection.connection.ingress.recv().await.is_none());
+            directory.await.unwrap();
+        }).await.unwrap();
+    });
+}
+
+#[test]
 fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_io() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
