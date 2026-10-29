@@ -380,7 +380,7 @@ fn proxy_writability_waits_for_the_same_packet_budget_without_reserving_credit()
         assert_eq!(writer.queued_bytes(), 196521);
         assert_eq!(
             output.writable(ProxyKind::TcpClose, 1).await,
-            Err(QueueError::Invalid)
+            Err(std::io::ErrorKind::InvalidInput)
         );
     });
 }
@@ -441,7 +441,7 @@ fn proxy_writability_observes_media_reserve_and_writer_closure() {
             tokio::time::timeout(Duration::from_secs(1), &mut closed)
                 .await
                 .unwrap(),
-            Err(QueueError::Closed)
+            Err(std::io::ErrorKind::BrokenPipe)
         );
     });
 }

@@ -3,8 +3,9 @@
 use super::{
     direct::DirectSockets,
     mailbox::{Consumer, Datagram},
+    proxy::ProxyOutput,
 };
-use crate::wire::Channel;
+use crate::wire::{Channel, ProxyKind};
 use std::{
     io,
     sync::{
@@ -69,6 +70,37 @@ pub enum PeerEvent {
     Io(io::ErrorKind),
 }
 
+/// Exact transport credit needed by an already-prepared outgoing packet.
+pub enum PeerWritable {
+    /// UDP socket readiness after a nonblocking send returned Pending.
+    Direct(Arc<DirectSockets>, Channel),
+    /// Shared Proxy credit for this kind and length, without reserving it.
+    Proxy {
+        /// Selected account transport; no direct fallback is attempted.
+        output: ProxyOutput,
+        /// Wire kind controls the reserved media/control allowances.
+        kind: ProxyKind,
+        /// Retained packet's payload length, excluding Proxy framing.
+        payload_bytes: usize,
+    },
+}
+
+impl PeerWritable {
+    async fn ready(&self) -> io::Result<()> {
+        match self {
+            Self::Direct(sockets, channel) => sockets.writable(*channel).await,
+            Self::Proxy {
+                output,
+                kind,
+                payload_bytes,
+            } => output
+                .writable(*kind, *payload_bytes)
+                .await
+                .map_err(io::Error::from),
+        }
+    }
+}
+
 /// Copied wait state; no mutable connection borrow survives an await or external callback.
 pub struct PeerWait {
     /// False when retained input cannot yet advance; queued packets must not drive a spin loop.
@@ -76,7 +108,7 @@ pub struct PeerWait {
     /// Next real protocol/media/playout deadline; None parks without periodic polling.
     pub deadline: Option<Instant>,
     /// Set only after an actual Pending send; idle writable sockets never drive the owner.
-    pub writable: Option<(Arc<DirectSockets>, Channel)>,
+    pub writable: Option<PeerWritable>,
 }
 
 impl Default for PeerWait {
@@ -140,7 +172,7 @@ impl PeerDriver {
                     } => PeerEvent::Deadline,
                     ready = async {
                         match wait.writable.as_ref() {
-                            Some((sockets, channel)) => sockets.writable(*channel).await,
+                            Some(pending) => pending.ready().await,
                             None => std::future::pending().await,
                         }
                     } => match ready {

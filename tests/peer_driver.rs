@@ -246,7 +246,10 @@ fn writable_readiness_resumes_the_same_prepared_packet() {
                 }
             }
             Some(PeerWait {
-                writable: Some((Arc::clone(&sockets), Channel::Audio)),
+                writable: Some(rptadv_echolink::transport::driver::PeerWritable::Direct(
+                    Arc::clone(&sockets),
+                    Channel::Audio,
+                )),
                 ..PeerWait::default()
             })
         },
@@ -255,5 +258,93 @@ fn writable_readiness_resumes_the_same_prepared_packet() {
     let (count, observed) = peer.recv_from(&mut output).unwrap();
     assert_eq!(&output[..count], b"prepared once");
     assert_eq!(observed, source);
+    driver.detach();
+}
+
+#[test]
+fn proxy_credit_resumes_one_peer_without_delaying_another_and_reports_closure() {
+    use rptadv_echolink::{
+        transport::{driver::PeerWritable, proxy::ProxyWriter},
+        wire::{ProxyKind, ProxyRecord},
+    };
+    let runtime = runtime();
+    let (stream, _reader) = tokio::io::duplex(64);
+    let mut writer = ProxyWriter::new(stream);
+    let output = writer.output();
+    let expired = Instant::now() - Duration::from_secs(1);
+    for _ in 0..56 {
+        output
+            .try_queue(
+                ProxyRecord {
+                    kind: ProxyKind::UdpData,
+                    address: "192.0.2.1".parse().unwrap(),
+                    payload: &[1],
+                },
+                Some(expired),
+            )
+            .unwrap();
+    }
+    let (_sender, receiver) = channel(1).unwrap();
+    let (observed, events) = std::sync::mpsc::channel();
+    let pending = output.clone();
+    let driver = PeerDriver::attach(
+        Arc::clone(&runtime),
+        Arc::new(Control::default()),
+        receiver,
+        move |event| {
+            match event {
+                PeerEvent::Writable => {
+                    // Advisory readiness reserved nothing; retry the exact packet.
+                    pending
+                        .try_queue(
+                            ProxyRecord {
+                                kind: ProxyKind::UdpData,
+                                address: "192.0.2.1".parse().unwrap(),
+                                payload: &[2],
+                            },
+                            Some(expired),
+                        )
+                        .unwrap();
+                    observed.send("ready").unwrap();
+                }
+                PeerEvent::Io(kind) => {
+                    assert_eq!(kind, std::io::ErrorKind::BrokenPipe);
+                    observed.send("closed").unwrap();
+                    return None;
+                }
+                _ => (),
+            }
+            Some(PeerWait {
+                receive: false,
+                writable: Some(PeerWritable::Proxy {
+                    output: pending.clone(),
+                    kind: ProxyKind::UdpData,
+                    payload_bytes: 1,
+                }),
+                ..PeerWait::default()
+            })
+        },
+    );
+    assert!(events.recv_timeout(Duration::from_millis(20)).is_err());
+    runtime.block_on(async {
+        // Other work remains runnable while this peer has no media credit.
+        tokio::time::timeout(Duration::from_secs(1), tokio::task::yield_now())
+            .await
+            .unwrap();
+        writer.flush_one(Instant::now()).await.unwrap();
+    });
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "ready"
+    );
+    drop(writer);
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "closed"
+    );
+    assert_eq!(
+        runtime.block_on(output.writable(ProxyKind::UdpData, 1)),
+        Err(std::io::ErrorKind::BrokenPipe)
+    );
     driver.detach();
 }

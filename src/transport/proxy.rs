@@ -257,9 +257,9 @@ impl ProxyOutput {
     /// Wait only after a Full send for this same kind/length, without copying
     /// PCM, reserving budget, polling a timer, or blocking another peer. Ready
     /// is advisory: concurrent senders may win its credit before try_queue.
-    pub async fn writable(&self, kind: ProxyKind, payload_bytes: usize) -> Result<(), QueueError> {
+    pub async fn writable(&self, kind: ProxyKind, payload_bytes: usize) -> Result<(), ErrorKind> {
         if !kind.valid_length(payload_bytes) {
-            return Err(QueueError::Invalid);
+            return Err(ErrorKind::InvalidInput);
         }
         loop {
             let progress = self.progress.notified();
@@ -268,7 +268,7 @@ impl ProxyOutput {
             // this snapshot and await must not be lost.
             progress.as_mut().enable();
             if self.sender.is_closed() {
-                return Err(QueueError::Closed);
+                return Err(ErrorKind::BrokenPipe);
             }
             let media = kind == ProxyKind::UdpData;
             if self.sender.capacity() != 0
@@ -280,7 +280,7 @@ impl ProxyOutput {
             }
             tokio::select! {
                 _ = progress => {},
-                _ = self.sender.closed() => return Err(QueueError::Closed),
+                _ = self.sender.closed() => return Err(ErrorKind::BrokenPipe),
             }
         }
     }
