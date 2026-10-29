@@ -222,3 +222,7 @@ impl Drop for PeerDriver {
         self.wait();
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/driver_control.rs"]
+mod tests;
