@@ -274,6 +274,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             qso_generation: 0,
             callsign: ByteSpan::default(),
             local_node: ByteSpan::default(),
+            source: ByteSpan::default(),
         }
     }
     struct Trace {
@@ -636,6 +637,11 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         assert_eq!(
             unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
             b"W1XYZ-R"
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(identity.source.data, identity.source.length) },
+            peer.local_addr().unwrap().to_string().as_bytes(),
+            "admission must expose the actual SDES endpoint, not an assumed UDP port"
         );
         let serial = StepTrace {
             api,

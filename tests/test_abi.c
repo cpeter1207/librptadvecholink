@@ -8,6 +8,10 @@ _Static_assert(offsetof(struct rptadv_echolink_event_v1, taken) == 32,
                "incoming ownership acknowledgement layout");
 _Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,
                "complete borrowed incoming event layout");
+_Static_assert(offsetof(struct rptadv_echolink_peer_info_v1, source) == 64,
+               "observed incoming endpoint tail layout");
+_Static_assert(sizeof(struct rptadv_echolink_peer_info_v1) == 80,
+               "complete verified identity record layout");
 _Static_assert(sizeof(struct rptadv_echolink_read_result_v1) == 24,
                "source-rate read result layout");
 _Static_assert(offsetof(struct rptadv_echolink_read_result_v1, finish_pending) == 16,

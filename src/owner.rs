@@ -60,6 +60,8 @@ struct Binding {
 }
 struct Peer {
     identity: DirectoryEntry,
+    // Original admitted SDES endpoint, not a directory address or inferred port.
+    source: String,
     generation: u64,
     control: Arc<crate::transport::driver::Control>,
     _lease: ConnectionLease,
@@ -446,6 +448,10 @@ pub(crate) unsafe extern "C" fn peer_info(qso: *const ffi::Qso, output: *mut Pee
         local_node: ByteSpan {
             data: local.as_ptr(),
             length: local.len(),
+        },
+        source: ByteSpan {
+            data: peer.source.as_ptr(),
+            length: peer.source.len(),
         },
     };
     // The checked record covers writable caller storage; never form a shared output borrow.

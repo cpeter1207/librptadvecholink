@@ -129,6 +129,9 @@ struct rptadv_echolink_peer_info_v1 {
     uint64_t qso_generation; /**< Exact connection generation. */
     struct rptadv_echolink_bytes_v1 callsign; /**< Provider-validated callsign. */
     struct rptadv_echolink_bytes_v1 local_node; /**< Owning controller node. */
+    /** Original incoming SDES IPv4:port, stable through QSO destruction.
+     * Proxy framing uses port zero; empty for outbound calls. */
+    struct rptadv_echolink_bytes_v1 source;
 };
 /** Borrowed callback event; never a caller-supplied authentication proof. */
 struct rptadv_echolink_event_v1 {

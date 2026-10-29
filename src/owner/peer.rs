@@ -77,6 +77,11 @@ impl Peer {
         Self {
             binding,
             identity: connection.identity,
+            source: connection
+                .initial
+                .as_ref()
+                .map(|initial| initial.source.to_string())
+                .unwrap_or_default(),
             generation: connection.generation,
             control,
             _lease: lease,
