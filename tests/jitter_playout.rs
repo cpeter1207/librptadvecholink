@@ -74,6 +74,55 @@ fn voice(bytes: &[u8]) -> VoicePacket<'_> {
 }
 
 #[test]
+fn receive_gain_reload_preserves_a_partially_accepted_decoded_packet() {
+    let providers = Providers::new();
+    let now = Instant::now();
+    let packets = providers.packets(Codec::GsmFr, 1, 2);
+    let mut changed = providers.playout(Codec::GsmFr, now);
+    let mut reference = providers.playout(Codec::GsmFr, now);
+    for playout in [&mut changed, &mut reference] {
+        for (index, packet) in packets.iter().enumerate() {
+            playout
+                .receive(
+                    voice(packet),
+                    now + Duration::from_millis(index as u64 * 80),
+                )
+                .unwrap();
+        }
+    }
+    let mut output = Sink {
+        limit: 73,
+        ..Sink::default()
+    };
+    for millisecond in 180..500 {
+        changed
+            .poll(now + Duration::from_millis(millisecond), &mut output)
+            .unwrap();
+        if !output.audio.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(output.audio.len(), 73);
+    changed.set_gain(6.020599913279624).unwrap();
+    for invalid in [f64::NAN, f64::INFINITY, 10000.0] {
+        assert!(changed.set_gain(invalid).is_err());
+    }
+    output.limit = usize::MAX;
+    drain(&mut changed, now, &mut output);
+    let mut original = Sink {
+        limit: usize::MAX,
+        ..Sink::default()
+    };
+    drain(&mut reference, now, &mut original);
+    assert_eq!(output.audio.len(), original.audio.len());
+    assert_eq!(&output.audio[..640], &original.audio[..640]);
+    assert!(!original.audio[640..].is_empty());
+    for (sample, reference) in output.audio[640..].iter().zip(&original.audio[640..]) {
+        assert_eq!(*sample, *reference * 2.0);
+    }
+}
+
+#[test]
 fn codec_preflight_rejects_contenders_without_priming_a_media_timeline() {
     let providers = Providers::new();
     let now = Instant::now();

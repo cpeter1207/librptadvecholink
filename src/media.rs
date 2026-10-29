@@ -6,6 +6,15 @@ use rptadv_codec_client::{CodecCatalog, EncodeResult, Encoder, ProfileId, Status
 const FRAMES: usize = 640;
 const MAX_ENCODED: usize = 252;
 
+pub(crate) fn gain(gain_db: f64) -> Result<f32, MediaError> {
+    let gain = 10.0f64.powf(gain_db / 20.0) as f32;
+    if gain_db.is_finite() && gain.is_finite() {
+        Ok(gain)
+    } else {
+        Err(MediaError::Invalid)
+    }
+}
+
 /// One connection's optional narrowband extension. GSM is always mandatory and initial.
 pub struct CodecChoice {
     speex: bool,
@@ -94,6 +103,11 @@ impl PreparedMedia {
         self.0.reset()
     }
 
+    /// Change only future input; preserve copied RTP and partially gained PCM.
+    pub(crate) fn set_gain(&mut self, gain_db: f64) -> Result<(), MediaError> {
+        self.0.set_gain(gain_db)
+    }
+
     /// Consume at most one four-unit coding block and copy at most one RTP packet.
     /// Capacity below the 264-byte maximum consumes nothing and changes no history.
     /// The product owns copied bytes, original source timing, send retries and expiry.
@@ -166,10 +180,7 @@ impl Packetizer {
         sequence: u16,
         source: u32,
     ) -> Result<Self, MediaError> {
-        let gain = 10.0f64.powf(gain_db / 20.0) as f32;
-        if !gain_db.is_finite() || !gain.is_finite() {
-            return Err(MediaError::Invalid);
-        }
+        let gain = gain(gain_db)?;
         let id = match codec {
             Codec::GsmFr => ProfileId::GsmFr,
             Codec::Speex => ProfileId::Speex,
@@ -195,6 +206,13 @@ impl Packetizer {
             clock: 0,
             source,
         })
+    }
+
+    /// Apply a new multiplier to subsequently accepted input only. Buffered PCM,
+    /// prepared bytes, codec history and the RTP sequence/clock remain unchanged.
+    pub fn set_gain(&mut self, gain_db: f64) -> Result<(), MediaError> {
+        self.gain = gain(gain_db)?;
+        Ok(())
     }
 
     /// Schedule the authenticated, monotonic GSM-to-Speex upgrade at the next

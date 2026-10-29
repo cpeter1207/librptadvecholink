@@ -215,6 +215,11 @@ impl PeerDriver {
         }
     }
 
+    /// Revisit copied account policy on the existing serial owner, without a task.
+    pub(crate) fn wake(&self) {
+        self.control.wake();
+    }
+
     /// Stop and join off-executor before releasing captured contexts or a provider DSO.
     pub fn detach(self) {}
 }

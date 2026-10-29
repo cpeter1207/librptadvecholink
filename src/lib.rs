@@ -14,9 +14,10 @@ pub mod transport;
 pub mod wire;
 use ffi::{AccountConfig, AccountSecrets, Descriptor, RuntimeConfig, Status};
 use owner::{
-    Account, account_activate, account_destroy, account_stop, dial, peer_attach, peer_destroy,
-    peer_detach, peer_elapsed_ms, peer_info, peer_prepare_audio, peer_read, peer_reset_encoder,
-    peer_send_prepared, peer_send_text, peer_set_deadline, peer_stop, peer_wake, validate_pending,
+    Account, account_activate, account_destroy, account_reconfigure, account_stop, dial,
+    peer_attach, peer_destroy, peer_detach, peer_elapsed_ms, peer_info, peer_prepare_audio,
+    peer_read, peer_reset_encoder, peer_send_prepared, peer_send_text, peer_set_deadline,
+    peer_stop, peer_wake, validate_pending,
 };
 use std::{mem::size_of, ptr, sync::Arc};
 
@@ -41,7 +42,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     context_destroy: Some(context_destroy),
     account_prepare: Some(account_prepare),
     account_activate: Some(account_activate),
-    account_reconfigure: None,
+    account_reconfigure: Some(account_reconfigure),
     account_stop: Some(account_stop),
     account_destroy: Some(account_destroy),
     dial: Some(dial),
@@ -145,28 +146,11 @@ unsafe extern "C" fn account_prepare(
     let Some(context) = (unsafe { context.cast::<Context>().as_ref() }) else {
         return Status::Invalid;
     };
-    // SAFETY: configuration follows the sized-record contract.
-    let Some(config) = (unsafe { record(config) }) else {
-        return Status::Invalid;
-    };
-    if config.abi_version != 1 || config.enabled > 1 {
-        return Status::Invalid;
-    }
     // Preparation owns configuration and credentials but performs no socket/login
     // operation. Activation/network capability remains separate and unpublished.
-    let settings = if config.enabled == 0 {
-        None
-    } else {
-        if context.resources.is_none() {
-            return Status::Unsupported;
-        }
-        let Some(secrets) = (unsafe { record(secrets) }) else {
-            return Status::Invalid;
-        };
-        match unsafe { account::settings::PreparedSettings::copy(config, secrets) } {
-            Ok(settings) => Some(Arc::new(settings)),
-            Err(status) => return status,
-        }
+    let settings = match unsafe { prepare_settings(config, secrets, context.resources.is_some()) } {
+        Ok(settings) => settings,
+        Err(status) => return status,
     };
     *output = Box::into_raw(Box::new(Account::new(
         Arc::clone(&context.runtime),
@@ -175,4 +159,25 @@ unsafe extern "C" fn account_prepare(
     )))
     .cast();
     Status::Ok
+}
+
+/// Copy a complete candidate before any account lifecycle or network side effect.
+unsafe fn prepare_settings(
+    config: *const AccountConfig,
+    secrets: *const AccountSecrets,
+    resources: bool,
+) -> Result<Option<Arc<account::settings::PreparedSettings>>, Status> {
+    let config = unsafe { record(config) }.ok_or(Status::Invalid)?;
+    if config.abi_version != 1 || config.enabled > 1 {
+        return Err(Status::Invalid);
+    }
+    if config.enabled == 0 {
+        return Ok(None);
+    }
+    if !resources {
+        return Err(Status::Unsupported);
+    }
+    let secrets = unsafe { record(secrets) }.ok_or(Status::Invalid)?;
+    unsafe { account::settings::PreparedSettings::copy(config, secrets) }
+        .map(|settings| Some(Arc::new(settings)))
 }

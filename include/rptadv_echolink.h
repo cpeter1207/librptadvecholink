@@ -195,7 +195,10 @@ struct rptadv_echolink_descriptor_v1 {
     /** Start I/O off executor; incoming ownership uses event.taken.
      * Disabled preparation remains socket/login/callback free. */
     rptadv_echolink_status (*account_activate)(struct rptadv_echolink_account *, rptadv_echolink_event_fn, void *);
-    /** Prepare/commit an account-only generation change. */
+    /** Validate/copy before changes. Live policy/metadata/gain/timing retain QSOs;
+     * exclusive changes quiesce old callbacks before reconnecting this account.
+     * Failure retains the old configuration and attempts its reconnection, not
+     * a false online state. Disable may be reversed; account_stop is terminal. */
     rptadv_echolink_status (*account_reconfigure)(struct rptadv_echolink_account *, const struct rptadv_echolink_account_config_v1 *, const struct rptadv_echolink_secrets_v1 *);
     /** Gate admissions and join callbacks off executor; repeated calls are harmless. */
     rptadv_echolink_status (*account_stop)(struct rptadv_echolink_account *);

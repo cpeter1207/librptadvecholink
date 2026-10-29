@@ -83,6 +83,20 @@ impl Receiver {
         self.qso.state()
     }
 
+    /// Update validated account policy on this sole owner. Accepted/decoded
+    /// media, talker ownership and liveness timestamp anchors remain intact.
+    pub(crate) fn reconfigure(
+        &mut self,
+        gain_db: f64,
+        timers: crate::session::Timers,
+    ) -> Result<(), MediaError> {
+        crate::media::gain(gain_db)?;
+        if !self.qso.set_timers(timers) {
+            return Err(MediaError::Invalid);
+        }
+        self.playout.set_gain(gain_db)
+    }
+
     /// All accepted source PCM has been published, but the product still owns
     /// its finite tail. Publish one end marker per burst before waiting for
     /// product-ring drainage; raw guard expiry is not permission to discard PCM.

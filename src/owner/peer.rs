@@ -36,6 +36,7 @@ pub(super) struct Prepared {
 
 /// Only the registered serial executor may access this state, including reentrant calls.
 pub(super) struct Serial {
+    settings: Arc<crate::account::settings::PreparedSettings>,
     deadline: Option<Instant>,
     receiver: Receiver,
     encoder: PreparedMedia,
@@ -48,7 +49,7 @@ pub(super) struct Serial {
 
 struct Registration {
     // Join before dropping the retained peer, whose resources include the runtime.
-    driver: PeerDriver,
+    driver: Arc<PeerDriver>,
     peer: Arc<Peer>,
 }
 
@@ -118,6 +119,12 @@ pub(crate) unsafe extern "C" fn peer_attach(
     if Handle::try_current().is_ok() || !Arc::ptr_eq(&context.runtime, &peer.binding.runtime) {
         return Status::Invalid;
     }
+    // Replacement gates admission and collects every driver under this same
+    // control-only lock. The spawned task never acquires it or waits on control.
+    let binding = Arc::clone(&peer.binding);
+    let Ok(mut drivers) = binding.drivers.lock() else {
+        return Status::Failed;
+    };
     let valid = peer.validate();
     if valid != Status::Ok {
         return valid;
@@ -129,7 +136,8 @@ pub(crate) unsafe extern "C" fn peer_attach(
         return Status::Invalid;
     };
     let resources = &peer.binding._resources;
-    let policy = &peer.binding.settings.as_abi().policy;
+    let settings = peer.binding.current.load_full();
+    let policy = &settings.as_abi().policy;
     let playout = match unsafe {
         Playout::new(
             resources.catalog(),
@@ -146,7 +154,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         resources.catalog(),
         policy.transmit_gain_db,
         0,
-        peer.binding.settings.as_abi().node_number,
+        settings.as_abi().node_number,
     ) {
         Ok(encoder) => encoder,
         Err(_) => return Status::Failed,
@@ -158,11 +166,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
     let Some(qso_state) = Qso::new(
         peer.identity.clone(),
         peer.generation,
-        Timers {
-            heartbeat: Duration::from_millis(policy.heartbeat_interval_ms.into()),
-            liveness: Duration::from_millis(policy.heartbeat_timeout_ms.into()),
-            connect: Duration::from_millis(policy.connect_timeout_ms.into()),
-        },
+        timers(policy),
         peer.created,
     ) else {
         return Status::Invalid;
@@ -172,6 +176,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         receiver.initial(initial);
     }
     let mut serial = Serial {
+        settings,
         deadline: None,
         receiver,
         encoder,
@@ -198,16 +203,22 @@ pub(crate) unsafe extern "C" fn peer_attach(
         function: callback,
         context: opaque,
     };
-    let driver = PeerDriver::attach(
+    let driver = Arc::new(PeerDriver::attach(
         Arc::clone(&peer.binding.runtime),
         Arc::clone(&peer.control),
         prepared.ingress,
         move |event| {
+            if !active.live() {
+                return None;
+            }
             {
                 let serial = unsafe { (*active.serial.get()).as_mut() }?;
                 serial.event(&active, event);
             }
             if callback.call() < 0 {
+                return None;
+            }
+            if !active.live() {
                 return None;
             }
             // End all prior borrows before callback.call: it may reenter this QSO.
@@ -223,23 +234,33 @@ pub(crate) unsafe extern "C" fn peer_attach(
                 writable: serial.writable.take(),
             })
         },
-    );
+    ));
+    drivers.retain(|driver| driver.strong_count() != 0);
+    drivers.push(Arc::downgrade(&driver));
     *output = Box::into_raw(Box::new(Registration { driver, peer })).cast();
     Status::Ok
+}
+
+fn timers(policy: &ffi::AccountPolicy) -> Timers {
+    Timers {
+        heartbeat: Duration::from_millis(policy.heartbeat_interval_ms.into()),
+        liveness: Duration::from_millis(policy.heartbeat_timeout_ms.into()),
+        connect: Duration::from_millis(policy.connect_timeout_ms.into()),
+    }
 }
 
 impl Serial {
     fn queue_control(&mut self, peer: &Peer, bye: bool) -> Result<(), Status> {
         let packet = if bye {
             ControlPacket::Bye {
-                source: peer.binding.settings.as_abi().node_number,
+                source: self.settings.as_abi().node_number,
                 reason: Vec::new(),
             }
         } else {
             ControlPacket::Sdes {
-                source: peer.binding.settings.as_abi().node_number,
-                callsign: peer.binding.settings.callsign().into(),
-                station_name: peer.binding.settings.directory_login().description.into(),
+                source: self.settings.as_abi().node_number,
+                callsign: self.settings.callsign().into(),
+                station_name: self.settings.directory_login().description.into(),
                 speex: peer
                     .binding
                     ._resources
@@ -272,6 +293,9 @@ impl Serial {
         payload: &[u8],
         expires: Option<Instant>,
     ) -> Status {
+        if !peer.live() {
+            return Status::Closed;
+        }
         use crate::transport::{direct::SendError, driver::PeerWritable, proxy::QueueError};
         match &self.transport {
             PeerTransport::Direct(sockets) => {
@@ -323,6 +347,21 @@ impl Serial {
     }
 
     fn event(&mut self, peer: &Peer, event: PeerEvent) {
+        let settings = peer.binding.current.load_full();
+        if !Arc::ptr_eq(&self.settings, &settings) {
+            let policy = &settings.as_abi().policy;
+            if self
+                .receiver
+                .reconfigure(policy.receive_gain_db, timers(policy))
+                .is_err()
+                || self.encoder.set_gain(policy.transmit_gain_db).is_err()
+            {
+                let action = self.receiver.control(QsoEvent::OwnerFailed, Instant::now());
+                self.action(peer, action);
+                return;
+            }
+            self.settings = settings;
+        }
         if self
             .deadline
             .is_some_and(|deadline| deadline <= Instant::now())
@@ -393,6 +432,9 @@ pub(crate) unsafe extern "C" fn peer_read(
         || unsafe { ptr::addr_of!((*output).abi_version).read() } != 1
     {
         return Status::Invalid;
+    }
+    if !peer.live() {
+        return Status::Closed;
     }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
@@ -489,6 +531,9 @@ pub(crate) unsafe extern "C" fn peer_prepare_audio(
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
+    if !peer.live() {
+        return Status::Closed;
+    }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
     };
@@ -553,6 +598,9 @@ pub(crate) unsafe extern "C" fn peer_send_prepared(
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
+    if !peer.live() {
+        return Status::Closed;
+    }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
     };
@@ -591,6 +639,9 @@ pub(crate) unsafe extern "C" fn peer_reset_encoder(qso: *mut ffi::Qso) -> Status
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
+    if !peer.live() {
+        return Status::Closed;
+    }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
     };
@@ -623,6 +674,9 @@ pub(crate) unsafe extern "C" fn peer_send_text(
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
+    if !peer.live() {
+        return Status::Closed;
+    }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
     };
@@ -662,7 +716,7 @@ pub(crate) unsafe extern "C" fn peer_wake(registration: *mut ffi::Registration) 
 pub(crate) unsafe extern "C" fn peer_detach(registration: *mut ffi::Registration) {
     if !registration.is_null() && Handle::try_current().is_err() {
         let registration = unsafe { Box::from_raw(registration.cast::<Registration>()) };
-        registration.driver.detach();
+        registration.driver.wait();
         // peer remains retained until the join has completed.
     }
 }
@@ -671,6 +725,9 @@ pub(crate) unsafe extern "C" fn peer_set_deadline(qso: *mut ffi::Qso, relative: 
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
+    if !peer.live() {
+        return Status::Closed;
+    }
     // Serialized host operation only, never a radio callback or concurrent control call.
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;

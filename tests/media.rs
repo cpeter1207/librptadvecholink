@@ -238,6 +238,37 @@ fn transmit_gain_is_applied_once_before_codec_encoding() {
 }
 
 #[test]
+fn gain_reload_preserves_buffered_pcm_prepared_bytes_and_rtp_history() {
+    let catalog = catalog();
+    let mut changed = Packetizer::new(&catalog, Codec::GsmFr, 0.0, 7, 42).unwrap();
+    let mut reference = Packetizer::new(&catalog, Codec::GsmFr, 0.0, 7, 42).unwrap();
+    let pcm = source(640);
+    assert_eq!(changed.push(&pcm[..320]).unwrap(), 320);
+    changed.set_gain(6.020599913279624).unwrap();
+    assert_eq!(changed.push(&pcm[320..]).unwrap(), 320);
+    let mut expected = pcm.clone();
+    for sample in &mut expected[320..] {
+        *sample *= 2.0;
+    }
+    reference.push(&expected).unwrap();
+    let first = changed.packet().unwrap().bytes.clone();
+    assert_eq!(first, reference.packet().unwrap().bytes);
+    changed.set_gain(0.0).unwrap();
+    assert_eq!(first, changed.packet().unwrap().bytes);
+    changed.retire().unwrap();
+    reference.retire().unwrap();
+    for invalid in [f64::NAN, f64::INFINITY, 10000.0] {
+        assert!(changed.set_gain(invalid).is_err());
+    }
+    changed.push(&pcm).unwrap();
+    reference.push(&pcm).unwrap();
+    assert_eq!(
+        changed.packet().unwrap().bytes,
+        reference.packet().unwrap().bytes
+    );
+}
+
+#[test]
 fn independent_upstream_speex_decoder_and_encoder_agree_on_four_frame_boundaries() {
     use std::{
         io::Write,

@@ -176,6 +176,16 @@ impl Qso {
         self.first_cause
     }
 
+    /// Replace intervals without renewing their elapsed timestamp anchors or
+    /// reviving a closing connection. Invalid intervals leave the policy intact.
+    pub fn set_timers(&mut self, timers: Timers) -> bool {
+        if [timers.heartbeat, timers.liveness, timers.connect].contains(&Duration::ZERO) {
+            return false;
+        }
+        self.timers = timers;
+        true
+    }
+
     /// Next control heartbeat/setup/liveness deadline for the existing serial owner.
     /// Closing generations wait only for media drain, never a heartbeat polling loop.
     pub fn deadline(&self) -> Option<Instant> {

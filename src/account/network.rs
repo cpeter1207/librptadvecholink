@@ -133,6 +133,7 @@ enum Command {
 pub struct AccountNetwork {
     control: NetworkControl,
     task: Option<JoinHandle<()>>,
+    direct: Option<Arc<DirectSockets>>,
 }
 
 /// Cloneable off-audio command port; it owns no join handle or account task.
@@ -251,6 +252,10 @@ impl AccountNetwork {
         let (events, output) = mpsc::channel(capacity);
         let (stopping, stop) = watch::channel(false);
         let retired = Arc::new(Notify::new());
+        let direct = match &transport {
+            Transport::Direct(sockets) => Some(Arc::clone(sockets)),
+            Transport::Proxy(_) => None,
+        };
         let owner = Owner {
             settings,
             transport,
@@ -274,6 +279,7 @@ impl AccountNetwork {
                     stopping,
                 },
                 task: Some(task),
+                direct,
             },
             output,
         ))
@@ -282,6 +288,12 @@ impl AccountNetwork {
     /// Borrowable command lifetime is independent of the account's join ownership.
     pub fn control(&self) -> NetworkControl {
         self.control.clone()
+    }
+
+    /// Reuse only after this owner's stop barrier. Old immutable QSO handles may
+    /// retain the socket allocation, but must never retain an active reader.
+    pub(crate) fn direct_sockets(&self) -> Option<Arc<DirectSockets>> {
+        self.direct.as_ref().map(Arc::clone)
     }
 
     /// Read-only current directory; a view alone never authorizes a QSO.

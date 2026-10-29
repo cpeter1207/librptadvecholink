@@ -92,10 +92,7 @@ impl Playout {
         descriptor: *const c_void,
         origin: Instant,
     ) -> Result<Self, MediaError> {
-        let gain = 10.0f64.powf(gain_db / 20.0) as f32;
-        if !gain_db.is_finite() || !gain.is_finite() {
-            return Err(MediaError::Invalid);
-        }
+        let gain = crate::media::gain(gain_db)?;
         let gsm = catalog
             .decoder(ProfileId::GsmFr, 0, FRAMES as u32, MAX_PAYLOAD)
             .map_err(MediaError::Provider)?;
@@ -133,6 +130,13 @@ impl Playout {
             ending: false,
             announced: false,
         })
+    }
+
+    /// Apply to future decode/PLC only. Partially published PCM retains its
+    /// original gain, source positions and jitter/decoder history.
+    pub fn set_gain(&mut self, gain_db: f64) -> Result<(), MediaError> {
+        self.gain = crate::media::gain(gain_db)?;
+        Ok(())
     }
 
     /// Inspect framing before requesting first-talker ownership. This does not decode,

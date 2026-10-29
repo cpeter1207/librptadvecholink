@@ -2,82 +2,9 @@
 use rptadv_echolink::{account::settings::PreparedSettings, ffi::*};
 use std::{mem::size_of, ptr};
 
-fn span(text: &str) -> ByteSpan {
-    ByteSpan {
-        data: text.as_ptr(),
-        length: text.len(),
-    }
-}
-
-fn settings(
-    call: &str,
-    location: &str,
-    servers: &[ByteSpan],
-    patterns: &[ByteSpan],
-) -> AccountConfig {
-    AccountConfig {
-        enabled: 1,
-        node_number: u32::MAX,
-        local_node: span("524950"),
-        callsign: span(call),
-        station: StationMetadata {
-            name: span("Site"),
-            location: span(location),
-            email: span("op@example.invalid"),
-            status_message: span("Available"),
-            latitude: 45.0,
-            longitude: -93.0,
-            frequency_mhz: 146.52,
-            tone_hz: 114.8,
-            power_w: 10.0,
-            antenna_height_m: 12.0,
-            antenna_gain_db: -2.0,
-            antenna_direction_deg: 180.0,
-        },
-        transport: TransportConfig {
-            kind: 0,
-            bind_address: span("127.0.0.1"),
-            audio_port: 5198,
-            proxy_port: 8100,
-            proxy_host: span("proxy.example.invalid"),
-            directory_servers: StringList {
-                items: servers.as_ptr(),
-                count: servers.len(),
-            },
-        },
-        policy: AccountPolicy {
-            max_stations: 20,
-            max_pending_handshakes: 20,
-            heartbeat_interval_ms: 10_000,
-            heartbeat_timeout_ms: 100_000,
-            connect_timeout_ms: 30_000,
-            directory_timeout_ms: 10_000,
-            registration_refresh_ms: 300_000,
-            directory_refresh_ms: 240_000,
-            directory_retry_ms: 20_000,
-            directory_freshness_ms: 900_000,
-            receive_gain_db: -3.0,
-            transmit_gain_db: 3.0,
-            announcement: 3,
-            telemetry: 3,
-            telemetry_dynamic: 1,
-            allow: StringList {
-                items: patterns.as_ptr(),
-                count: patterns.len(),
-            },
-            deny: StringList::default(),
-        },
-        ..AccountConfig::default()
-    }
-}
-fn secrets(password: &str) -> AccountSecrets {
-    AccountSecrets {
-        struct_size: size_of::<AccountSecrets>() as u32,
-        abi_version: 1,
-        directory_password: span(password),
-        proxy_password: span("fixture-proxy-password"),
-    }
-}
+#[path = "support/settings.rs"]
+mod settings_fixture;
+use settings_fixture::{secrets, settings, span};
 
 #[test]
 fn exclusive_update_classification_uses_only_the_selected_transport() {
@@ -264,25 +191,9 @@ fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
     assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
 }
 
-fn resource_context(api: &Descriptor) -> *mut Context {
-    let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
-    let gsm = format!("{directory}/librptadv_codec_gsm.so.1");
-    let speex = format!("{directory}/librptadv_codec_speex.so.1");
-    let jitter = format!("{directory}/rpt_advanced/librptadv_jitter_adapter.so.1");
-    let runtime = RuntimeConfig {
-        worker_threads: 1,
-        gsm_library: span(&gsm),
-        speex_library: span(&speex),
-        jitter_library: span(&jitter),
-        ..RuntimeConfig::default()
-    };
-    let mut context = ptr::null_mut();
-    assert_eq!(
-        unsafe { api.context_create.unwrap()(&runtime, &mut context) },
-        Status::Ok
-    );
-    context
-}
+#[path = "support/context.rs"]
+mod context;
+use context::resource_context;
 
 #[test]
 fn enabled_abi_preparation_owns_settings_without_binding_or_logging_in() {

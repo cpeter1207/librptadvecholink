@@ -16,7 +16,7 @@ use std::{
     mem::size_of,
     ptr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -35,6 +35,8 @@ use tokio::{
 pub(crate) struct Account {
     runtime: Arc<Runtime>,
     resources: Option<Arc<Resources>>,
+    // Account lifecycle only: never acquired by a provider or audio callback.
+    operation: Mutex<()>,
     state: Mutex<State>,
 }
 struct State {
@@ -42,6 +44,9 @@ struct State {
     active: Option<Active>,
     generation: u64,
     stopped: bool,
+    activated: bool,
+    callback: Option<Callback>,
+    direct: Vec<Weak<crate::transport::direct::DirectSockets>>,
 }
 struct Active {
     network: AccountNetwork,
@@ -53,9 +58,12 @@ struct Binding {
     runtime: Arc<Runtime>,
     _resources: Arc<Resources>,
     settings: Arc<PreparedSettings>,
+    current: arc_swap::ArcSwap<PreparedSettings>,
     control: NetworkControl,
     generation: u64,
     live: AtomicBool,
+    // Attach/publication gate only; weak entries never prolong a QSO/runtime.
+    drivers: Mutex<Vec<Weak<crate::transport::driver::PeerDriver>>>,
     first_failure: Mutex<Option<NetworkError>>,
 }
 struct Peer {
@@ -86,6 +94,7 @@ struct Callback {
 // The host retains a thread-safe context through the off-executor stop barrier.
 // Only this account's one bridge invokes it, never a radio callback.
 unsafe impl Send for Callback {}
+unsafe impl Sync for Callback {}
 impl Callback {
     fn emit(self, kind: u32, status: Status, qso: *mut ffi::Qso, generation: u64, taken: *mut u32) {
         let event = Event {
@@ -109,11 +118,15 @@ impl Account {
         Self {
             runtime,
             resources,
+            operation: Mutex::new(()),
             state: Mutex::new(State {
                 settings,
                 active: None,
                 generation: 0,
                 stopped: false,
+                activated: false,
+                callback: None,
+                direct: Vec::new(),
             }),
         }
     }
@@ -126,6 +139,104 @@ impl Account {
             .filter(|active| active.binding.live.load(Ordering::Acquire))
             .map(|active| Arc::clone(&active.binding))
             .ok_or(Status::Closed)
+    }
+
+    /// Start outside the state lock: the bridge may notify the host immediately.
+    fn start(&self, settings: Arc<PreparedSettings>) -> Result<Active, Status> {
+        let resources = self
+            .resources
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(Status::Unsupported)?;
+        let (generation, callback, sockets) = {
+            let mut state = self.state.lock().map_err(|_| Status::Failed)?;
+            // A failed open still consumes its generation; a retired identity is never reused.
+            state.generation = state.generation.checked_add(1).ok_or(Status::Failed)?;
+            state.direct.retain(|sockets| sockets.strong_count() != 0);
+            let sockets = state
+                .direct
+                .iter()
+                .filter_map(Weak::upgrade)
+                .find(|sockets| {
+                    settings.as_abi().transport.kind == 0
+                        && sockets
+                            .local_addr(crate::wire::Channel::Audio)
+                            .is_ok_and(|address| {
+                                address.ip().to_string() == settings.bind_address()
+                                    && address.port() == settings.as_abi().transport.audio_port
+                            })
+                });
+            (state.generation, state.callback, sockets)
+        };
+        let (network, events) = self
+            .runtime
+            .block_on(async {
+                match sockets {
+                    Some(sockets) => {
+                        AccountNetwork::direct(Arc::clone(&settings), sockets, civil_time)
+                    }
+                    None => AccountNetwork::open(Arc::clone(&settings), civil_time).await,
+                }
+            })
+            .map_err(network_status)?;
+        if let Some(sockets) = network.direct_sockets() {
+            let mut state = self.state.lock().map_err(|_| Status::Failed)?;
+            if !state
+                .direct
+                .iter()
+                .any(|known| known.ptr_eq(&Arc::downgrade(&sockets)))
+            {
+                state.direct.push(Arc::downgrade(&sockets));
+            }
+        }
+        let binding = Arc::new(Binding {
+            runtime: Arc::clone(&self.runtime),
+            _resources: resources,
+            current: arc_swap::ArcSwap::from(Arc::clone(&settings)),
+            settings,
+            control: network.control(),
+            generation,
+            live: AtomicBool::new(true),
+            drivers: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(None),
+        });
+        let (stop, stopping) = watch::channel(false);
+        let bridge = self
+            .runtime
+            .spawn(bridge(Arc::clone(&binding), events, stopping, callback));
+        Ok(Active {
+            network,
+            binding,
+            stop,
+            bridge,
+        })
+    }
+
+    /// Retire one generation without permanently stopping the reloadable account.
+    /// Never hold account state across callback/network quiescence.
+    fn retire(&self, active: Active) -> Status {
+        let drivers = {
+            let mut drivers = active.binding.drivers.lock().unwrap();
+            active.binding.live.store(false, Ordering::Release);
+            std::mem::take(&mut *drivers)
+                .into_iter()
+                .filter_map(|driver| driver.upgrade())
+                .collect::<Vec<_>>()
+        };
+        active.stop.send_replace(true);
+        let status = self.runtime.block_on(async {
+            let notified = active.bridge.await;
+            let network = active.network.stop().await;
+            if notified.is_ok() && network.is_ok() {
+                Status::Ok
+            } else {
+                Status::Failed
+            }
+        });
+        for driver in drivers {
+            driver.wait();
+        }
+        status
     }
 }
 
@@ -163,55 +274,126 @@ pub(crate) unsafe extern "C" fn account_activate(
     let Some(account) = (unsafe { account.cast::<Account>().as_ref() }) else {
         return Status::Invalid;
     };
-    let Ok(mut state) = account.state.lock() else {
+    let Ok(_operation) = account.operation.lock() else {
         return Status::Failed;
     };
-    if state.stopped {
-        return Status::Closed;
-    }
-    if state.active.is_some() {
-        return Status::Invalid;
-    }
-    let Some(settings) = state.settings.as_ref().map(Arc::clone) else {
+    let settings = {
+        let Ok(mut state) = account.state.lock() else {
+            return Status::Failed;
+        };
+        if state.stopped {
+            return Status::Closed;
+        }
+        if state.activated {
+            return Status::Invalid;
+        }
+        state.activated = true;
+        state.callback = callback.map(|function| Callback { function, context });
+        state.settings.as_ref().map(Arc::clone)
+    };
+    let Some(settings) = settings else {
         return Status::Ok;
     };
-    let Some(resources) = account.resources.as_ref().map(Arc::clone) else {
-        return Status::Unsupported;
+    let active = match account.start(settings) {
+        Ok(active) => active,
+        Err(status) => {
+            account.state.lock().unwrap().activated = false;
+            return status;
+        }
     };
-    let Some(generation) = state.generation.checked_add(1) else {
+    account.state.lock().unwrap().active = Some(active);
+    Status::Ok
+}
+
+/// Validate first; update the existing owner or quiesce only this account.
+/// An exclusive failure restores its prior configuration and attempts reconnect,
+/// never claiming that restoring configuration restored network connectivity.
+pub(crate) unsafe extern "C" fn account_reconfigure(
+    account: *mut ffi::Account,
+    config: *const ffi::AccountConfig,
+    secrets: *const ffi::AccountSecrets,
+) -> Status {
+    if Handle::try_current().is_ok() {
+        return Status::Invalid;
+    }
+    let Some(account) = (unsafe { account.cast::<Account>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let next =
+        match unsafe { crate::prepare_settings(config, secrets, account.resources.is_some()) } {
+            Ok(next) => next,
+            Err(status) => return status,
+        };
+    let Ok(_operation) = account.operation.lock() else {
         return Status::Failed;
     };
-    let (network, events) = match account
-        .runtime
-        .block_on(AccountNetwork::open(Arc::clone(&settings), civil_time))
-    {
-        Ok(network) => network,
-        Err(error) => return network_status(error),
+    let (old, binding, activated) = {
+        let Ok(state) = account.state.lock() else {
+            return Status::Failed;
+        };
+        if state.stopped {
+            return Status::Closed;
+        }
+        (
+            state.settings.as_ref().map(Arc::clone),
+            state
+                .active
+                .as_ref()
+                .map(|active| Arc::clone(&active.binding)),
+            state.activated,
+        )
     };
-    let binding = Arc::new(Binding {
-        runtime: Arc::clone(&account.runtime),
-        _resources: resources,
-        settings,
-        control: network.control(),
-        generation,
-        live: AtomicBool::new(true),
-        first_failure: Mutex::new(None),
-    });
-    let (stop, stopping) = watch::channel(false);
-    let bridge = account.runtime.spawn(bridge(
-        Arc::clone(&binding),
-        events,
-        stopping,
-        callback.map(|function| Callback { function, context }),
-    ));
-    state.generation = generation;
-    state.active = Some(Active {
-        network,
-        binding,
-        stop,
-        bridge,
-    });
-    Status::Ok
+    if let (Some(old), Some(next), Some(binding)) = (&old, &next, &binding) {
+        if !old.requires_handoff(next) && binding.live.load(Ordering::Acquire) {
+            if let Err(error) = account
+                .runtime
+                .block_on(binding.control.reconfigure(Arc::clone(next)))
+            {
+                return network_status(error);
+            }
+            account.state.lock().unwrap().settings = Some(Arc::clone(next));
+            binding.current.store(Arc::clone(next));
+            // Wake existing serial owners; control must never access their codec state.
+            let drivers: Vec<_> = binding
+                .drivers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for driver in drivers {
+                driver.wake();
+            }
+            return Status::Ok;
+        }
+    }
+    let active = account.state.lock().unwrap().active.take();
+    if let Some(active) = active {
+        let status = account.retire(active);
+        if status != Status::Ok {
+            return status;
+        }
+    }
+    let replacement = if activated {
+        next.as_ref()
+            .map(|settings| account.start(Arc::clone(settings)))
+            .transpose()
+    } else {
+        Ok(None)
+    };
+    match replacement {
+        Ok(active) => {
+            let mut state = account.state.lock().unwrap();
+            state.settings = next;
+            state.active = active;
+            Status::Ok
+        }
+        Err(status) => {
+            let restored = old.and_then(|settings| account.start(settings).ok());
+            account.state.lock().unwrap().active = restored;
+            status
+        }
+    }
 }
 
 async fn bridge(
@@ -310,30 +492,20 @@ pub(crate) unsafe extern "C" fn account_stop(account: *mut ffi::Account) -> Stat
     let Some(account) = (unsafe { account.cast::<Account>().as_ref() }) else {
         return Status::Invalid;
     };
+    let Ok(_operation) = account.operation.lock() else {
+        return Status::Failed;
+    };
     let active = {
         let Ok(mut state) = account.state.lock() else {
             return Status::Failed;
         };
         state.stopped = true;
-        let active = state.active.take();
-        if let Some(active) = &active {
-            active.binding.live.store(false, Ordering::Release);
-            active.stop.send_replace(true);
-        }
-        active
+        state.active.take()
     };
     let Some(active) = active else {
         return Status::Ok;
     };
-    account.runtime.block_on(async {
-        let notified = active.bridge.await;
-        let network = active.network.stop().await;
-        if notified.is_ok() && network.is_ok() {
-            Status::Ok
-        } else {
-            Status::Failed
-        }
-    })
+    account.retire(active)
 }
 
 pub(crate) unsafe extern "C" fn account_destroy(account: *mut ffi::Account) {
@@ -361,7 +533,15 @@ pub(crate) unsafe extern "C" fn dial(
         Ok(binding) => binding,
         Err(status) => return status,
     };
-    let timeout = Duration::from_millis(binding.settings.as_abi().policy.connect_timeout_ms.into());
+    let timeout = Duration::from_millis(
+        binding
+            .current
+            .load()
+            .as_abi()
+            .policy
+            .connect_timeout_ms
+            .into(),
+    );
     let connection = match binding
         .runtime
         .block_on(async { tokio::time::timeout(timeout, binding.control.dial(node)).await })
@@ -380,13 +560,17 @@ pub(crate) unsafe extern "C" fn dial(
 }
 
 impl Peer {
+    fn live(&self) -> bool {
+        self.binding.live.load(Ordering::Acquire) && !self.control.is_stopped()
+    }
+
     fn validate(&self) -> Status {
-        if !self.binding.live.load(Ordering::Acquire)
-            || self.control.is_stopped()
+        if !self.live()
             || self.created.elapsed()
                 >= Duration::from_millis(
                     self.binding
-                        .settings
+                        .current
+                        .load()
                         .as_abi()
                         .policy
                         .connect_timeout_ms

@@ -50,6 +50,57 @@ fn establish(call: &mut Qso, generation: u64, now: Instant) {
 }
 
 #[test]
+fn timer_reload_preserves_elapsed_history_and_first_close_cause() {
+    let now = Instant::now();
+    let mut call = qso(now, 1);
+    let timers = Timers {
+        heartbeat: Duration::from_secs(100),
+        liveness: Duration::from_secs(20),
+        connect: Duration::from_secs(5),
+    };
+    assert!(call.set_timers(timers));
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(5)));
+    assert!(!call.set_timers(Timers {
+        connect: Duration::ZERO,
+        ..timers
+    }));
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(5)));
+    assert!(call.set_timers(Timers {
+        connect: Duration::from_secs(60),
+        ..timers
+    }));
+    assert_eq!(
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(10)),
+        None
+    );
+    establish(&mut call, 1, now + Duration::from_secs(10));
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(30)));
+    assert!(call.set_timers(Timers {
+        heartbeat: Duration::from_secs(12),
+        ..timers
+    }));
+    assert_eq!(call.deadline(), Some(now + Duration::from_secs(12)));
+    assert_eq!(
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(12)),
+        Some(QsoAction::Heartbeat)
+    );
+    assert!(call.set_timers(Timers {
+        liveness: Duration::from_secs(2),
+        ..timers
+    }));
+    assert_eq!(
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(12)),
+        Some(QsoAction::Closing {
+            cause: Cause::LivenessExpired,
+            send_bye: true
+        })
+    );
+    assert!(call.set_timers(timers));
+    assert_eq!(call.deadline(), None);
+    assert_eq!(call.first_cause(), Some(Cause::LivenessExpired));
+}
+
+#[test]
 fn qso_owner_waits_for_heartbeat_or_expiry_and_parks_closed_generations() {
     let now = Instant::now();
     let mut call = qso(now, 1);
