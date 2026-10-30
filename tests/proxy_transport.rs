@@ -75,7 +75,16 @@ fn explicit_proxy_rejection_is_typed_and_incomplete_nonce_obeys_deadline() {
             (3, ProxyError::Rejected(3)),
         ] {
             let (mut source, input) = tokio::io::duplex(64);
-            source.write_all(&record(7, [0; 4], &[code])).await.unwrap();
+            source
+                .write_all(
+                    &[
+                        record(7, [0; 4], &[code]),
+                        record(5, [127, 0, 0, 2], b"must not be emitted"),
+                    ]
+                    .concat(),
+                )
+                .await
+                .unwrap();
             let mut reader = ProxyReader::new(input);
             assert_eq!(
                 reader.read(&mut |_| panic!("rejection became media")).await,
@@ -199,6 +208,7 @@ fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
         let mut writer = ProxyWriter::new(output);
         let observer = writer.output();
         let now = Instant::now();
+        assert_eq!(writer.flush_one(now).await.unwrap(), FlushOutcome::Empty);
         writer
             .try_queue(
                 ProxyRecord {
@@ -244,13 +254,7 @@ fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
             all.extend(rest);
             all
         });
-        assert_eq!(
-            writer
-                .flush_one(now + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            FlushOutcome::Sent
-        );
+        assert_eq!(writer.flush_next().await.unwrap(), FlushOutcome::Sent);
         assert_eq!(
             writer
                 .flush_one(now + Duration::from_secs(1))
@@ -275,6 +279,131 @@ fn canceled_partial_write_keeps_the_header_and_payload_before_later_control() {
         );
         assert_eq!(completed.queued_bytes, 0);
         assert!(completed.stall_ms >= stalled.stall_ms);
+    });
+}
+
+#[test]
+fn proxy_connection_validation_and_short_nonce_preserve_typed_failures() {
+    run(async {
+        let address = "127.0.0.1:0".parse().unwrap();
+        for callsign in ["", "K1234567890123456", "BAD!"] {
+            assert!(matches!(
+                connect(address, callsign, "", Duration::from_secs(1)).await,
+                Err(ProxyError::Invalid)
+            ));
+        }
+        assert!(matches!(
+            connect(address, "K1ABC-R", "", Duration::from_secs(1)).await,
+            Err(ProxyError::Io(_))
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(b"1234").await.unwrap();
+        });
+        assert!(matches!(
+            connect(address, "K1ABC-R", "", Duration::from_secs(1)).await,
+            Err(ProxyError::Closed)
+        ));
+        server.await.unwrap();
+    });
+}
+
+#[test]
+fn proxy_readiness_waits_for_queue_and_partially_written_record_credit() {
+    run(async {
+        let (stream, mut sink) = tokio::io::duplex(1);
+        let mut writer = ProxyWriter::new(stream);
+        let output = writer.output();
+        let packet = ProxyRecord {
+            kind: ProxyKind::UdpControl,
+            address: Ipv4Addr::LOCALHOST,
+            payload: b"c",
+        };
+        for _ in 0..64 {
+            output.try_queue(packet, None).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), output.writable(packet.kind, 1))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), writer.flush_next())
+                .await
+                .is_err()
+        );
+        // The channel now has a slot, but the retained record still owns its
+        // semaphore permit until its last byte reaches the socket boundary.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), output.writable(packet.kind, 1))
+                .await
+                .is_err()
+        );
+        let receive = tokio::spawn(async move {
+            let mut wire = [0; 10];
+            sink.read_exact(&mut wire).await.unwrap();
+            wire
+        });
+        assert_eq!(writer.flush_next().await.unwrap(), FlushOutcome::Sent);
+        assert_eq!(
+            receive.await.unwrap().as_slice(),
+            record(6, [127, 0, 0, 1], b"c")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), output.writable(packet.kind, 1))
+                .await
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(output.observe().sent, 1);
+    });
+}
+
+struct ZeroWriter;
+impl tokio::io::AsyncWrite for ZeroWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        _: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(0))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[test]
+fn zero_write_is_a_transport_failure_not_a_sent_or_expired_record() {
+    run(async {
+        let mut writer = ProxyWriter::new(ZeroWriter);
+        writer
+            .try_queue(
+                ProxyRecord {
+                    kind: ProxyKind::UdpControl,
+                    address: Ipv4Addr::LOCALHOST,
+                    payload: b"control",
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            writer.flush_next().await,
+            Err(ProxyError::Io(std::io::ErrorKind::WriteZero))
+        );
+        let stats = writer.output().observe();
+        assert_eq!((stats.sent, stats.expired), (0, 0));
     });
 }
 

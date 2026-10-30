@@ -1,6 +1,5 @@
 //! Metadata copies on their existing owners, never on a radio callback.
 use super::{Account, TransportFailure, ffi, network_status};
-use crate::account::directory::DirectoryState;
 use std::{fmt::Debug, mem::size_of, ptr, sync::atomic::Ordering};
 
 /// Validate the readable prefix before forming a reference to the whole output.
@@ -92,13 +91,10 @@ pub(crate) unsafe extern "C" fn account_observe(
                 Ok(observed) => observed,
                 Err(error) => return network_status(error),
             };
-            result.state = match observed.directory.state {
-                DirectoryState::Registering => 1,
-                DirectoryState::Online => 2,
-                DirectoryState::Retrying => 3,
-                DirectoryState::Stopping => 4,
-                DirectoryState::Stopped => 5,
-            };
+            // The network owner answers only while running. Shutdown codes
+            // remain defined by the directory state, without duplicate branches
+            // for states that cannot answer an account observation request.
+            result.state = observed.directory.state as u32;
             result.available = 1;
             result.fresh = u32::from(observed.fresh);
             result.registered = u32::from(observed.directory.registered);
@@ -139,7 +135,218 @@ pub(crate) unsafe extern "C" fn account_observe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fmt, sync::Arc};
+    use crate::{account::settings::PreparedSettings, resources::Resources};
+    use std::{
+        fmt,
+        io::{Read, Write},
+        net::{TcpListener, UdpSocket},
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    struct Activated(Box<Account>);
+    impl Activated {
+        fn pointer(&self) -> *mut ffi::Account {
+            ptr::from_ref(self.0.as_ref()).cast_mut().cast()
+        }
+        fn observation(&self) -> (ffi::Status, ffi::AccountObservation) {
+            let mut result = ffi::AccountObservation {
+                struct_size: size_of::<ffi::AccountObservation>() as u32,
+                abi_version: 1,
+                ..Default::default()
+            };
+            let status = unsafe { account_observe(self.pointer(), &mut result) };
+            (status, result)
+        }
+    }
+    impl Drop for Activated {
+        fn drop(&mut self) {
+            unsafe { super::super::account_stop(self.pointer()) };
+        }
+    }
+
+    fn active(runtime: Arc<tokio::runtime::Runtime>) -> (Activated, TcpListener) {
+        let span = |text: &str| ffi::ByteSpan {
+            data: text.as_ptr(),
+            length: text.len(),
+        };
+        let directory = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = directory.local_addr().unwrap().to_string();
+        let servers = [span(&server)];
+        let audio_port = loop {
+            let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = audio.local_addr().unwrap().port();
+            if port < u16::MAX && UdpSocket::bind(("127.0.0.1", port + 1)).is_ok() {
+                break port;
+            }
+        };
+        let config = ffi::AccountConfig {
+            enabled: 1,
+            node_number: 654321,
+            local_node: span("524950"),
+            callsign: span("K1ABC-R"),
+            transport: ffi::TransportConfig {
+                bind_address: span("127.0.0.1"),
+                audio_port,
+                directory_servers: ffi::StringList {
+                    items: servers.as_ptr(),
+                    count: 1,
+                },
+                ..Default::default()
+            },
+            policy: ffi::AccountPolicy {
+                max_stations: 1,
+                max_pending_handshakes: 1,
+                heartbeat_interval_ms: 10_000,
+                heartbeat_timeout_ms: 100_000,
+                connect_timeout_ms: 30_000,
+                directory_timeout_ms: 10_000,
+                registration_refresh_ms: 300_000,
+                directory_refresh_ms: 240_000,
+                directory_retry_ms: 60_000,
+                directory_freshness_ms: 900_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let secrets = ffi::AccountSecrets {
+            struct_size: size_of::<ffi::AccountSecrets>() as u32,
+            abi_version: 1,
+            directory_password: span("fixture-password"),
+            proxy_password: ffi::ByteSpan::default(),
+        };
+        let settings = Arc::new(unsafe { PreparedSettings::copy(&config, &secrets) }.unwrap());
+        let path = std::env::var("RPTADV_CODEC_DIR").unwrap();
+        let gsm = format!("{path}/librptadv_codec_gsm.so.1");
+        let jitter = format!("{path}/rpt_advanced/librptadv_jitter_adapter.so.1");
+        let resources = unsafe {
+            Resources::load(&ffi::RuntimeConfig {
+                gsm_library: span(&gsm),
+                jitter_library: span(&jitter),
+                ..Default::default()
+            })
+        }
+        .unwrap()
+        .unwrap();
+        let account = Activated(Box::new(Account::new(
+            runtime,
+            Some(Arc::new(resources)),
+            Some(settings),
+        )));
+        assert_eq!(
+            unsafe { super::super::account_activate(account.pointer(), None, ptr::null_mut()) },
+            ffi::Status::Ok
+        );
+        (account, directory)
+    }
+
+    #[test]
+    fn registering_and_retrying_are_copied_from_the_real_directory_owner() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (account, directory) = active(runtime);
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = directory.accept().unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut first = [0];
+            connection.read_exact(&mut first).unwrap();
+            assert_eq!(first, [b'l']);
+            arrived.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(3)).unwrap();
+            connection.write_all(b"NO").unwrap();
+        });
+        arrival.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (status, result) = account.observation();
+        assert_eq!(status, ffi::Status::Ok);
+        assert_eq!(
+            (result.state, result.available, result.registered),
+            (1, 1, 0)
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (status, result) = account.observation();
+            assert_eq!(status, ffi::Status::Ok);
+            if result.state == 3 {
+                assert_eq!(result.directory_failures, 1);
+                assert!(result.retry_in_ms <= 60_000);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "registration rejection was not observed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn retained_binding_observation_handles_retirement_and_poisoned_metadata() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (account, _directory) = active(Arc::clone(&runtime));
+        let binding = account.0.binding().unwrap();
+        let failure = binding.first_failure.lock().unwrap();
+        let references = Arc::strong_count(&binding);
+        std::thread::scope(|scope| {
+            let observed = scope.spawn(|| account.observation());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Arc::strong_count(&binding) == references {
+                assert!(
+                    Instant::now() < deadline,
+                    "observer never retained the binding"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                unsafe { super::super::account_stop(account.pointer()) },
+                ffi::Status::Ok
+            );
+            drop(failure);
+            let (status, result) = observed.join().unwrap();
+            assert_eq!(status, ffi::Status::Ok);
+            assert_eq!((result.available, result.first_cause), (0, 0));
+        });
+        let (account, _directory) = active(runtime);
+        let binding = account.0.binding().unwrap();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = binding.first_failure.lock().unwrap();
+                panic!("intentional test-only poisoned failure metadata");
+            }))
+            .is_err()
+        );
+        assert_eq!(account.observation().0, ffi::Status::Failed);
+    }
+
+    #[test]
+    fn observation_reports_real_control_queue_backpressure_without_waiting() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (account, _directory) = active(runtime);
+        let binding = account.0.binding().unwrap();
+        binding.control.remove(1, 1).unwrap();
+        binding.control.remove(2, 2).unwrap();
+        assert_eq!(account.observation().0, ffi::Status::Full);
+    }
 
     struct Category<'a>(&'a str);
     impl Debug for Category<'_> {

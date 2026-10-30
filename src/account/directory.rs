@@ -20,18 +20,20 @@ pub struct DirectoryPolicy {
 }
 
 /// Directory health is separate from QSO liveness and public inbound reachability.
+/// Discriminants are the copied account-observation state codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
 pub enum DirectoryState {
     /// Initial or renewed directory login is due/in flight.
-    Registering,
+    Registering = 1,
     /// Latest operation succeeded; further deadlines remain scheduled.
-    Online,
+    Online = 2,
     /// An operation failed; old snapshots and calls remain intact.
-    Retrying,
+    Retrying = 3,
     /// Logout/cancellation is in progress; no new operation may start.
-    Stopping,
+    Stopping = 4,
     /// Shutdown completed, including a failed finite logout attempt.
-    Stopped,
+    Stopped = 5,
 }
 
 /// A typed operation contains no credentials; construct its wire request just before I/O.
