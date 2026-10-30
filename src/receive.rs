@@ -410,7 +410,9 @@ impl Receiver {
                 activity = Some(false);
             }
         }
-        if drained && self.qso.state() == QsoState::Closing {
+        // The account's drain acknowledgement may arrive on a later serial
+        // turn. Closing the QSO first would retire its host before final unkey.
+        if drained && !self.selected && self.qso.state() == QsoState::Closing {
             self.control(QsoEvent::Drained, now);
         }
         Ok(Turn {

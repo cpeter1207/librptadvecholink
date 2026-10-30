@@ -399,6 +399,65 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
 }
 
 #[test]
+fn graceful_close_waits_for_the_selected_source_unkey_before_retiring() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        receiver
+            .packet(datagram(
+                generation,
+                Channel::Audio,
+                now,
+                &encoder.packet().unwrap().bytes,
+            ))
+            .unwrap();
+        coordinator.service().await;
+        let mut sink = Sink {
+            limit: 640,
+            ..Sink::default()
+        };
+        assert_eq!(
+            receiver.poll(now, false, &mut sink).unwrap().activity,
+            Some(true)
+        );
+        coordinator.service().await;
+        receiver.control(QsoEvent::Stop, now);
+        let later = now + Duration::from_millis(400);
+        for _ in 0..4 {
+            receiver.poll(later, false, &mut sink).unwrap();
+        }
+        assert_eq!(sink.samples, 640);
+        assert!(receiver.product_finish_pending());
+        assert_eq!(
+            receiver.poll(later, true, &mut sink).unwrap().activity,
+            None
+        );
+        assert_eq!(
+            receiver.state(),
+            QsoState::Closing,
+            "the owner must remain runnable until the account returns unkey"
+        );
+        coordinator.service().await;
+        assert_eq!(coordinator.poll(later), Some((1, generation)));
+        assert_eq!(
+            receiver.poll(later, true, &mut sink).unwrap().activity,
+            Some(false)
+        );
+        assert_eq!(receiver.state(), QsoState::Closed);
+        assert_eq!(
+            receiver.poll(later, true, &mut sink).unwrap().activity,
+            None
+        );
+    });
+}
+
+#[test]
 fn suppressed_and_invalid_media_never_reach_pcm_or_selected_activity() {
     run(async {
         let providers = Providers::new();
@@ -795,6 +854,7 @@ fn remote_bye_preserves_blocked_codec_pcm_and_the_first_terminal_cause() {
         coordinator.service().await;
         let mut sink = Sink::default();
         receiver.poll(now, false, &mut sink).unwrap();
+        coordinator.service().await;
         let later = now + Duration::from_millis(200);
         receiver.poll(later, false, &mut sink).unwrap();
         let mut bye = [0; 128];
@@ -830,6 +890,15 @@ fn remote_bye_preserves_blocked_codec_pcm_and_the_first_terminal_cause() {
         assert_eq!(sink.samples, 640);
         assert_eq!(receiver.state(), QsoState::Closing);
         receiver.poll(later, true, &mut sink).unwrap();
+        assert_eq!(receiver.state(), QsoState::Closing);
+        coordinator.service().await;
+        assert_eq!(coordinator.poll(later), None);
+        let unkey_at = now + Duration::from_millis(320);
+        assert_eq!(coordinator.poll(unkey_at), Some((1, generation)));
+        assert_eq!(
+            receiver.poll(unkey_at, true, &mut sink).unwrap().activity,
+            Some(false)
+        );
         assert_eq!(receiver.state(), QsoState::Closed);
     });
 }

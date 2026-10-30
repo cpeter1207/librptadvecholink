@@ -145,6 +145,7 @@ struct Trace {
     cause: AtomicUsize,
     sent: AtomicBool,
     checked: AtomicBool,
+    closing_checked: AtomicBool,
     pcm: AtomicUsize,
     texts: AtomicUsize,
     errors: AtomicUsize,
@@ -196,6 +197,7 @@ fn attach(
         cause: AtomicUsize::new(0),
         sent: AtomicBool::new(false),
         checked: AtomicBool::new(false),
+        closing_checked: AtomicBool::new(false),
         pcm: AtomicUsize::new(0),
         texts: AtomicUsize::new(0),
         errors: AtomicUsize::new(0),
@@ -310,6 +312,25 @@ unsafe extern "C" fn text(opaque: *mut std::ffi::c_void, _: ByteSpan, _: ByteSpa
         .texts
         .fetch_add(1, Ordering::Release);
 }
+// Use the released encoder for state/expiry probes, not invented RTP bytes.
+fn prepared(trace: &Trace) -> (Status, rptadv_codec_client::EncodeResultRaw, [u8; 264]) {
+    let mut result: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
+    result.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
+    let mut packet = [0; 264];
+    let pcm = [0.1; 640];
+    let status = unsafe {
+        trace.api.peer_prepare_audio.unwrap()(
+            trace.qso,
+            pcm.as_ptr(),
+            pcm.len(),
+            packet.as_mut_ptr(),
+            packet.len(),
+            0,
+            ptr::from_mut(&mut result).cast(),
+        )
+    };
+    (status, result, packet)
+}
 unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
     let trace = unsafe { &*opaque.cast::<Trace>() };
     let mut read = ReadResult::default();
@@ -325,6 +346,21 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
             unsafe { peer_contract::serial(trace.api, trace.qso, &sink) },
             Ordering::Release,
         );
+        let (status, result, packet) = prepared(trace);
+        let voice = ByteSpan {
+            data: packet.as_ptr(),
+            length: result.encoded_bytes,
+        };
+        if status != Status::Ok
+            || unsafe { trace.api.peer_send_prepared.unwrap()(trace.qso, voice, 640, 0) }
+                != Status::Pending
+            || unsafe {
+                trace.api.peer_send_text.unwrap()(trace.qso, span("K1ABC-R"), span("Pending"))
+            } != Status::Pending
+            || unsafe { trace.api.peer_reset_encoder.unwrap()(trace.qso) } != Status::Ok
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
         if let Some(codec) = &trace.codec {
             codec.select(9);
             let reset = unsafe { trace.api.peer_reset_encoder.unwrap()(trace.qso) };
@@ -374,36 +410,57 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
         trace.finish.store(true, Ordering::Release);
     }
     if read.state == 1 && !trace.sent.swap(true, Ordering::AcqRel) {
-        let mut result: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
-        result.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
-        let mut packet = [0; 264];
-        let pcm = [0.1; 640];
-        let prepared = unsafe {
-            trace.api.peer_prepare_audio.unwrap()(
-                trace.qso,
-                pcm.as_ptr(),
-                pcm.len(),
-                packet.as_mut_ptr(),
-                packet.len(),
-                0,
-                ptr::from_mut(&mut result).cast(),
-            )
+        let (status, result, packet) = prepared(trace);
+        let mut before = PeerObservation {
+            struct_size: size_of::<PeerObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
         };
-        if prepared != Status::Ok
+        let mut after = before;
+        let mut elapsed = 0;
+        let voice = ByteSpan {
+            data: packet.as_ptr(),
+            length: result.encoded_bytes,
+        };
+        // A stale packet is accepted as expired, without transport admission.
+        if status != Status::Ok
+            || unsafe { trace.api.peer_elapsed_ms.unwrap()(trace.qso, &mut elapsed) } != Status::Ok
+            || unsafe { trace.api.peer_observe.unwrap()(trace.qso, &mut before) } != Status::Ok
             || unsafe {
                 trace.api.peer_send_prepared.unwrap()(
                     trace.qso,
-                    ByteSpan {
-                        data: packet.as_ptr(),
-                        length: result.encoded_bytes,
-                    },
+                    voice,
                     640,
-                    0,
+                    (elapsed as u32).wrapping_sub(200),
                 )
+            } != Status::Ok
+            || unsafe { trace.api.peer_observe.unwrap()(trace.qso, &mut after) } != Status::Ok
+            || before.proxy_admitted != after.proxy_admitted
+            || unsafe {
+                trace.api.peer_send_prepared.unwrap()(trace.qso, voice, 640, elapsed as u32)
             } != Status::Ok
             || unsafe {
                 trace.api.peer_send_text.unwrap()(trace.qso, span("K1ABC-R"), span("Test message"))
             } != Status::Ok
+        {
+            trace.errors.fetch_add(1, Ordering::Release);
+        }
+    }
+    if read.state == 2 && !trace.closing_checked.swap(true, Ordering::AcqRel) {
+        let (status, result, packet) = prepared(trace);
+        let voice = ByteSpan {
+            data: packet.as_ptr(),
+            length: result.encoded_bytes,
+        };
+        // Graceful closing still owns its finite media, but admits no new send.
+        let sent = unsafe { trace.api.peer_send_prepared.unwrap()(trace.qso, voice, 640, 0) };
+        let text = unsafe {
+            trace.api.peer_send_text.unwrap()(trace.qso, span("K1ABC-R"), span("Closing"))
+        };
+        // Transport EOF also closes preparation itself, unlike graceful BYE.
+        if !matches!(status, Status::Ok | Status::Closed)
+            || sent != Status::Closed
+            || text != Status::Closed
         {
             trace.errors.fetch_add(1, Ordering::Release);
         }
@@ -428,14 +485,16 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
 }
 
 #[test]
-fn proxy_eof_delivers_a_final_serial_turn_with_the_transport_cause() {
-    for (speex, blocked, faults) in [
-        (false, false, false),
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
+fn proxy_closure_delivers_a_final_serial_turn_with_the_first_cause() {
+    for (speex, blocked, faults, cause) in [
+        (false, false, false, 5),
+        (true, false, false, 5),
+        (false, true, false, 5),
+        (false, false, true, 5),
+        (false, false, false, 1),
+        (false, false, false, 2),
     ] {
-        proxy_case(speex, blocked, faults);
+        proxy_case(speex, blocked, faults, cause);
     }
 }
 
@@ -500,6 +559,20 @@ fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert_eq!(fault.calls(false), 0);
         fault.select(0);
+        assert_eq!(
+            unsafe {
+                api.peer_attach.unwrap()(
+                    context,
+                    qso,
+                    Some(unexpected),
+                    ptr::from_ref(&calls).cast_mut().cast(),
+                    &mut registration,
+                )
+            },
+            Status::Invalid,
+            "failed initialization consumes the one pending attachment"
+        );
+        assert!(registration.is_null());
         unsafe { api.peer_destroy.unwrap()(qso) };
         socket.shutdown(Shutdown::Both).unwrap();
     }
@@ -574,7 +647,7 @@ fn pending_peer_revalidation_observes_timeout_staleness_and_changed_directory_id
         socket.shutdown(Shutdown::Both).unwrap();
     }
 }
-fn proxy_case(speex: bool, blocked: bool, faults: bool) {
+fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (ready, socket) = std::sync::mpsc::channel();
@@ -613,8 +686,23 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool) {
             && trace.pcm.load(Ordering::Acquire) == if blocked { 0 } else { 640 }
             && trace.texts.load(Ordering::Acquire) == 1
     });
-    socket.shutdown(Shutdown::Both).unwrap();
-    let final_turn = wait(|| trace.cause.load(Ordering::Acquire) == 5);
+    match cause {
+        1 => unsafe { api.peer_stop.unwrap()(fixture.registration) },
+        2 => {
+            let mut bye = [0; 64];
+            let count = write_control(
+                &ControlPacket::Bye {
+                    source: 7,
+                    reason: Vec::new(),
+                },
+                &mut bye,
+            )
+            .unwrap();
+            send(&mut socket, 6, [127, 0, 0, 2], &bye[..count]);
+        }
+        _ => socket.shutdown(Shutdown::Both).unwrap(),
+    }
+    let final_turn = wait(|| trace.cause.load(Ordering::Acquire) == cause);
     trace.limit.store(73, Ordering::Release);
     unsafe { api.peer_wake.unwrap()(fixture.registration) };
     let finite = wait(|| trace.finish.load(Ordering::Acquire));
@@ -628,8 +716,13 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool) {
         abi_version: 1,
         ..Default::default()
     };
-    let account_failed = wait(|| unsafe {
-        api.account_observe.unwrap()(account, &mut health) == Status::Ok && health.first_cause == 2
+    let account_observed = wait(|| unsafe {
+        api.account_observe.unwrap()(account, &mut health) == Status::Ok
+            && if cause == 5 {
+                health.first_cause == 2
+            } else {
+                health.available != 0
+            }
     });
     unsafe {
         api.peer_detach.unwrap()(fixture.registration);
@@ -648,13 +741,20 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool) {
     );
     assert!(
         finite && !premature_unkey && released,
-        "transport loss finite={finite}, premature_unkey={premature_unkey}, released={released}, state={}, read_errors={}",
+        "closure cause={cause}, speex={speex}, blocked={blocked}, faults={faults}: finite={finite}, premature_unkey={premature_unkey}, released={released}, state={}, read_errors={}",
         trace.state.load(Ordering::Acquire),
         trace.errors.load(Ordering::Acquire)
     );
     assert_eq!(trace.errors.load(Ordering::Acquire), 0);
     assert_eq!(trace.pcm.load(Ordering::Acquire), 640);
-    assert!(account_failed && health.state == 7 && health.available == 0);
+    assert!(trace.closing_checked.load(Ordering::Acquire));
+    assert!(account_observed);
+    if cause == 5 {
+        assert!(health.state == 7 && health.available == 0);
+    } else {
+        assert_eq!(health.first_cause, 0);
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
 }
 
 #[test]
