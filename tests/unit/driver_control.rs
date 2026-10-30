@@ -48,6 +48,7 @@ fn graceful_close_wakes_after_a_coalesced_product_wake_is_consumed() {
     runtime.block_on(async {
         let control = Control::default();
         control.wake();
+        control.wake();
         control.notify.notified().await;
         // The task has consumed its wake, but has not cleared pending yet.
         // A concurrent close must supply a fresh wake in this exact window.

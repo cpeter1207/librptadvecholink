@@ -1,6 +1,7 @@
 /** @file
- * @brief Fault boundary around a retained released codec, never a substitute codec.
- * Follows rptadv-codec-adapters' codec_loader_fixture.c descriptor-copy pattern.
+ * @brief Fault boundary around a retained released codec, never a substitute
+ * codec. Follows rptadv-codec-adapters' codec_loader_fixture.c descriptor-copy
+ * pattern.
  */
 #include <rptadv-codec/rptadv_codec.h>
 
@@ -8,15 +9,19 @@ static rptadv_codec_descriptor_v1_table original, fixture;
 static int fault;
 static size_t decodes, conceals;
 
-/** Preserve inspection except for one explicit fatal-provider test. */
+/** Preserve inspection except for explicit provider-failure/corruption tests.
+ */
 static int32_t inspect(void *context, const uint8_t *packet, size_t length,
                        rptadv_codec_packet_info_v1 *result) {
   if (fault == 1)
     return RPTADV_CODEC_FAILED;
+  if (fault == 6)
+    return RPTADV_CODEC_MALFORMED;
   return original.inspect(context, packet, length, result);
 }
 
-/** Inject damage or bounded result faults while retaining real codec history. */
+/** Inject damage or bounded result faults while retaining real codec history.
+ */
 static int32_t decode(void *context, const uint8_t *packet, size_t length,
                       float *pcm, size_t capacity, size_t *frames) {
   ++decodes;
@@ -24,7 +29,8 @@ static int32_t decode(void *context, const uint8_t *packet, size_t length,
     return RPTADV_CODEC_MALFORMED;
   if (fault == 5)
     return RPTADV_CODEC_FAILED;
-  int32_t result = original.decode(context, packet, length, pcm, capacity, frames);
+  int32_t result =
+      original.decode(context, packet, length, pcm, capacity, frames);
   if (result == RPTADV_CODEC_COMPLETE) {
     if (fault == 3)
       *frames = 0;
@@ -34,18 +40,21 @@ static int32_t decode(void *context, const uint8_t *packet, size_t length,
   return result;
 }
 
-/** Native PLC remains the released provider's implementation, including Unsupported. */
-static int32_t conceal(void *context, uint32_t count, float *pcm, size_t capacity,
-                       size_t *frames) {
+/** Native PLC remains the released provider's implementation, including
+ * Unsupported. */
+static int32_t conceal(void *context, uint32_t count, float *pcm,
+                       size_t capacity, size_t *frames) {
   ++conceals;
   return original.conceal(context, count, pcm, capacity, frames);
 }
 
-/** Exercise packetizer checks after the neutral client accepts bounded metadata. */
+/** Exercise packetizer checks after the neutral client accepts bounded
+ * metadata. */
 static int32_t encode(void *context, const float *pcm, size_t frames,
                       uint8_t *packet, size_t capacity, uint32_t flush,
                       rptadv_codec_encode_result_v1 *result) {
-  int32_t status = original.encode(context, pcm, frames, packet, capacity, flush, result);
+  int32_t status =
+      original.encode(context, pcm, frames, packet, capacity, flush, result);
   if (status == RPTADV_CODEC_COMPLETE) {
     if (fault == 10)
       result->consumed_frames = 639;

@@ -180,6 +180,11 @@ fn fresh_sdes_identity_and_real_channel_bind_before_media() {
     let mut router = router();
     let mut peer = router.dial(&directory, 1, now).unwrap();
     assert!(matches!(
+        router.receive(&directory, Channel::Control, endpoint(1, 5199), now, &[0]),
+        RouteResult::Dropped
+    ));
+    assert_eq!(router.malformed_packets(), 1);
+    assert!(matches!(
         router.receive(&directory, Channel::Audio, endpoint(1, 5198), now, &voice()),
         RouteResult::Dropped
     ));

@@ -211,7 +211,7 @@ fn invalid_and_cancelled_directory_requests_do_not_steal_the_next_reply() {
             let transport = connect(address, "N0CALL-R", "fixture-password", Duration::from_secs(1)).await.unwrap();
             let session = ProxySession::start(transport, Duration::from_secs(1)).unwrap();
             let directory = session.directory();
-            for (request, timeout) in [(vec![], Duration::from_secs(1)), (vec![0; 65_537], Duration::from_secs(1)), (vec![1], Duration::ZERO)] {
+            for (request, timeout) in [(vec![], Duration::from_secs(1)), (vec![0; 65_537], Duration::from_secs(1)), (vec![1], Duration::ZERO), (vec![1], Duration::MAX)] {
                 assert_eq!(directory.exchange(Ipv4Addr::LOCALHOST, &request, ReplyKind::Login, timeout).await, Err(TransactionError::Malformed));
             }
             let first = directory.exchange(Ipv4Addr::LOCALHOST, b"first", ReplyKind::Login, Duration::from_secs(2));

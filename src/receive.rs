@@ -8,7 +8,7 @@ use crate::{
     playout::{PcmSink, Playout, Progress, Reception},
     session::{Packet, Qso, QsoAction, QsoEvent, QsoState},
     transport::{mailbox::Datagram, routing::PendingHandshake},
-    wire::{Codec, ControlPacket, WirePacket, parse_datagram},
+    wire::{Codec, ControlPacket, VoicePacket, WirePacket, parse_datagram},
 };
 use std::{net::IpAddr, time::Instant};
 
@@ -62,6 +62,22 @@ pub struct Observation {
     pub concealment: crate::playout::Concealment,
 }
 
+/// Retain the original byte/queue credit and its already-validated wire header.
+/// The payload remains borrowed from that immutable datagram, never copied again.
+struct PendingVoice {
+    packet: Datagram,
+    header: VoicePacket<'static>,
+    payload_start: usize,
+}
+impl PendingVoice {
+    fn voice(&self) -> VoicePacket<'_> {
+        VoicePacket {
+            payload: &self.packet.payload()[self.payload_start..],
+            ..self.header
+        }
+    }
+}
+
 /// Exactly one serial worker owns this object. Host notification occurs only after
 /// ending its mutable borrow. The PCM sink only publishes to the existing product
 /// ring; it must not reenter this owner. Outgoing encoding remains independently owned.
@@ -70,7 +86,7 @@ pub struct Receiver {
     playout: Playout,
     codecs: CodecChoice,
     talker: TalkerPort,
-    pending: Option<Datagram>,
+    pending: Option<PendingVoice>,
     granted: bool,
     selected: bool,
     ending: bool,
@@ -108,7 +124,7 @@ impl Receiver {
             codec: self.codec(),
             selected: self.selected,
             retained_age_ms: self.pending.as_ref().map_or(0, |packet| {
-                crate::session::ms(now.saturating_duration_since(packet.arrived()))
+                crate::session::ms(now.saturating_duration_since(packet.packet.arrived()))
             }),
             stale_packets: self.stale_packets,
             malformed_packets: self.malformed_packets,
@@ -229,6 +245,7 @@ impl Receiver {
                 return Ok(Incoming::Ignored);
             }
         }
+        let mut retained = None;
         let input = match &wire {
             WirePacket::Control(ControlPacket::Sdes {
                 source, callsign, ..
@@ -247,6 +264,13 @@ impl Receiver {
                     self.malformed_packets = self.malformed_packets.saturating_add(1);
                     return Ok(Incoming::Ignored);
                 }
+                retained = Some((
+                    VoicePacket {
+                        payload: &[],
+                        ..*voice
+                    },
+                    packet.payload().len() - voice.payload.len(),
+                ));
                 Packet::Voice { source: voice.ssrc }
             }
             WirePacket::Chat { .. } => Packet::Chat,
@@ -277,7 +301,13 @@ impl Receiver {
         if action == Some(QsoAction::Voice) {
             match self.talker.offer(packet.arrived()) {
                 Ok(()) => {
-                    self.pending = Some(packet);
+                    // QsoAction::Voice is produced only for this validated input.
+                    let (header, payload_start) = retained.unwrap();
+                    self.pending = Some(PendingVoice {
+                        packet,
+                        header,
+                        payload_start,
+                    });
                     return Ok(Incoming::Retained);
                 }
                 Err(OfferError::Full) => return Ok(Incoming::Ignored),
@@ -322,13 +352,10 @@ impl Receiver {
                 self.playout.reset()?;
                 self.ending = false;
             }
-            let packet = self.pending.as_ref().ok_or(MediaError::Contract)?;
-            let WirePacket::Voice(voice) =
-                parse_datagram(packet.class(), packet.payload()).map_err(MediaError::Wire)?
-            else {
-                return Err(MediaError::Contract);
-            };
-            match self.playout.receive(voice, packet.arrived())? {
+            // A grant belongs to the one retained Voice input until admission.
+            let packet = self.pending.as_ref().unwrap();
+            let voice = packet.voice();
+            match self.playout.receive(voice, packet.packet.arrived())? {
                 Reception::Busy => {}
                 Reception::Invalid => return Err(MediaError::Contract),
                 Reception::Admitted(_) => {
@@ -405,3 +432,7 @@ impl Receiver {
         .min()
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/receive_policy.rs"]
+mod tests;

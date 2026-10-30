@@ -4,7 +4,7 @@ use rptadv_codec_client::{CodecCatalog, ProfileId, ProviderSelection};
 use rptadv_echolink::{
     account::{Account, coordination::Coordinator},
     directory::DirectorySnapshot,
-    media::{CodecChoice, Packetizer},
+    media::{CodecChoice, MediaError, Packetizer},
     playout::{PcmSink, Playout},
     receive::{Incoming, Receiver},
     session::{Cause, Qso, QsoAction, QsoEvent, QsoState, Timers},
@@ -23,6 +23,9 @@ struct Providers {
     _jitter: Library,
     descriptor: *const c_void,
 }
+
+#[path = "support/codec_fault.rs"]
+mod codec_fault;
 impl Providers {
     fn new() -> Self {
         let path = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
@@ -225,6 +228,12 @@ fn incoming_initial_sdes_establishes_once_without_waiting_for_another_heartbeat(
             panic!("fixture must pass real directory routing");
         };
         let mut wrong = initial.clone();
+        wrong.source = "[::1]:5199".parse().unwrap();
+        assert_eq!(receiver.initial(&wrong), None);
+        wrong = initial.clone();
+        wrong.control = ControlPacket::Report { source: 42 };
+        assert_eq!(receiver.initial(&wrong), None);
+        wrong = initial.clone();
         wrong.source = "192.0.2.2:5199".parse().unwrap();
         assert_eq!(receiver.initial(&wrong), None);
         assert_eq!(receiver.state(), QsoState::Connecting);
@@ -266,6 +275,10 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
             Incoming::Retained
         ));
         assert!(!receiver.can_receive());
+        assert!(matches!(
+            receiver.packet(datagram(generation, Channel::Audio, now, bytes)),
+            Err(MediaError::Contract)
+        ));
         assert!(
             matches!(
                 receiver
@@ -341,6 +354,12 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
         );
         receiver.poll(later, true, &mut sink).unwrap();
         assert_eq!(receiver.state(), QsoState::Closed);
+        assert!(matches!(
+            receiver
+                .packet(datagram(generation, Channel::Audio, later, bytes))
+                .unwrap(),
+            Incoming::Ignored
+        ));
     });
 }
 
@@ -401,6 +420,257 @@ fn suppressed_and_invalid_media_never_reach_pcm_or_selected_activity() {
         );
         assert_eq!(receiver.state(), QsoState::Closed);
         assert_eq!(sink.samples, 0);
+        assert_eq!(sink.gaps, 0);
+    });
+}
+
+#[test]
+fn invalid_addresses_and_talker_queue_limits_do_not_publish_receive_audio() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        let (sender, mut input) = mailbox::channel(generation).unwrap();
+        sender
+            .try_push(
+                Channel::Control,
+                "[::1]:5199".parse().unwrap(),
+                now,
+                &sdes(),
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.packet(input.try_recv().unwrap()).unwrap(),
+            Incoming::Ignored
+        ));
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        let mut ports: Vec<_> = (100..104)
+            .map(|node| coordinator.port(node, 1, Arc::new(Control::default())))
+            .collect();
+        for port in &mut ports {
+            port.offer(now).unwrap();
+        }
+        assert!(matches!(
+            receiver
+                .packet(datagram(
+                    generation,
+                    Channel::Audio,
+                    now,
+                    &encoder.packet().unwrap().bytes
+                ))
+                .unwrap(),
+            Incoming::Ignored
+        ));
+        coordinator.close();
+        assert!(matches!(
+            receiver.packet(datagram(
+                generation,
+                Channel::Audio,
+                now,
+                &encoder.packet().unwrap().bytes
+            )),
+            Err(MediaError::Contract)
+        ));
+        assert!(!receiver.observe(now).unwrap().selected);
+    });
+}
+
+#[test]
+fn lost_account_control_preserves_the_selected_tail_until_product_completion() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        receiver
+            .packet(datagram(
+                generation,
+                Channel::Audio,
+                now,
+                &encoder.packet().unwrap().bytes,
+            ))
+            .unwrap();
+        coordinator.service().await;
+        receiver.control(QsoEvent::TransportLost, now);
+        coordinator.close();
+        let mut sink = Sink::default();
+        assert_eq!(
+            receiver.poll(now, false, &mut sink).unwrap().activity,
+            Some(true)
+        );
+        assert_eq!(receiver.poll(now, false, &mut sink).unwrap().activity, None);
+        assert_eq!(receiver.state(), QsoState::Closing);
+        let later = now + Duration::from_millis(400);
+        sink.limit = 37;
+        for _ in 0..40 {
+            assert_eq!(
+                receiver.poll(later, false, &mut sink).unwrap().activity,
+                None
+            );
+        }
+        assert_eq!(sink.samples, 640);
+        assert_eq!(receiver.state(), QsoState::Closing);
+        assert_eq!(
+            receiver.poll(later, true, &mut sink).unwrap().activity,
+            Some(false)
+        );
+        assert_eq!(receiver.state(), QsoState::Closed);
+        assert_eq!(
+            receiver.poll(later, true, &mut sink).unwrap().activity,
+            None
+        );
+    });
+}
+
+#[test]
+fn vanished_talker_control_returns_a_contract_error_before_or_after_grant() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        for granted in [false, true] {
+            let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+            receiver
+                .packet(datagram(generation, Channel::Control, now, &sdes()))
+                .unwrap();
+            let mut encoder =
+                Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+            encoder.push(&[0.1; 640]).unwrap();
+            receiver
+                .packet(datagram(
+                    generation,
+                    Channel::Audio,
+                    now,
+                    &encoder.packet().unwrap().bytes,
+                ))
+                .unwrap();
+            if granted {
+                coordinator.service().await;
+            }
+            drop(coordinator);
+            assert!(matches!(
+                receiver.poll(now, false, &mut Sink::default()),
+                Err(MediaError::Contract)
+            ));
+            assert_eq!(receiver.state(), QsoState::Connected);
+        }
+    });
+}
+
+#[test]
+fn codec_inspection_failure_never_becomes_selected_audio() {
+    run(async {
+        let fault = codec_fault::FaultCodec::new(ProfileId::GsmFr);
+        let mut providers = Providers::new();
+        providers.catalog = fault.catalog();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        let bytes = &encoder.packet().unwrap().bytes;
+        fault.select(1);
+        assert!(matches!(
+            receiver.packet(datagram(generation, Channel::Audio, now, bytes)),
+            Err(MediaError::Provider(_))
+        ));
+        fault.select(6);
+        assert!(matches!(
+            receiver
+                .packet(datagram(generation, Channel::Audio, now, bytes))
+                .unwrap(),
+            Incoming::Ignored
+        ));
+        fault.select(0);
+        assert!(matches!(
+            receiver
+                .packet(datagram(generation, Channel::Audio, now, bytes))
+                .unwrap(),
+            Incoming::Retained
+        ));
+        coordinator.service().await;
+        fault.select(6); // Foreign inspection changed after initial validation.
+        assert!(matches!(
+            receiver.poll(now, false, &mut Sink::default()),
+            Err(MediaError::Contract)
+        ));
+        assert_eq!(fault.calls(false), 0);
+    });
+}
+
+#[test]
+fn reordered_voice_and_blocked_pcm_keep_the_original_retained_input() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut sink = Sink::default();
+        let mut blocked = false;
+        for (index, (millis, sequence)) in [(0, 10), (20, 12), (40, 11), (200, 13)]
+            .into_iter()
+            .enumerate()
+        {
+            let arrived = now + Duration::from_millis(millis);
+            if index == 3 {
+                receiver.poll(arrived, false, &mut sink).unwrap();
+            }
+            let mut encoder =
+                Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, sequence, 42).unwrap();
+            encoder.push(&[0.1; 640]).unwrap();
+            assert!(matches!(
+                receiver
+                    .packet(datagram(
+                        generation,
+                        Channel::Audio,
+                        arrived,
+                        &encoder.packet().unwrap().bytes
+                    ))
+                    .unwrap(),
+                Incoming::Retained
+            ));
+            coordinator.service().await;
+            receiver.poll(arrived, false, &mut sink).unwrap();
+            coordinator.service().await; // Each new grant publishes its drain state.
+            if !receiver.can_receive() {
+                blocked = true;
+                sink.limit = 37;
+                for _ in 0..64 {
+                    receiver.poll(arrived, false, &mut sink).unwrap();
+                    if receiver.can_receive() {
+                        break;
+                    }
+                }
+                assert!(
+                    receiver.can_receive(),
+                    "retained packet did not resume: index={index} samples={} gaps={} jitter={:?}",
+                    sink.samples,
+                    sink.gaps,
+                    receiver.observe(arrived).unwrap().jitter
+                );
+                sink.limit = 0;
+            }
+        }
+        assert!(blocked, "the fixture must exercise actual PCM backpressure");
+        assert_eq!(receiver.observe(now).unwrap().out_of_order_packets, 1);
+        sink.limit = 37;
+        let later = now + Duration::from_millis(700);
+        for _ in 0..150 {
+            receiver.poll(later, false, &mut sink).unwrap();
+        }
+        assert!(receiver.can_receive());
+        assert_eq!(sink.samples, 2560);
         assert_eq!(sink.gaps, 0);
     });
 }
