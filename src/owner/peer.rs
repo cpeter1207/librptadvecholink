@@ -27,6 +27,10 @@ use std::{
 };
 use tokio::runtime::Handle;
 
+#[cfg(test)]
+#[path = "../../tests/unit/owner_peer.rs"]
+mod tests;
+
 pub(super) struct Prepared {
     ingress: Consumer,
     initial: Option<PendingHandshake>,

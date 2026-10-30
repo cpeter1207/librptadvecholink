@@ -38,6 +38,11 @@ impl DirectSockets {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_socket(&self, class: Channel) -> &UdpSocket {
+        self.socket(class)
+    }
+
     /// Actual bound endpoint, including the kernel-selected port in isolated tests.
     pub fn local_addr(&self, class: Channel) -> io::Result<SocketAddr> {
         self.socket(class).local_addr()
@@ -81,10 +86,6 @@ impl DirectSockets {
 }
 
 #[cfg(test)]
-#[path = "../../tests/support/settings.rs"]
-mod settings_fixture;
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -92,7 +93,7 @@ mod tests {
             network::{AccountNetwork, NetworkEvent},
             settings::PreparedSettings,
         },
-        transport::direct::settings_fixture::{secrets, settings, span},
+        settings_fixture::{secrets, settings, span},
     };
     use std::{sync::Arc, time::Duration};
 

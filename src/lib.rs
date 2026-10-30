@@ -4,6 +4,9 @@
 
 #[cfg(test)]
 extern crate self as rptadv_echolink;
+#[cfg(test)]
+#[path = "../tests/support/settings.rs"]
+mod settings_fixture;
 
 pub mod account;
 pub mod directory;
