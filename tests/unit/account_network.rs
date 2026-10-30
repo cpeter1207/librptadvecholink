@@ -291,7 +291,8 @@ async fn pending_dials_share_finite_credit_and_revalidate_before_publication() {
         harness.control.remove(123456, 1),
         Err(NetworkError::Stopped)
     );
-    drop(harness.control);
+    // Retain the stop sender: only the closed command receiver should wake
+    // recovery, not a simultaneous stop notification from dropping Control.
     assert!(!harness.owner.recover_proxy(ProxyError::Closed).await);
     assert_eq!(
         pending.await.unwrap().err(),
