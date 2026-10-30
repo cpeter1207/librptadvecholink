@@ -96,6 +96,9 @@ fn valid_bye_reason_padding_need_not_leave_a_word_aligned_body() {
 #[test]
 fn control_padding_identity_and_compound_ambiguity_are_rejected() {
     for fixture in [
+        "81ca00020000000700000001", // SDES END has a nonzero tail.
+        "00c9000100000007",         // Unsupported RTP version.
+        "80c90000",                 // Complete RTCP header, truncated receiver report body.
         // Padding is allowed only on the final compound member.
         "c0c9000100000000e1cb00020000000100000003c0c9000100000000",
         "e1cb000100000001",         // Padding steals a source identifier byte.
@@ -129,6 +132,12 @@ fn control_padding_identity_and_compound_ambiguity_are_rejected() {
         parse_datagram(Channel::Control, &compound),
         Ok(WirePacket::Control(ControlPacket::Report { source: 7 }))
     );
+    let mut report = [0; 8];
+    assert_eq!(
+        write_control(&ControlPacket::Report { source: 7 }, &mut report),
+        Ok(8)
+    );
+    assert_eq!(report, [0xc0, 0xc9, 0, 1, 0, 0, 0, 7]);
 }
 
 #[test]

@@ -67,7 +67,21 @@ struct Binding {
     live: AtomicBool,
     // Attach/publication gate only; weak entries never prolong a QSO/runtime.
     drivers: Mutex<Vec<Weak<crate::transport::driver::PeerDriver>>>,
-    first_failure: Mutex<Option<NetworkError>>,
+    first_failure: Mutex<Option<TransportFailure>>,
+}
+/// Only terminal transport events enter retained account-close diagnostics.
+#[derive(Clone, Copy)]
+enum TransportFailure {
+    Io(std::io::ErrorKind),
+    Proxy(crate::transport::proxy::ProxyError),
+}
+impl std::fmt::Debug for TransportFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => formatter.debug_tuple("Io").field(error).finish(),
+            Self::Proxy(error) => formatter.debug_tuple("Proxy").field(error).finish(),
+        }
+    }
 }
 struct Peer {
     identity: DirectoryEntry,
@@ -520,15 +534,17 @@ async fn bridge(
                 }
             }
             NetworkEvent::TransportLost(error) => {
-                binding.failure(NetworkError::Io(error), callback)
+                binding.failure(TransportFailure::Io(error), callback)
             }
-            NetworkEvent::ProxyLost(error) => binding.failure(NetworkError::Proxy(error), callback),
+            NetworkEvent::ProxyLost(error) => {
+                binding.failure(TransportFailure::Proxy(error), callback)
+            }
         }
     }
 }
 
 impl Binding {
-    fn failure(&self, error: NetworkError, callback: Option<Callback>) {
+    fn failure(&self, error: TransportFailure, callback: Option<Callback>) {
         if let Ok(mut first) = self.first_failure.lock() {
             first.get_or_insert(error);
         }

@@ -1,6 +1,6 @@
 //! Metadata copies on their existing owners, never on a radio callback.
-use super::{Account, ffi, network_status};
-use crate::account::{directory::DirectoryState, network::NetworkError};
+use super::{Account, TransportFailure, ffi, network_status};
+use crate::account::directory::DirectoryState;
 use std::{fmt::Debug, mem::size_of, ptr, sync::atomic::Ordering};
 
 /// Validate the readable prefix before forming a reference to the whole output.
@@ -21,6 +21,15 @@ pub(super) fn detail(error: &impl Debug) -> [u8; 32] {
         };
     }
     result
+}
+impl TransportFailure {
+    /// Stable copied categories; their payloads are typed local errors only.
+    fn code(self) -> u64 {
+        match self {
+            Self::Io(_) => 1,
+            Self::Proxy(_) => 2,
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn account_observe(
@@ -76,11 +85,7 @@ pub(crate) unsafe extern "C" fn account_observe(
         };
         if let Some(error) = first {
             result.state = 7;
-            result.first_cause = match error {
-                NetworkError::Io(_) => 1,
-                NetworkError::Proxy(_) => 2,
-                _ => 3,
-            };
+            result.first_cause = error.code();
             result.cause_detail = detail(&error);
         } else if binding.live.load(Ordering::Acquire) {
             let observed = match account.runtime.block_on(binding.control.observe()) {
@@ -129,4 +134,86 @@ pub(crate) unsafe extern "C" fn account_observe(
     }
     unsafe { ptr::write(output_record, result) };
     ffi::Status::Ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fmt, sync::Arc};
+
+    struct Category<'a>(&'a str);
+    impl Debug for Category<'_> {
+        fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
+            output.write_str(self.0)
+        }
+    }
+
+    #[test]
+    fn categories_are_ascii_bounded_and_null_terminated() {
+        for (error, code, prefix) in [
+            (
+                TransportFailure::Io(std::io::ErrorKind::BrokenPipe),
+                1,
+                b"Io(".as_slice(),
+            ),
+            (
+                TransportFailure::Proxy(crate::transport::proxy::ProxyError::Closed),
+                2,
+                b"Proxy(".as_slice(),
+            ),
+        ] {
+            assert_eq!(error.code(), code);
+            assert!(detail(&error).starts_with(prefix));
+        }
+        let unusual = detail(&Category("A \n\t\u{7f}é"));
+        assert_eq!(&unusual[..7], b"A ?????");
+        assert!(unusual[7..].iter().all(|byte| *byte == 0));
+        let maximum = detail(&Category(&"X".repeat(50)));
+        assert_eq!(&maximum[..31], &[b'X'; 31]);
+        assert_eq!(maximum[31], 0);
+    }
+
+    #[test]
+    fn disabled_stopped_and_poisoned_accounts_have_explicit_observations() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let account = Account::new(Arc::clone(&runtime), None, None);
+        let pointer = ptr::from_ref(&account).cast::<ffi::Account>();
+        let mut result = ffi::AccountObservation {
+            struct_size: size_of::<ffi::AccountObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { account_observe(pointer, &mut result) },
+            ffi::Status::Ok
+        );
+        assert_eq!(
+            (result.state, result.available, result.generation),
+            (6, 0, 0)
+        );
+        assert_eq!(
+            runtime.block_on(async { unsafe { account_observe(pointer, &mut result) } }),
+            ffi::Status::Invalid
+        );
+        account.state.lock().unwrap().stopped = true;
+        assert_eq!(
+            unsafe { account_observe(pointer, &mut result) },
+            ffi::Status::Ok
+        );
+        assert_eq!((result.state, result.available), (5, 0));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = account.state.lock().unwrap();
+            panic!("intentional test-only poisoned account owner");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(
+            unsafe { account_observe(pointer, &mut result) },
+            ffi::Status::Failed
+        );
+    }
 }

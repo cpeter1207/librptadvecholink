@@ -166,18 +166,16 @@ pub(crate) unsafe extern "C" fn peer_attach(
         Ok(encoder) => encoder,
         Err(_) => return Status::Failed,
     };
-    let codecs = match CodecChoice::new(resources.catalog()) {
-        Ok(codecs) => codecs,
-        Err(_) => return Status::Failed,
-    };
-    let Some(qso_state) = Qso::new(
+    // Startup validated the immutable catalog; admission validated the positive
+    // generation and prepared settings validated every timer.
+    let codecs = CodecChoice::new(resources.catalog()).expect("startup validated GSM");
+    let qso_state = Qso::new(
         peer.identity.clone(),
         peer.generation,
         timers(policy),
         peer.created,
-    ) else {
-        return Status::Invalid;
-    };
+    )
+    .expect("admission validated generation and timers");
     let mut receiver = Receiver::new(qso_state, playout, codecs, prepared.talker);
     if let Some(initial) = &prepared.initial {
         receiver.initial(initial);
@@ -226,7 +224,8 @@ pub(crate) unsafe extern "C" fn peer_attach(
                 return None;
             }
             {
-                let serial = unsafe { (*active.serial.get()).as_mut() }?;
+                let serial =
+                    unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
                 serial.event(&active, event);
             }
             if callback.call() < 0 {
@@ -236,7 +235,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
                 return None;
             }
             // End all prior borrows before callback.call: it may reenter this QSO.
-            let serial = unsafe { (*active.serial.get()).as_mut() }?;
+            let serial = unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
             let now = Instant::now();
             serial.flush_control(&active);
             Some(PeerWait {
@@ -374,8 +373,9 @@ impl Serial {
                         });
                         Status::Full
                     }
-                    Err(QueueError::Invalid) => Status::Invalid,
-                    Err(QueueError::Closed) => Status::Closed,
+                    // All callers pass serialized, bounded UDP records. Invalid
+                    // input cannot occur here; other terminal failures close.
+                    Err(_) => Status::Closed,
                 }
             }
         }
@@ -385,16 +385,10 @@ impl Serial {
         let settings = peer.binding.current.load_full();
         if !Arc::ptr_eq(&self.settings, &settings) {
             let policy = &settings.as_abi().policy;
-            if let Err(error) = self
-                .receiver
+            self.receiver
                 .reconfigure(policy.receive_gain_db, timers(policy))
                 .and_then(|_| self.encoder.set_gain(policy.transmit_gain_db))
-            {
-                self.remember(&error);
-                let action = self.receiver.control(QsoEvent::OwnerFailed, Instant::now());
-                self.action(peer, action);
-                return;
-            }
+                .expect("prepared finite gains and positive timers");
             self.settings = settings;
         }
         if self
@@ -880,10 +874,9 @@ pub(crate) unsafe extern "C" fn peer_set_deadline(qso: *mut ffi::Qso, relative: 
     serial.deadline = if relative == u64::MAX {
         None
     } else {
-        let Some(deadline) = Instant::now().checked_add(Duration::from_nanos(relative)) else {
-            return Status::Invalid;
-        };
-        Some(deadline)
+        // On supported 64-bit Linux, even u64 nanoseconds (<585 years) fits
+        // the signed-seconds monotonic representation.
+        Some(Instant::now() + Duration::from_nanos(relative))
     };
     Status::Ok
 }

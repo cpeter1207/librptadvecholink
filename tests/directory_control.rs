@@ -403,6 +403,15 @@ fn ordered_server_failover_obeys_retry_deadlines_and_ignores_old_completions() {
     );
     assert_eq!(owner.state(), DirectoryState::Retrying);
     let later = now + Duration::from_secs(10);
+    // A no-op reload must retain both the selected retry server and deadline.
+    assert!(owner.reconfigure(
+        vec![
+            "first.example.invalid".into(),
+            "second.example.invalid".into()
+        ],
+        policy(),
+        false
+    ));
     let status = owner.observe(later);
     assert_eq!(status.state, DirectoryState::Retrying);
     assert!(!status.registered);
