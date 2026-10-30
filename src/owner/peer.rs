@@ -222,7 +222,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         Arc::clone(&peer.control),
         prepared.ingress,
         move |event| {
-            if !active.live() {
+            if active.control.is_stopped() {
                 return None;
             }
             {
@@ -232,7 +232,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
             if callback.call() < 0 {
                 return None;
             }
-            if !active.live() {
+            if active.control.is_stopped() {
                 return None;
             }
             // End all prior borrows before callback.call: it may reenter this QSO.
@@ -473,7 +473,9 @@ pub(crate) unsafe extern "C" fn peer_read(
     {
         return Status::Invalid;
     }
-    if !peer.live() {
+    // A failed account still owes its attached host a final source turn;
+    // explicit lifecycle retirement alone makes the serial state unreadable.
+    if peer.control.is_stopped() {
         return Status::Closed;
     }
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
@@ -867,7 +869,8 @@ pub(crate) unsafe extern "C" fn peer_set_deadline(qso: *mut ffi::Qso, relative: 
     let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
         return Status::Invalid;
     };
-    if !peer.live() {
+    // Downstream credit/drain deadlines remain valid after transport loss.
+    if peer.control.is_stopped() {
         return Status::Closed;
     }
     // Serialized host operation only, never a radio callback or concurrent control call.

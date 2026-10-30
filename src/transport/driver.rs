@@ -26,6 +26,7 @@ pub struct Control {
     notify: Notify,
     pending: AtomicBool,
     close: AtomicBool,
+    failed: AtomicBool,
 }
 
 impl Default for Control {
@@ -35,6 +36,7 @@ impl Default for Control {
             notify: Notify::new(),
             pending: AtomicBool::new(false),
             close: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
         }
     }
 }
@@ -48,6 +50,13 @@ impl Control {
     /// Inspect teardown on a non-audio owner; shutdown never implies packet loss.
     pub fn is_stopped(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    /// Account transport failure must reach a peer even while its input is
+    /// backpressured. Unlike stop, this preserves the finite-media owner.
+    pub(crate) fn transport_lost(&self) {
+        self.failed.store(true, Ordering::Release);
+        self.notify.notify_one();
     }
 
     /// Ask the serial QSO owner to send BYE and drain accepted media. This is
@@ -79,7 +88,8 @@ pub enum PeerEvent {
     Deadline,
     /// A previously unready socket can be retried with the same prepared bytes.
     Writable,
-    /// Readiness failed; preserve the category rather than inventing a generic hangup.
+    /// Readiness or unexpected ingress closure failed; deliver the terminal
+    /// turn before retiring the host's finite media. Explicit stop remains a barrier.
     Io(io::ErrorKind),
 }
 
@@ -155,13 +165,16 @@ impl PeerDriver {
         let task = runtime.spawn(async move {
             let mut event = PeerEvent::Wake;
             let mut turns = 0;
+            let mut receive_open = true;
             loop {
                 // End the watch borrow before a callback can reenter Control::stop.
                 let stopped = *stopping.borrow();
                 if stopped {
                     break;
                 }
-                if active.close.swap(false, Ordering::AcqRel) {
+                if active.failed.swap(false, Ordering::AcqRel) {
+                    event = PeerEvent::Io(io::ErrorKind::BrokenPipe);
+                } else if active.close.swap(false, Ordering::AcqRel) {
                     event = PeerEvent::Close;
                 }
                 active.pending.store(false, Ordering::Release);
@@ -175,9 +188,12 @@ impl PeerDriver {
                 }
                 event = tokio::select! {
                     _ = stopping.changed() => break,
-                    packet = consumer.recv(), if wait.receive => match packet {
+                    packet = consumer.recv(), if wait.receive && receive_open => match packet {
                         Some(packet) => PeerEvent::Packet(packet),
-                        None => break,
+                        None => {
+                            receive_open = false;
+                            PeerEvent::Io(io::ErrorKind::BrokenPipe)
+                        },
                     },
                     _ = active.notify.notified() => PeerEvent::Wake,
                     _ = async {

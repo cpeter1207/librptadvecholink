@@ -367,6 +367,15 @@ impl Receiver {
         if self.selected {
             match self.talker.report_drained(drained) {
                 Ok(()) | Err(OfferError::Full) => {}
+                // The account owner cannot arbitrate after transport loss.
+                // Its selected QSO still owns the exact downstream tail and
+                // releases that activity locally only after the finite token.
+                Err(OfferError::Closed) if self.qso.state() == QsoState::Closing => {
+                    if drained {
+                        self.selected = false;
+                        activity = Some(false);
+                    }
+                }
                 Err(_) => return Err(MediaError::Contract),
             }
             if self.talker.take_unkey() {

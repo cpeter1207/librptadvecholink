@@ -562,6 +562,7 @@ impl Owner {
             // A permanently ready socket/command queue cannot monopolize the executor.
             tokio::task::yield_now().await;
         }
+        let failed = terminal.is_some();
         if let Some(event) = terminal {
             // This account has stopped routing. Retain its first cause behind
             // ordinary health events, but never prevent lifecycle quiescence.
@@ -574,7 +575,13 @@ impl Owner {
         self.commands.close();
         for ((node, generation), peer) in std::mem::take(&mut self.peers) {
             self.coordinator.remove(node, generation);
-            peer.stop();
+            // Failure wakes even a backpressured peer so its host can finish
+            // finite media. Only requested shutdown cancels the serial owner.
+            if failed {
+                peer.transport_lost();
+            } else {
+                peer.stop();
+            }
         }
         self.coordinator.close();
         if let Ok(Some(job)) = self.directory.stop() {
