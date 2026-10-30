@@ -23,6 +23,9 @@ fn encoded() -> rptadv_codec_client::EncodeResultRaw {
 /// # Safety
 /// QSO is live but has not been attached. The caller owns context and QSO.
 pub unsafe fn before_attach(api: &Descriptor, context: *mut Context, qso: *mut Qso) -> usize {
+    unsafe extern "C" fn no_work(_: *mut std::ffi::c_void) -> i32 {
+        -1
+    }
     let mut read = ReadResult::default();
     let mut result = encoded();
     let mut registration = ptr::dangling_mut();
@@ -32,6 +35,44 @@ pub unsafe fn before_attach(api: &Descriptor, context: *mut Context, qso: *mut Q
         ..unsafe { std::mem::zeroed() }
     };
     let mut errors = rejected([unsafe { api.peer_info.unwrap()(qso, ptr::null_mut()) }]);
+    // A real owner from another runtime cannot adopt this account's QSO.
+    let mut other = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            api.context_create.unwrap()(
+                &RuntimeConfig {
+                    worker_threads: 1,
+                    ..Default::default()
+                },
+                &mut other,
+            )
+        },
+        Status::Ok
+    );
+    errors += rejected([unsafe {
+        api.peer_attach.unwrap()(
+            other,
+            qso,
+            Some(no_work),
+            ptr::null_mut(),
+            &mut registration,
+        )
+    }]);
+    unsafe { api.context_destroy.unwrap()(other) };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    errors += rejected([runtime.block_on(async {
+        unsafe {
+            api.peer_attach.unwrap()(
+                context,
+                qso,
+                Some(no_work),
+                ptr::null_mut(),
+                &mut registration,
+            )
+        }
+    })]);
     for (size, abi) in [(0, 1), (size_of::<PeerInfo>() as u32, 2)] {
         info.struct_size = size;
         info.abi_version = abi;
