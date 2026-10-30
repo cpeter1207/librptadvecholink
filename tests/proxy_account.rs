@@ -740,6 +740,58 @@ fn failed_negotiated_speex_upgrade_closes_with_owner_failure_not_transport_loss(
     socket.shutdown(Shutdown::Both).unwrap();
 }
 
+#[test]
+fn attached_peer_reports_setup_and_liveness_expiry_without_failing_its_account() {
+    for connected in [false, true] {
+        let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+        let context = context::resource_context(api);
+        let _context = ContextOwner(api, context);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || registered(&listener));
+        let servers = [span("127.0.0.1")];
+        let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+        config.transport.kind = 1;
+        config.transport.proxy_host = span("127.0.0.1");
+        config.transport.proxy_port = port;
+        config.policy.heartbeat_interval_ms = 20;
+        config.policy.connect_timeout_ms = 100;
+        config.policy.heartbeat_timeout_ms = 100;
+        let account = prepare(api, context, &config);
+        assert_eq!(
+            unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+            Status::Ok
+        );
+        let mut socket = server.join().unwrap();
+        let fixture = attach(api, context, account, false, None);
+        fixture.trace.drained.store(true, Ordering::Release);
+        assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 0));
+        if connected {
+            send_sdes(&mut socket, false);
+            assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 1));
+        }
+        assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 3));
+        assert_eq!(
+            fixture.trace.cause.load(Ordering::Acquire),
+            if connected { 4 } else { 3 }
+        );
+        assert_eq!(fixture.trace.errors.load(Ordering::Acquire), 0);
+        assert_eq!(fixture.trace.pcm.load(Ordering::Acquire), 0);
+        let mut health = AccountObservation {
+            struct_size: size_of::<AccountObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { api.account_observe.unwrap()(account, &mut health) },
+            Status::Ok
+        );
+        assert_eq!(health.available, 1);
+        assert_eq!(health.first_cause, 0);
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
+}
+
 fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
