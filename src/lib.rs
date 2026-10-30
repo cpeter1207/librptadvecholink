@@ -1,4 +1,5 @@
 //! Versioned EchoLink provider boundary, independent of Asterisk and radio I/O.
+//! The complete descriptor publishes lifecycle, network, prepared media and text.
 #![deny(missing_docs)]
 
 pub mod account;
@@ -37,7 +38,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     struct_size: size_of::<Descriptor>() as u32,
     abi_version: 1,
     capability: *b"rptadv.echolink.v1\0\0\0\0\0\0",
-    capabilities: 1,
+    capabilities: 15,
     context_create: Some(context_create),
     context_destroy: Some(context_destroy),
     account_prepare: Some(account_prepare),

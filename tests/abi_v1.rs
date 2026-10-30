@@ -6,17 +6,19 @@ use rptadv_echolink::{
 use std::{mem::size_of, ptr};
 
 #[test]
-fn descriptor_exposes_a_sized_versioned_lifecycle() {
+fn descriptor_exposes_the_complete_sized_network_media_and_text_groups() {
     // SAFETY: descriptor storage has process lifetime.
     let api = unsafe { &*rptadv_echolink_descriptor_v1() };
     assert_eq!(api.struct_size as usize, size_of::<Descriptor>());
     assert_eq!(api.abi_version, 1);
     assert_eq!(&api.capability[..19], b"rptadv.echolink.v1\0");
-    assert_eq!(api.capabilities, 1); // lifecycle only until network work is implemented.
-    assert!(api.account_activate.is_some()); // Complete network group remains unpublished.
+    assert_eq!(api.capabilities, 15);
+    assert!(api.account_activate.is_some());
     assert!(api.account_apply_prepared.is_some());
     let client = unsafe { rptadv_peer_support::echolink::Api::open(api) }.unwrap();
-    assert!(!client.network_available());
+    assert!(client.network_available());
+    assert!(client.prepared_media_available());
+    assert!(client.text_available());
 }
 
 #[test]

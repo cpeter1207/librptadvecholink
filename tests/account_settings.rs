@@ -678,6 +678,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         );
         assert_ne!(identity.account_generation, 0);
         assert_ne!(identity.qso_generation, 0);
+        let peer_capabilities = identity.capabilities;
         assert_eq!(
             unsafe { std::slice::from_raw_parts(identity.callsign.data, identity.callsign.length) },
             b"W1XYZ-R"
@@ -826,5 +827,9 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         server.join().unwrap();
         // Evaluate new diagnostic assertions only after every callback barrier.
         assert_eq!(serial.ingress_capacity.load(Ordering::Acquire), 64);
+        assert_eq!(
+            peer_capabilities, 14,
+            "the admitted QSO must expose its complete network/media/text group"
+        );
     }
 }

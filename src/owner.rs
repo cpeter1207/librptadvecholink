@@ -682,7 +682,7 @@ pub(crate) unsafe extern "C" fn peer_info(qso: *const ffi::Qso, output: *mut Pee
         struct_size: size_of::<PeerInfo>() as u32,
         abi_version: 1,
         node_number: identity.node_number,
-        capabilities: 0,
+        capabilities: 14,
         account_generation: peer.binding.generation,
         qso_generation: peer.generation,
         callsign: ByteSpan {
