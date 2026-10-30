@@ -96,13 +96,10 @@ impl ProxyDecoder {
             let needed = if self.buffer.len() < 9 {
                 9
             } else {
-                match header(&self.buffer) {
-                    Ok((_, length)) => 9 + length,
-                    Err(error) => {
-                        self.buffer.clear();
-                        return Err(error);
-                    }
-                }
+                // A retained header already passed the check below; only its
+                // body can be incomplete. The private buffer cannot be mutated
+                // by emit, so revalidating this header has no error path.
+                9 + u32::from_le_bytes(self.buffer[5..9].try_into().unwrap()) as usize
             };
             let count = input.len().min(needed - self.buffer.len());
             self.buffer.extend_from_slice(&input[..count]);

@@ -21,6 +21,24 @@ fn directory(now: Instant) -> DirectorySnapshot {
 }
 
 #[test]
+fn empty_station_budget_and_zero_route_generation_cannot_admit() {
+    assert!(Account::new(0, vec![], vec![]).is_none());
+    let now = Instant::now();
+    let mut account = Account::new(1, vec![], vec![]).unwrap();
+    assert_eq!(
+        account.admit(
+            &directory(now),
+            "K1ABC-R",
+            Ipv4Addr::new(192, 0, 2, 1),
+            0,
+            now
+        ),
+        Err(Admission::Unverified)
+    );
+    assert_eq!(account.admitted(), 0);
+}
+
+#[test]
 fn delayed_voice_offers_cannot_rewind_the_selected_talkers_quiet_timer() {
     let now = Instant::now();
     let mut account = Account::new(20, vec![], vec![]).unwrap();

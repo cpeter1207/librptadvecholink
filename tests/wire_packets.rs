@@ -13,6 +13,44 @@ fn hex(text: &str) -> Vec<u8> {
 }
 
 #[test]
+fn outgoing_wire_profiles_reject_oversize_and_missing_identity_fields() {
+    use rptadv_echolink::wire::{MAX_CHAT_BYTES, MAX_DATAGRAM, write_chat};
+    for error in [
+        WireError::Malformed,
+        WireError::Unsupported,
+        WireError::TooLarge,
+        WireError::Capacity(12),
+    ] {
+        assert_eq!(error.to_string(), format!("EchoLink wire error: {error:?}"));
+    }
+    let mut output = vec![0xa5; MAX_DATAGRAM + 1];
+    let mut voice = VoicePacket {
+        codec: Codec::Speex,
+        marker: true,
+        sequence: 0,
+        timestamp: 0,
+        ssrc: 0,
+        payload: &vec![0; MAX_DATAGRAM],
+    };
+    assert_eq!(write_voice(&voice, &mut output), Err(WireError::TooLarge));
+    voice.payload = &[1];
+    voice.marker = false;
+    assert_eq!(write_voice(&voice, &mut output), Err(WireError::Malformed));
+    for (sender, body, error) in [
+        ("", "message", WireError::Malformed),
+        (&"X".repeat(65), "message", WireError::Malformed),
+        (
+            "N0CALL",
+            &"x".repeat(MAX_CHAT_BYTES + 1),
+            WireError::TooLarge,
+        ),
+    ] {
+        assert_eq!(write_chat(sender, body, &mut output), Err(error));
+    }
+    assert!(output.iter().all(|byte| *byte == 0xa5));
+}
+
+#[test]
 fn wire_reference_roundtrip() {
     let fixtures: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/echolib-control.json")).unwrap();

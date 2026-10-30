@@ -169,6 +169,7 @@ fn every_resolved_account_scalar_and_selected_transport_is_validated() {
         |c| c.node_number = 0,
         |c| c.local_node = span(""),
         |c| c.local_node = span("not-a-node"),
+        |c| c.local_node = span("123456789012345678901234567890123"),
         |c| c.callsign = span(""),
         |c| c.callsign = span("invalid+call"),
         |c| c.transport.directory_servers = StringList::default(),
