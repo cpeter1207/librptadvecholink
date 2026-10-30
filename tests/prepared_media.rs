@@ -81,6 +81,7 @@ fn finite_speex_flush_reports_only_real_input_and_finishes_without_endless_paddi
     media.upgrade_speex(&catalog).unwrap();
     let mut output = [0; 264];
     let first = media.prepare(&[0.1; 100], &mut output, true).unwrap();
+    media.upgrade_speex(&catalog).unwrap(); // Repeating a completed upgrade preserves coding state.
     assert_eq!(
         (
             first.consumed_frames,
@@ -136,4 +137,35 @@ fn bounded_but_inconsistent_encoder_results_cannot_be_sent_as_voice() {
         ));
         assert_eq!(fixture.calls(false), 0);
     }
+    let fixture = codec_fault::FaultCodec::new(ProfileId::GsmFr);
+    let catalog = fixture.catalog();
+    let mut packetizer =
+        rptadv_echolink::media::Packetizer::new(&catalog, Codec::GsmFr, 0.0, 7, 42).unwrap();
+    packetizer.push(&[0.1; 100]).unwrap();
+    fixture.select(10);
+    assert!(matches!(packetizer.finish(), Err(MediaError::Contract)));
+    assert!(
+        !packetizer.drained(),
+        "failed finite padding cannot count as played media"
+    );
+}
+
+#[test]
+fn finite_flush_waits_until_the_entire_offered_suffix_has_been_accepted() {
+    let catalog = catalog();
+    let mut media = PreparedMedia::new(&catalog, 0.0, 7, 42).unwrap();
+    let mut output = [0; 264];
+    let first = media.prepare(&[0.1; 1000], &mut output, true).unwrap();
+    assert_eq!((first.consumed_frames, first.source_frames), (640, 640));
+    let second = media.prepare(&[0.1; 360], &mut output, true).unwrap();
+    assert_eq!(
+        (
+            second.consumed_frames,
+            second.source_start_frames,
+            second.source_frames
+        ),
+        (360, 640, 360)
+    );
+    let end = media.prepare(&[], &mut output, true).unwrap();
+    assert_eq!((end.status, end.encoded_bytes), (Status::Complete, 0));
 }

@@ -74,7 +74,6 @@ pub struct Playout {
     pending: Option<Decision>,
     prefix: u32,
     remaining: u32,
-    decoded: bool,
     concealed: bool,
     pcm: [f32; FRAMES],
     position: usize,
@@ -132,7 +131,6 @@ impl Playout {
             pending: None,
             prefix: 0,
             remaining: 0,
-            decoded: false,
             concealed: false,
             pcm: [0.0; FRAMES],
             position: 0,
@@ -296,7 +294,6 @@ impl Playout {
                 0
             };
             self.remaining = decision.span;
-            self.decoded = false;
             self.pending = Some(decision);
         }
         if self.position == self.count && self.gap == 0 {
@@ -357,7 +354,9 @@ impl Playout {
             self.prefix -= span;
             return self.prepare_gap(span, true);
         }
-        if decision.kind == Kind::Packet && !self.decoded {
+        // A packet's sole decoded block retires this decision when consumed;
+        // only gap decisions may need multiple prepare calls after the prefix.
+        if decision.kind == Kind::Packet {
             self.last_codec = match self.encoded[0] {
                 0 => Codec::GsmFr,
                 1 => Codec::Speex,
@@ -397,7 +396,6 @@ impl Playout {
                     *sample *= self.gain;
                 }
             }
-            self.decoded = true;
             self.remaining = 0;
         } else {
             let span = self.remaining.min(FRAMES as u32);

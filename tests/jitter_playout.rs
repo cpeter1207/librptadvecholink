@@ -514,7 +514,7 @@ fn fatal_inspection_and_short_decode_cannot_publish_pcm() {
     let providers = Providers::new();
     let origin = Instant::now();
     let packets = providers.packets(Codec::GsmFr, 1, 1);
-    let mut playout =
+    let playout =
         unsafe { Playout::new(&catalog, Codec::GsmFr, 0.0, providers.descriptor, origin) }.unwrap();
     fixture.select(1);
     assert!(matches!(
@@ -522,23 +522,31 @@ fn fatal_inspection_and_short_decode_cannot_publish_pcm() {
         Err(MediaError::Provider(_))
     ));
     assert_eq!((fixture.calls(false), fixture.calls(true)), (0, 0));
-    fixture.select(0);
-    playout.receive(voice(&packets[0]), origin).unwrap();
-    fixture.select(4);
-    let mut sink = Sink {
-        limit: 640,
-        ..Sink::default()
-    };
-    let mut error = None;
-    for millisecond in 180..500 {
-        if let Err(found) = playout.poll(origin + Duration::from_millis(millisecond), &mut sink) {
-            error = Some(found);
-            break;
+    for fault in [4, 5] {
+        let mut playout =
+            unsafe { Playout::new(&catalog, Codec::GsmFr, 0.0, providers.descriptor, origin) }
+                .unwrap();
+        fixture.select(fault);
+        playout.receive(voice(&packets[0]), origin).unwrap();
+        let mut sink = Sink {
+            limit: 640,
+            ..Sink::default()
+        };
+        let mut error = None;
+        for millisecond in 180..500 {
+            if let Err(found) = playout.poll(origin + Duration::from_millis(millisecond), &mut sink)
+            {
+                error = Some(found);
+                break;
+            }
         }
+        assert!(matches!(
+            (fault, error),
+            (4, Some(MediaError::Contract)) | (5, Some(MediaError::Provider(_)))
+        ));
+        assert!(sink.audio.is_empty());
+        assert_eq!(sink.gaps, 0);
     }
-    assert!(matches!(error, Some(MediaError::Contract)));
-    assert!(sink.audio.is_empty());
-    assert_eq!(sink.gaps, 0);
 }
 
 // Script only the neutral capability's signed-offset decisions. Encoding, decoding and
@@ -740,6 +748,20 @@ mod offsets {
         }
         0
     }
+    unsafe extern "C" fn long_prefix(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            (*result).start_offset = 800;
+        }
+        0
+    }
     struct ExcessSink;
     impl PcmSink for ExcessSink {
         fn audio(&mut self, _: u64, samples: &[f32]) -> usize {
@@ -844,6 +866,32 @@ mod offsets {
         drain(&mut playout, origin, &mut sink);
         assert_eq!((sink.next, sink.gaps), (2000, 1280));
         assert_eq!(sink.audio.len(), 720);
+    }
+    #[test]
+    fn long_positive_offset_finishes_its_prefix_before_decoding_the_packet() {
+        let providers = Providers::new();
+        let origin = Instant::now();
+        let packets = providers.packets(Codec::Speex, 1, 1);
+        let mut descriptor = descriptor(true);
+        descriptor.get = Some(long_prefix);
+        let mut playout = unsafe {
+            Playout::new(
+                &providers.catalog,
+                Codec::Speex,
+                0.0,
+                ptr::from_ref(&descriptor).cast(),
+                origin,
+            )
+        }
+        .unwrap();
+        playout.receive(voice(&packets[0]), origin).unwrap();
+        let mut sink = Sink {
+            limit: 73,
+            ..Sink::default()
+        };
+        drain(&mut playout, origin, &mut sink);
+        assert_eq!((sink.next, sink.gaps, sink.audio.len()), (1440, 0, 1440));
+        assert_eq!(playout.concealment().codec_samples, 800);
     }
     #[test]
     fn insertion_preserves_codec_history_and_overlap_is_trimmed_after_decode_once() {

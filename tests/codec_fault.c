@@ -22,6 +22,8 @@ static int32_t decode(void *context, const uint8_t *packet, size_t length,
   ++decodes;
   if (fault == 2)
     return RPTADV_CODEC_MALFORMED;
+  if (fault == 5)
+    return RPTADV_CODEC_FAILED;
   int32_t result = original.decode(context, packet, length, pcm, capacity, frames);
   if (result == RPTADV_CODEC_COMPLETE) {
     if (fault == 3)
