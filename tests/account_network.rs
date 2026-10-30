@@ -77,6 +77,56 @@ fn settings_at(
 }
 
 #[test]
+fn an_ipv6_only_directory_records_failure_without_dialing_an_unverified_peer() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let sockets = Arc::new(
+                    DirectSockets::bind(
+                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let (network, mut events) =
+                    AccountNetwork::direct(settings("::1", 300_000, 0), sockets, || (9, 3))
+                        .unwrap();
+                assert!(matches!(
+                    events.recv().await,
+                    Some(NetworkEvent::Directory {
+                        failures: 1,
+                        fresh: false,
+                        ..
+                    })
+                ));
+                assert!(matches!(
+                    network.dial(123456).await,
+                    Err(NetworkError::Admission(
+                        rptadv_echolink::account::Admission::Unverified
+                    ))
+                ));
+                assert_eq!(
+                    network
+                        .control()
+                        .observe()
+                        .await
+                        .unwrap()
+                        .directory
+                        .failures,
+                    1
+                );
+                network.stop().await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+}
+
+#[test]
 fn live_policy_and_metadata_update_preserves_the_existing_route() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -183,6 +233,23 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
             let verified = directory_view.by_node(123456, std::time::Instant::now()).unwrap();
             assert_eq!(verified.callsign, "K1ABC-R");
             assert_eq!(directory_view.lookup("K1ABC-R", "192.0.2.1".parse().unwrap(), std::time::Instant::now()), Err(rptadv_echolink::directory::AdmissionError::Address));
+            // No yield on this current-thread runtime: four commands fill the
+            // configured account queue without slowing another account.
+            for node in 1..=4 { commands.remove(node, 1).unwrap(); }
+            assert_eq!(commands.remove(5, 1), Err(NetworkError::Full));
+            assert!(matches!(commands.observe().await, Err(NetworkError::Full)));
+            loop {
+                match commands.observe().await {
+                    Ok(status) => { assert_eq!(status.admitted, 0); break; },
+                    Err(NetworkError::Full) => tokio::task::yield_now().await,
+                    Err(error) => panic!("failed to recover command credit: {error:?}"),
+                }
+            }
+            // Cancel after command admission but before this account owner
+            // runs. Its failed reply delivery must retire the reserved route.
+            let mut cancelled = Box::pin(commands.dial(123456));
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(cancelled.as_mut().poll(cx).is_pending())).await);
+            drop(cancelled);
             let mut connection = commands.dial(123456).await.unwrap();
             assert_eq!(connection.connection.identity.callsign, "K1ABC-R");
             let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -305,6 +372,12 @@ fn terminal_proxy_cause_survives_a_full_account_event_queue_and_stop_remains_bou
                             ),
                             "terminal cause was silently dropped behind ordinary health events"
                         );
+                        let commands = network.control();
+                        assert!(matches!(
+                            commands.observe().await,
+                            Err(NetworkError::Stopped)
+                        ));
+                        assert_eq!(commands.remove(1, 1), Err(NetworkError::Stopped));
                     }
                     network.stop().await.unwrap();
                 }

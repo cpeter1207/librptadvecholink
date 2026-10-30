@@ -744,12 +744,17 @@ impl Owner {
                 let request = settings
                     .directory_login()
                     .request(&job.operation, hour, day)?;
+                // Resolve the protocol's IPv4 endpoint once; the selected
+                // transport cannot subsequently receive an IPv6 candidate.
                 let address = match job.server.parse::<SocketAddr>() {
-                    Ok(address) if address.is_ipv4() => address,
+                    Ok(SocketAddr::V4(address)) => address,
                     _ => tokio::net::lookup_host((job.server.as_str(), 5200))
                         .await
                         .map_err(|error| TransactionError::Io(error.kind()))?
-                        .find(SocketAddr::is_ipv4)
+                        .find_map(|address| match address {
+                            SocketAddr::V4(address) => Some(address),
+                            SocketAddr::V6(_) => None,
+                        })
                         .ok_or(TransactionError::Io(io::ErrorKind::AddrNotAvailable))?,
                 };
                 let kind = if matches!(job.operation, Operation::Snapshot { .. }) {
@@ -758,15 +763,12 @@ impl Owner {
                     ReplyKind::Login
                 };
                 match proxy {
-                    Some(proxy) => match address {
-                        SocketAddr::V4(address) => {
-                            proxy
-                                .exchange(*address.ip(), &request, kind, job.timeout)
-                                .await
-                        }
-                        SocketAddr::V6(_) => Err(TransactionError::Malformed),
-                    },
-                    None => directory_exchange(address, &request, kind, job.timeout).await,
+                    Some(proxy) => {
+                        proxy
+                            .exchange(*address.ip(), &request, kind, job.timeout)
+                            .await
+                    }
+                    None => directory_exchange(address.into(), &request, kind, job.timeout).await,
                 }
             })
             .await

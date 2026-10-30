@@ -161,6 +161,30 @@ fn receive_observation_preserves_first_cause_and_separates_raw_from_selected_aud
         receiver
             .packet(datagram(generation, Channel::Control, now, &sdes()))
             .unwrap();
+        let mut report = [0; 128];
+        let count = write_control(&ControlPacket::Report { source: 42 }, &mut report).unwrap();
+        assert!(matches!(
+            receiver
+                .packet(datagram(
+                    generation,
+                    Channel::Control,
+                    now,
+                    &report[..count]
+                ))
+                .unwrap(),
+            Incoming::Ignored
+        ));
+        let chat = receiver
+            .packet(datagram(
+                generation,
+                Channel::Audio,
+                now,
+                b"oNDATAK1ABC-R>hello\r\n\0",
+            ))
+            .unwrap();
+        assert!(
+            matches!(chat, Incoming::Text { sender, body } if sender == "K1ABC-R" && body == "hello")
+        );
         receiver
             .packet(datagram(generation + 1, Channel::Audio, now, b"bad"))
             .unwrap();
@@ -207,7 +231,18 @@ fn incoming_initial_sdes_establishes_once_without_waiting_for_another_heartbeat(
         use rptadv_echolink::transport::routing::RouteResult;
         let providers = Providers::new();
         let now = Instant::now();
-        let (_coordinator, mut receiver, _) = setup(&providers, now);
+        let (_coordinator, mut receiver, generation) = setup(&providers, now);
+        assert!(matches!(
+            receiver
+                .packet(datagram(
+                    generation,
+                    Channel::Audio,
+                    now,
+                    b"oNDATAK1ABC-R>hello\r\n\0"
+                ))
+                .unwrap(),
+            Incoming::Ignored
+        ));
         let mut directory = DirectorySnapshot::new(Duration::from_secs(900));
         directory
             .update(b"@@@\n1\nK1ABC-R\nTest\n1\n192.0.2.1\n+++\n", now)
@@ -561,6 +596,69 @@ fn vanished_talker_control_returns_a_contract_error_before_or_after_grant() {
             ));
             assert_eq!(receiver.state(), QsoState::Connected);
         }
+    });
+}
+
+#[test]
+fn next_burst_waits_for_the_blocked_source_tail_without_losing_its_packet() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (mut coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 1, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        receiver
+            .packet(datagram(
+                generation,
+                Channel::Audio,
+                now,
+                &encoder.packet().unwrap().bytes,
+            ))
+            .unwrap();
+        coordinator.service().await;
+        let mut sink = Sink::default();
+        assert_eq!(
+            receiver.poll(now, false, &mut sink).unwrap().activity,
+            Some(true)
+        );
+        assert!(!receiver.product_finish_pending());
+        coordinator.service().await;
+        let later = now + Duration::from_millis(400);
+        receiver.poll(later, false, &mut sink).unwrap();
+        assert!(!receiver.product_finish_pending());
+        let mut encoder = Packetizer::new(&providers.catalog, Codec::GsmFr, 0.0, 2, 42).unwrap();
+        encoder.push(&[0.1; 640]).unwrap();
+        assert!(matches!(
+            receiver
+                .packet(datagram(
+                    generation,
+                    Channel::Audio,
+                    later,
+                    &encoder.packet().unwrap().bytes
+                ))
+                .unwrap(),
+            Incoming::Retained
+        ));
+        assert!(!receiver.product_finish_pending());
+        coordinator.service().await;
+        receiver.poll(later, false, &mut sink).unwrap();
+        assert!(!receiver.can_receive());
+        sink.limit = 37;
+        for _ in 0..40 {
+            receiver.poll(later, false, &mut sink).unwrap();
+        }
+        assert!(receiver.can_receive());
+        for _ in 0..40 {
+            receiver
+                .poll(later + Duration::from_millis(400), false, &mut sink)
+                .unwrap();
+        }
+        assert_eq!(sink.samples, 1280);
+        assert_eq!(sink.gaps, 0);
+        assert!(receiver.product_finish_pending());
     });
 }
 
