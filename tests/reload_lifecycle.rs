@@ -115,6 +115,53 @@ unsafe extern "C" fn event(context: *mut std::ffi::c_void, event: *const Event) 
 }
 
 #[test]
+fn failed_activation_consumes_generation_and_cannot_be_committed_as_a_prepared_snapshot() {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = context::resource_context(api);
+    let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let servers = [span("127.0.0.1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.transport.audio_port = occupied.local_addr().unwrap().port();
+    let mut candidate = ptr::null_mut();
+    let mut target = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            api.account_prepare.unwrap()(
+                context,
+                &config,
+                &secrets("fixture-password"),
+                &mut candidate,
+            )
+        },
+        Status::Ok
+    );
+    assert_eq!(
+        unsafe {
+            api.account_prepare.unwrap()(
+                context,
+                &AccountConfig::default(),
+                ptr::null(),
+                &mut target,
+            )
+        },
+        Status::Ok
+    );
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(candidate, None, ptr::null_mut()) },
+        Status::Failed
+    );
+    assert_eq!(
+        unsafe { api.account_apply_prepared.unwrap()(target, candidate) },
+        Status::Invalid
+    );
+    unsafe {
+        api.account_destroy.unwrap()(candidate);
+        api.account_destroy.unwrap()(target);
+        api.context_destroy.unwrap()(context);
+    }
+}
+
+#[test]
 fn activated_disabled_account_retains_callbacks_through_enable_disable_enable() {
     let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
     let update = api

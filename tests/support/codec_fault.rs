@@ -17,6 +17,9 @@ pub struct FaultCodec {
     _original: Library,
 }
 impl FaultCodec {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub fn new(profile: ProfileId) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let directory = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap());
@@ -74,7 +77,7 @@ impl FaultCodec {
             };
             ProviderSelection {
                 path: if profile == self.profile {
-                    self.path.clone()
+                    self.path().to_owned()
                 } else {
                     self.directory.join(format!("librptadv_codec_{name}.so.1"))
                 },

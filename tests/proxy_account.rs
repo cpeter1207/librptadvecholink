@@ -8,16 +8,40 @@ use std::{
     mem::size_of,
     net::{Shutdown, TcpListener, TcpStream},
     ptr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 #[path = "support/settings.rs"]
 mod settings_fixture;
 use settings_fixture::{secrets, settings, span};
+#[path = "support/codec_fault.rs"]
+mod codec_fault;
 #[path = "support/context.rs"]
 mod context;
 #[path = "support/peer_contract.rs"]
 mod peer_contract;
+
+fn fault_context(api: &Descriptor, fault: &codec_fault::FaultCodec) -> *mut Context {
+    let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
+    let speex = format!("{directory}/librptadv_codec_speex.so.1");
+    let jitter = format!("{directory}/rpt_advanced/librptadv_jitter_adapter.so.1");
+    let config = RuntimeConfig {
+        worker_threads: 1,
+        gsm_library: span(fault.path().to_str().unwrap()),
+        speex_library: span(&speex),
+        jitter_library: span(&jitter),
+        ..Default::default()
+    };
+    let mut context = ptr::null_mut();
+    assert_eq!(
+        unsafe { api.context_create.unwrap()(&config, &mut context) },
+        Status::Ok
+    );
+    context
+}
 
 fn receive(socket: &mut TcpStream) -> (u8, Vec<u8>) {
     let mut header = [0; 9];
@@ -129,6 +153,7 @@ struct Trace {
     finish: AtomicBool,
     drained: AtomicBool,
     limit: AtomicUsize,
+    codec: Option<Arc<codec_fault::FaultCodec>>,
 }
 // Unwind in test code must still join foreign callbacks before releasing Trace.
 struct Attached {
@@ -152,6 +177,7 @@ fn attach(
     context: *mut Context,
     account: *mut Account,
     blocked: bool,
+    codec: Option<Arc<codec_fault::FaultCodec>>,
 ) -> Attached {
     fresh(api, account);
     let mut qso = ptr::null_mut();
@@ -178,6 +204,7 @@ fn attach(
         finish: AtomicBool::new(false),
         drained: AtomicBool::new(false),
         limit: AtomicUsize::new(if blocked { 0 } else { 73 }),
+        codec,
     });
     let mut fixture = Attached {
         account,
@@ -298,6 +325,31 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
             unsafe { peer_contract::serial(trace.api, trace.qso, &sink) },
             Ordering::Release,
         );
+        if let Some(codec) = &trace.codec {
+            codec.select(9);
+            let reset = unsafe { trace.api.peer_reset_encoder.unwrap()(trace.qso) };
+            codec.select(10);
+            let mut result: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
+            result.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
+            let pcm = [0.1; 640];
+            let mut packet = [0; 264];
+            let prepare = unsafe {
+                trace.api.peer_prepare_audio.unwrap()(
+                    trace.qso,
+                    pcm.as_ptr(),
+                    pcm.len(),
+                    packet.as_mut_ptr(),
+                    packet.len(),
+                    0,
+                    ptr::from_mut(&mut result).cast(),
+                )
+            };
+            codec.select(0);
+            let restored = unsafe { trace.api.peer_reset_encoder.unwrap()(trace.qso) };
+            if reset != Status::Failed || prepare != Status::Failed || restored != Status::Ok {
+                trace.errors.fetch_add(1, Ordering::Release);
+            }
+        }
     }
     let status = unsafe {
         trace.api.peer_read.unwrap()(
@@ -377,11 +429,82 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
 
 #[test]
 fn proxy_eof_delivers_a_final_serial_turn_with_the_transport_cause() {
-    for (speex, blocked) in [(false, false), (true, false), (false, true)] {
-        proxy_case(speex, blocked);
+    for (speex, blocked, faults) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        proxy_case(speex, blocked, faults);
     }
 }
-fn proxy_case(speex: bool, blocked: bool) {
+
+#[test]
+fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
+    unsafe extern "C" fn unexpected(context: *mut std::ffi::c_void) -> i32 {
+        unsafe { &*context.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Release);
+        -1
+    }
+    for mode in [7, 8, 0] {
+        let fault = codec_fault::FaultCodec::new(rptadv_codec_client::ProfileId::GsmFr);
+        let _catalog = fault.catalog();
+        let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+        let context = fault_context(api, &fault);
+        let _context = ContextOwner(api, context);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || registered(&listener));
+        let servers = [span("127.0.0.1")];
+        let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+        config.transport.kind = 1;
+        config.transport.proxy_host = span("127.0.0.1");
+        config.transport.proxy_port = port;
+        let long_location = "L".repeat(241);
+        if mode == 0 {
+            config.station.name = ByteSpan::default();
+            config.station.location = span(&long_location);
+        }
+        let account = prepare(api, context, &config);
+        let _account = PreparedAccount(api, account);
+        assert_eq!(
+            unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+            Status::Ok
+        );
+        let socket = server.join().unwrap();
+        fresh(api, account);
+        let mut qso = ptr::null_mut();
+        assert_eq!(
+            unsafe { api.dial.unwrap()(account, 123456, &mut qso) },
+            Status::Ok
+        );
+        fault.select(mode);
+        let calls = AtomicUsize::new(0);
+        let mut registration = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                api.peer_attach.unwrap()(
+                    context,
+                    qso,
+                    Some(unexpected),
+                    ptr::from_ref(&calls).cast_mut().cast(),
+                    &mut registration,
+                )
+            },
+            if mode == 0 {
+                Status::Invalid
+            } else {
+                Status::Failed
+            }
+        );
+        assert!(registration.is_null());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(fault.calls(false), 0);
+        fault.select(0);
+        unsafe { api.peer_destroy.unwrap()(qso) };
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
+}
+fn proxy_case(speex: bool, blocked: bool, faults: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (ready, socket) = std::sync::mpsc::channel();
@@ -389,7 +512,15 @@ fn proxy_case(speex: bool, blocked: bool) {
         ready.send(registered(&listener)).unwrap();
     });
     let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
-    let context = context::resource_context(api);
+    let codec = faults.then(|| {
+        Arc::new(codec_fault::FaultCodec::new(
+            rptadv_codec_client::ProfileId::GsmFr,
+        ))
+    });
+    let context = codec.as_ref().map_or_else(
+        || context::resource_context(api),
+        |codec| fault_context(api, codec),
+    );
     let _context = ContextOwner(api, context);
     let servers = [span("127.0.0.1")];
     let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
@@ -403,7 +534,7 @@ fn proxy_case(speex: bool, blocked: bool) {
     );
     let mut socket = socket.recv_timeout(Duration::from_secs(3)).unwrap();
     server.join().unwrap();
-    let mut fixture = attach(api, context, account, blocked);
+    let mut fixture = attach(api, context, account, blocked, codec);
     let trace = fixture.trace.as_ref();
     let (media, chat) = start_media(&mut socket, speex);
     let connected = wait(|| trace.state.load(Ordering::Acquire) == 1);
@@ -486,7 +617,7 @@ fn slow_directory_and_exclusive_reload_do_not_interrupt_another_real_account() {
             Status::Ok
         );
         sockets.push(server.join().unwrap());
-        fixtures.push(attach(api, context, account, false));
+        fixtures.push(attach(api, context, account, false, None));
     }
     let before_a = identity(api, fixtures[0].qso);
     let before_b = identity(api, fixtures[1].qso);

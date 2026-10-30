@@ -9,6 +9,26 @@ static rptadv_codec_descriptor_v1_table original, fixture;
 static int fault;
 static size_t decodes, conceals;
 
+/** Fail a new context without replacing or leaking an existing codec owner. */
+static int32_t open_encoder(const rptadv_codec_config_v1 *config,
+                            void **context) {
+  if (fault == 7)
+    return RPTADV_CODEC_FAILED;
+  return original.open_encoder(config, context);
+}
+static int32_t open_decoder(const rptadv_codec_config_v1 *config,
+                            void **context) {
+  if (fault == 8)
+    return RPTADV_CODEC_FAILED;
+  return original.open_decoder(config, context);
+}
+/** A coding-history reset is fallible even on an established connection. */
+static int32_t reset(void *context) {
+  if (fault == 9)
+    return RPTADV_CODEC_FAILED;
+  return original.reset(context);
+}
+
 /** Preserve inspection except for explicit provider-failure/corruption tests.
  */
 static int32_t inspect(void *context, const uint8_t *packet, size_t length,
@@ -72,6 +92,9 @@ static int32_t encode(void *context, const float *pcm, size_t frames,
 void rptadv_test_configure(const void *descriptor) {
   original = *(const rptadv_codec_descriptor_v1_table *)descriptor;
   fixture = original;
+  fixture.open_encoder = open_encoder;
+  fixture.open_decoder = open_decoder;
+  fixture.reset = reset;
   fixture.inspect = inspect;
   fixture.decode = decode;
   fixture.conceal = conceal;
