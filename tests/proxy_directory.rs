@@ -210,3 +210,96 @@ fn parser_completion_does_not_queue_a_second_close_after_staging_failure() {
         );
     });
 }
+
+#[test]
+fn invalid_jobs_and_unexpected_virtual_tcp_records_preserve_first_failure() {
+    run(async {
+        let mut channel = DirectoryChannel::default();
+        channel.output_queued();
+        feed(&mut channel, ProxyKind::TcpClose, &[]);
+        for (request, timeout) in [
+            (Vec::new(), Duration::from_secs(1)),
+            (vec![0; 65_537], Duration::from_secs(1)),
+            (b"F0\r".to_vec(), Duration::ZERO),
+            (b"F0\r".to_vec(), Duration::MAX),
+        ] {
+            assert_eq!(
+                channel
+                    .begin(Ipv4Addr::LOCALHOST, &request, ReplyKind::Directory, timeout)
+                    .err(),
+                Some(TunnelError::Invalid)
+            );
+            assert!(channel.outgoing().is_none());
+        }
+        for (kind, payload) in [
+            (ProxyKind::TcpOpen, &[][..]),
+            (ProxyKind::TcpStatus, &[0; 3][..]),
+        ] {
+            let (token, reply) = channel
+                .begin(
+                    Ipv4Addr::LOCALHOST,
+                    b"login",
+                    ReplyKind::Login,
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+            channel.output_queued();
+            channel.output_queued(); // WaitingOpen cannot queue the OPEN twice.
+            assert!(channel.outgoing().is_none());
+            feed(
+                &mut channel,
+                ProxyKind::TcpData,
+                b"ignored before TCP_STATUS",
+            );
+            feed(&mut channel, kind, payload);
+            channel.finish(token, reply.await);
+            channel.output_queued();
+            feed(&mut channel, ProxyKind::TcpClose, &[]);
+            assert_eq!(
+                channel
+                    .begin(
+                        Ipv4Addr::LOCALHOST,
+                        b"next",
+                        ReplyKind::Login,
+                        Duration::from_secs(1)
+                    )
+                    .err(),
+                Some(TunnelError::Busy)
+            );
+            assert_eq!(
+                channel.take_completed(),
+                Some((token, Err(TunnelError::Protocol)))
+            );
+        }
+    });
+}
+
+#[test]
+fn large_single_tcp_record_retains_the_unread_suffix_across_parser_reads() {
+    run(async {
+        let mut channel = DirectoryChannel::default();
+        let (token, reply) = channel
+            .begin(
+                Ipv4Addr::LOCALHOST,
+                b"F0\r",
+                ReplyKind::Directory,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        channel.output_queued();
+        feed(&mut channel, ProxyKind::TcpStatus, &[0; 4]);
+        channel.output_queued();
+        let mut body = b"@@@\n9\n".to_vec();
+        for _ in 0..9 {
+            body.extend_from_slice(b".\n");
+            body.extend([b'X'; 1000]);
+            body.extend_from_slice(b"\n1\n127.0.0.1\n");
+        }
+        body.extend_from_slice(b"+++");
+        feed(&mut channel, ProxyKind::TcpData, &body);
+        channel.finish(token, reply.await);
+        channel.output_queued();
+        feed(&mut channel, ProxyKind::TcpClose, &[]);
+        assert_eq!(channel.take_completed(), Some((token, Ok(body))));
+    });
+}

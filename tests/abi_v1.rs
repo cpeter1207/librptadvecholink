@@ -243,6 +243,89 @@ fn runtime_resources_load_real_dsos_and_keep_the_legacy_prefix_usable() {
 }
 
 #[test]
+fn runtime_resource_exhaustion_cannot_publish_or_abort_a_context() {
+    const CHILD: &str = "RPTADV_ECHO_TEST_RESOURCE_FAILURE";
+    if let Ok(resource) = std::env::var(CHILD) {
+        // Only this dedicated test child loses its resource allowance.
+        // Root ignores RLIMIT_NPROC, so drop privileges before imposing it.
+        let (kind, original) = unsafe {
+            if resource == "threads" && libc::geteuid() == 0 {
+                assert_eq!(libc::setgid(65534), 0);
+                assert_eq!(libc::setuid(65534), 0);
+            }
+            let kind = if resource == "threads" {
+                libc::RLIMIT_NPROC
+            } else {
+                libc::RLIMIT_NOFILE
+            };
+            let mut original = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(kind, &mut original), 0);
+            let limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: original.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(kind, &limit), 0);
+            (kind, original)
+        };
+        let api = unsafe { &*rptadv_echolink_descriptor_v1() };
+        let mut context = ptr::dangling_mut();
+        let status = unsafe {
+            api.context_create.unwrap()(
+                &RuntimeConfig {
+                    worker_threads: 1,
+                    ..Default::default()
+                },
+                &mut context,
+            )
+        };
+        // Restore the soft limit before diagnostics and LLVM's exit-time file write.
+        assert_eq!(unsafe { libc::setrlimit(kind, &original) }, 0);
+        assert_eq!(status, Status::Failed);
+        assert!(context.is_null());
+    } else {
+        for resource in ["threads", "files"] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "runtime_resource_exhaustion_cannot_publish_or_abort_a_context",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, resource);
+            if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+                use std::os::unix::fs::PermissionsExt;
+                // The privilege-dropped child must still write its own coverage.
+                // Keep the file in llvm-cov's raw-profile directory for collection.
+                let profile = std::path::Path::new(&profile)
+                    .parent()
+                    .unwrap()
+                    .join(format!(
+                        "echo-runtime-{}-{resource}.profraw",
+                        std::process::id()
+                    ));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&profile)
+                    .unwrap();
+                std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o666)).unwrap();
+                command.env("LLVM_PROFILE_FILE", profile);
+            }
+            let child = command.output().unwrap();
+            assert!(
+                child.status.success(),
+                "{resource}: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+    }
+}
+
+#[test]
 fn disabled_accounts_have_no_network_side_effects_and_retain_context() {
     let api = unsafe { &*rptadv_echolink_descriptor_v1() };
     let mut context = ptr::null_mut();

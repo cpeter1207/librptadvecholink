@@ -112,12 +112,16 @@ unsafe extern "C" fn context_create(
     } else {
         prefix.worker_threads as usize
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .thread_name("rpt-echo")
-        .enable_all()
-        .build();
-    let Ok(runtime) = runtime else {
+    // Tokio reports driver failures as Err but panics on OS worker-spawn
+    // failure. Neither startup failure may unwind across this C boundary.
+    let runtime = std::panic::catch_unwind(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .thread_name("rpt-echo")
+            .enable_all()
+            .build()
+    });
+    let Ok(Ok(runtime)) = runtime else {
         return Status::Failed;
     };
     *output = Box::into_raw(Box::new(Context {

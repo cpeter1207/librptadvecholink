@@ -295,3 +295,45 @@ impl DirectoryChannel {
         self.completed.take()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_read_does_not_wait_for_a_directory_chunk() {
+        let (_sender, receiver) = mpsc::channel(1);
+        let mut input = Input {
+            receiver,
+            current: None,
+        };
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let mut empty = [];
+        let mut output = ReadBuf::new(&mut empty);
+        assert!(matches!(
+            Pin::new(&mut input).poll_read(&mut context, &mut output),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(input.current.is_none());
+    }
+
+    #[test]
+    fn exhausted_transaction_tokens_fail_without_wrapping() {
+        let mut channel = DirectoryChannel {
+            next: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(
+            channel
+                .begin(
+                    Ipv4Addr::LOCALHOST,
+                    b"F0\r",
+                    ReplyKind::Directory,
+                    Duration::from_secs(1)
+                )
+                .err(),
+            Some(TunnelError::Invalid)
+        );
+        assert!(channel.outgoing().is_none());
+    }
+}
