@@ -162,6 +162,101 @@ fn malformed_records_or_borrowed_spans_fail_without_publishing_settings() {
 }
 
 #[test]
+fn every_resolved_account_scalar_and_selected_transport_is_validated() {
+    let servers = [span("directory.example.invalid")];
+    let keys = secrets("fixture-password");
+    let invalid: &[fn(&mut AccountConfig)] = &[
+        |c| c.node_number = 0,
+        |c| c.local_node = span(""),
+        |c| c.local_node = span("not-a-node"),
+        |c| c.callsign = span(""),
+        |c| c.callsign = span("invalid+call"),
+        |c| c.transport.directory_servers = StringList::default(),
+        |c| c.transport.kind = 2,
+        |c| c.transport.audio_port = 0,
+        |c| c.transport.audio_port = u16::MAX,
+        |c| c.transport.bind_address = span("invalid-address"),
+        |c| {
+            c.transport.kind = 1;
+            c.transport.proxy_port = 0;
+        },
+        |c| {
+            c.transport.kind = 1;
+            c.transport.proxy_host = span("");
+        },
+        |c| {
+            c.transport.kind = 1;
+            c.transport.proxy_host = span("bad host");
+        },
+        |c| c.policy.max_stations = u32::MAX,
+        |c| c.policy.announcement = 4,
+        |c| c.policy.telemetry = 4,
+        |c| c.policy.telemetry_dynamic = 2,
+    ];
+    for (index, change) in invalid.iter().enumerate() {
+        let mut config = settings("K1ABC-R", "North", &servers, &[]);
+        change(&mut config);
+        assert!(
+            unsafe { PreparedSettings::copy(&config, &keys) }.is_err(),
+            "invalid case {index}"
+        );
+    }
+    for index in 0..10 {
+        let mut config = settings("K1ABC-R", "North", &servers, &[]);
+        let p = &mut config.policy;
+        *[
+            &mut p.max_stations,
+            &mut p.max_pending_handshakes,
+            &mut p.heartbeat_interval_ms,
+            &mut p.heartbeat_timeout_ms,
+            &mut p.connect_timeout_ms,
+            &mut p.directory_timeout_ms,
+            &mut p.registration_refresh_ms,
+            &mut p.directory_refresh_ms,
+            &mut p.directory_retry_ms,
+            &mut p.directory_freshness_ms,
+        ][index] = 0;
+        assert!(
+            unsafe { PreparedSettings::copy(&config, &keys) }.is_err(),
+            "zero scalar {index}"
+        );
+    }
+    type Scalar = fn(&mut AccountConfig) -> &mut f64;
+    let floats: &[(Scalar, &[f64])] = &[
+        (|c| &mut c.policy.receive_gain_db, &[f64::NAN, -61.0, 61.0]),
+        (|c| &mut c.policy.transmit_gain_db, &[f64::NAN, -61.0, 61.0]),
+        (|c| &mut c.station.latitude, &[f64::NAN, -91.0, 91.0]),
+        (|c| &mut c.station.longitude, &[f64::NAN, -181.0, 181.0]),
+        (
+            |c| &mut c.station.antenna_direction_deg,
+            &[f64::NAN, -2.0, 361.0],
+        ),
+        (|c| &mut c.station.antenna_gain_db, &[f64::NAN]),
+        (|c| &mut c.station.frequency_mhz, &[f64::NAN, -1.0]),
+        (|c| &mut c.station.tone_hz, &[f64::NAN, -1.0]),
+        (|c| &mut c.station.power_w, &[f64::NAN, -1.0]),
+        (|c| &mut c.station.antenna_height_m, &[f64::NAN, -1.0]),
+    ];
+    for (field, values) in floats {
+        for value in *values {
+            let mut config = settings("K1ABC-R", "North", &servers, &[]);
+            *field(&mut config) = *value;
+            assert!(unsafe { PreparedSettings::copy(&config, &keys) }.is_err());
+        }
+    }
+    for host in ["", "bad host"] {
+        let invalid = [span(host)];
+        let config = settings("K1ABC-R", "North", &invalid, &[]);
+        assert!(unsafe { PreparedSettings::copy(&config, &keys) }.is_err());
+    }
+    let mut config = settings("K1ABC-R", "North", &servers, &[]);
+    config.station.name = span("");
+    let prepared = unsafe { PreparedSettings::copy(&config, &keys) }.unwrap();
+    assert_eq!(prepared.directory_login().description, "North");
+    assert!(prepared.aprs_location(&"x".repeat(220)).is_err());
+}
+
+#[test]
 fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
     let servers = [span("directory.example.invalid")];
     let secret = secrets("fixture-password");

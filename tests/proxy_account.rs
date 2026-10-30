@@ -56,6 +56,25 @@ struct Trace {
     drained: AtomicBool,
     limit: AtomicUsize,
 }
+// Unwind in test code must still join foreign callbacks before releasing Trace.
+struct Attached {
+    context: *mut Context,
+    account: *mut Account,
+    qso: *mut Qso,
+    registration: *mut Registration,
+    trace: Box<Trace>,
+}
+impl Drop for Attached {
+    fn drop(&mut self) {
+        let api = self.trace.api;
+        unsafe {
+            api.peer_detach.unwrap()(self.registration);
+            api.peer_destroy.unwrap()(self.qso);
+            api.account_destroy.unwrap()(self.account);
+            api.context_destroy.unwrap()(self.context);
+        }
+    }
+}
 unsafe extern "C" fn audio(
     opaque: *mut std::ffi::c_void,
     _: u64,
@@ -222,7 +241,7 @@ fn proxy_case(speex: bool, blocked: bool) {
         unsafe { api.dial.unwrap()(account, 123456, &mut qso) },
         Status::Ok
     );
-    let trace = Trace {
+    let trace = Box::new(Trace {
         api,
         qso,
         state: AtomicUsize::new(usize::MAX),
@@ -236,16 +255,23 @@ fn proxy_case(speex: bool, blocked: bool) {
         finish: AtomicBool::new(false),
         drained: AtomicBool::new(false),
         limit: AtomicUsize::new(if blocked { 0 } else { 73 }),
+    });
+    let mut fixture = Attached {
+        context,
+        account,
+        qso,
+        registration: ptr::null_mut(),
+        trace,
     };
-    let mut registration = ptr::null_mut();
+    let trace = fixture.trace.as_ref();
     assert_eq!(
         unsafe {
             api.peer_attach.unwrap()(
                 context,
                 qso,
                 Some(step),
-                ptr::from_ref(&trace).cast_mut().cast(),
-                &mut registration,
+                ptr::from_ref(trace).cast_mut().cast(),
+                &mut fixture.registration,
             )
         },
         Status::Ok
@@ -290,11 +316,11 @@ fn proxy_case(speex: bool, blocked: bool) {
     socket.shutdown(Shutdown::Both).unwrap();
     let final_turn = wait(|| trace.cause.load(Ordering::Acquire) == 5);
     trace.limit.store(73, Ordering::Release);
-    unsafe { api.peer_wake.unwrap()(registration) };
+    unsafe { api.peer_wake.unwrap()(fixture.registration) };
     let finite = wait(|| trace.finish.load(Ordering::Acquire));
     let premature_unkey = trace.unkeyed.load(Ordering::Acquire);
     trace.drained.store(true, Ordering::Release);
-    unsafe { api.peer_wake.unwrap()(registration) };
+    unsafe { api.peer_wake.unwrap()(fixture.registration) };
     let released =
         wait(|| trace.unkeyed.load(Ordering::Acquire) && trace.state.load(Ordering::Acquire) == 3);
     let mut health = AccountObservation {
@@ -306,11 +332,9 @@ fn proxy_case(speex: bool, blocked: bool) {
         api.account_observe.unwrap()(account, &mut health) == Status::Ok && health.first_cause == 2
     });
     unsafe {
-        api.peer_detach.unwrap()(registration);
-        api.peer_destroy.unwrap()(qso);
-        api.account_destroy.unwrap()(account);
-        api.context_destroy.unwrap()(context);
+        api.peer_detach.unwrap()(fixture.registration);
     }
+    fixture.registration = ptr::null_mut();
     assert!(connected, "fixture did not establish the actual QSO");
     assert_eq!(chat, b"oNDATAK1ABC-R>Test message\r\n\0");
     assert_eq!(&media[..2], &[0xc0, if speex { 0x96 } else { 3 }]);

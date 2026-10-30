@@ -22,6 +22,98 @@ fn descriptor_exposes_the_complete_sized_network_media_and_text_groups() {
 }
 
 #[test]
+fn peer_operations_reject_missing_owners_and_invalid_output_prefixes() {
+    use rptadv_echolink::ffi::{AccountObservation, PeerInfo, PeerObservation, ReadResult};
+    let api = unsafe { &*rptadv_echolink_descriptor_v1() };
+    let mut info = PeerInfo {
+        struct_size: size_of::<PeerInfo>() as u32,
+        abi_version: 1,
+        node_number: 0,
+        capabilities: 0,
+        account_generation: 0,
+        qso_generation: 0,
+        callsign: ByteSpan::default(),
+        local_node: ByteSpan::default(),
+        source: ByteSpan::default(),
+    };
+    let mut peer = PeerObservation {
+        struct_size: size_of::<PeerObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    let mut account = AccountObservation {
+        struct_size: size_of::<AccountObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    let mut read = ReadResult::default();
+    let mut encoded: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
+    encoded.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
+    let mut registration = ptr::dangling_mut();
+    let mut qso = ptr::dangling_mut();
+    let mut elapsed = 100;
+    unsafe {
+        for status in [
+            api.peer_info.unwrap()(ptr::null(), &mut info),
+            api.peer_info.unwrap()(ptr::null(), ptr::null_mut()),
+            api.peer_observe.unwrap()(ptr::null(), &mut peer),
+            api.peer_observe.unwrap()(ptr::null(), ptr::null_mut()),
+            api.account_observe.unwrap()(ptr::null(), &mut account),
+            api.account_observe.unwrap()(ptr::null(), ptr::null_mut()),
+            api.peer_read.unwrap()(
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                &mut read,
+            ),
+            api.peer_prepare_audio.unwrap()(
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                0,
+                0,
+                ptr::from_mut(&mut encoded).cast(),
+            ),
+            api.peer_reset_encoder.unwrap()(ptr::null_mut()),
+            api.peer_send_prepared.unwrap()(ptr::null_mut(), ByteSpan::default(), 0, 0),
+            api.peer_send_text.unwrap()(ptr::null_mut(), ByteSpan::default(), ByteSpan::default()),
+            api.peer_set_deadline.unwrap()(ptr::null_mut(), 0),
+            api.peer_elapsed_ms.unwrap()(ptr::null(), &mut elapsed),
+            api.peer_elapsed_ms.unwrap()(ptr::null(), ptr::null_mut()),
+            api.peer_attach.unwrap()(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                &mut registration,
+            ),
+            api.peer_attach.unwrap()(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            api.dial.unwrap()(ptr::null_mut(), 0, &mut qso),
+            api.dial.unwrap()(ptr::null_mut(), 1, &mut qso),
+            api.dial.unwrap()(ptr::null_mut(), 1, ptr::null_mut()),
+            api.validate_pending.unwrap()(ptr::null(), &mut info),
+        ] {
+            assert_eq!(status, Status::Invalid);
+        }
+        api.peer_stop.unwrap()(ptr::null_mut());
+        api.peer_wake.unwrap()(ptr::null_mut());
+        api.peer_detach.unwrap()(ptr::null_mut());
+        api.peer_destroy.unwrap()(ptr::null_mut());
+    }
+    assert_eq!(elapsed, 0);
+    assert!(registration.is_null() && qso.is_null());
+}
+
+#[test]
 fn context_validation_clears_failed_outputs() {
     let api = unsafe { &*rptadv_echolink_descriptor_v1() };
     let create = api.context_create.unwrap();
