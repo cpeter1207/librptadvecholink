@@ -517,6 +517,10 @@ fn concurrent_proxy_senders_share_one_slot_budget_and_wake_the_existing_writer()
         peer.await.unwrap();
         drop(writer);
         assert_eq!(first.try_queue(control, None), Err(QueueError::Closed));
+        assert_eq!(
+            first.writable(ProxyKind::UdpControl, 1).await,
+            Err(std::io::ErrorKind::BrokenPipe)
+        );
     });
 }
 

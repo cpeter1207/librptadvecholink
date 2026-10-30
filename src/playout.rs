@@ -381,10 +381,15 @@ impl Playout {
             }
             .map_err(MediaError::Provider)?;
             let skip = decision.start_offset.saturating_neg().max(0) as usize;
-            if skip > FRAMES || (self.count != 0 && self.count != FRAMES) {
+            // Jitter validated span + start_offset > 0, and a packet's span
+            // above is exactly FRAMES, so its overlap cannot consume the whole packet.
+            if self.count != 0 && self.count != FRAMES {
                 return Err(MediaError::Contract);
             }
             if self.count == 0 {
+                // Unsupported native PLC produced no PCM; the ring owns this
+                // missing span, including its concealment provenance counters.
+                self.concealed = false;
                 self.gap = (FRAMES - skip) as u32;
             } else {
                 self.position = skip;

@@ -6,6 +6,9 @@ use rptadv_echolink::{
 };
 use std::path::PathBuf;
 
+#[path = "support/codec_fault.rs"]
+mod codec_fault;
+
 fn catalog() -> CodecCatalog {
     let path = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
     CodecCatalog::load(&[
@@ -117,4 +120,20 @@ fn finite_speex_flush_reports_only_real_input_and_finishes_without_endless_paddi
     );
     let done = media.prepare(&[], &mut output, true).unwrap();
     assert_eq!((done.status, done.encoded_bytes), (Status::Complete, 0));
+}
+
+#[test]
+fn bounded_but_inconsistent_encoder_results_cannot_be_sent_as_voice() {
+    use rptadv_echolink::media::MediaError;
+    for fault in [10, 11, 12] {
+        let fixture = codec_fault::FaultCodec::new(ProfileId::GsmFr);
+        let catalog = fixture.catalog();
+        let mut media = PreparedMedia::new(&catalog, 0.0, 7, 42).unwrap();
+        fixture.select(fault);
+        assert!(matches!(
+            media.prepare(&[0.1; 640], &mut [0; 264], false),
+            Err(MediaError::Contract)
+        ));
+        assert_eq!(fixture.calls(false), 0);
+    }
 }

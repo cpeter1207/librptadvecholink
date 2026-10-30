@@ -13,6 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/codec_fault.rs"]
+mod codec_fault;
+
 struct Providers {
     catalog: CodecCatalog,
     _jitter: Library,
@@ -365,6 +368,7 @@ fn backpressure_blocks_further_jitter_admission_and_preserves_pending_pcm() {
         playout.receive(voice(&packets[1]), origin).unwrap(),
         Reception::Busy
     );
+    assert!(!playout.drained());
     sink.limit = 80;
     for _ in 0..8 {
         playout
@@ -409,6 +413,11 @@ fn malformed_or_wrong_codec_does_not_revive_a_burst_or_shift_sequence_epoch() {
         ..Sink::default()
     };
     drain(&mut playout, origin, &mut sink);
+    assert_eq!(
+        playout.receive(voice(&packets[0]), origin).unwrap(),
+        Reception::Busy,
+        "an ended burst cannot accept media before reset"
+    );
     playout.reset().unwrap();
     playout
         .receive(voice(&packets[0]), origin + Duration::from_secs(3))
@@ -442,6 +451,94 @@ fn gsm_only_resources_cannot_accept_or_start_a_speex_stream() {
         Reception::Invalid
     );
     assert!(playout.drained());
+}
+
+#[test]
+fn malformed_gsm_uses_ring_gap_provenance_when_native_plc_is_unsupported() {
+    let fixture = codec_fault::FaultCodec::new(ProfileId::GsmFr);
+    let catalog = fixture.catalog();
+    let providers = Providers::new();
+    let origin = Instant::now();
+    let packets = providers.packets(Codec::GsmFr, 1, 1);
+    let mut playout =
+        unsafe { Playout::new(&catalog, Codec::GsmFr, 0.0, providers.descriptor, origin) }.unwrap();
+    playout.receive(voice(&packets[0]), origin).unwrap();
+    fixture.select(2);
+    let mut sink = Sink {
+        limit: 73,
+        ..Sink::default()
+    };
+    drain(&mut playout, origin, &mut sink);
+    assert!(sink.audio.is_empty());
+    assert_eq!(sink.gaps, 640);
+    assert_eq!((fixture.calls(false), fixture.calls(true)), (1, 1));
+    assert_eq!(playout.concealment().codec_samples, 0);
+    assert_eq!(playout.concealment().gap_samples, 640);
+}
+
+#[test]
+fn native_plc_and_zero_decode_results_keep_exact_accepted_prefix_provenance() {
+    for (profile, codec, fault, expected_pcm, expected_gap, expected_plc) in [
+        (ProfileId::Speex, Codec::Speex, 2, 640, 0, 1),
+        (ProfileId::GsmFr, Codec::GsmFr, 3, 0, 640, 0),
+    ] {
+        let fixture = codec_fault::FaultCodec::new(profile);
+        let catalog = fixture.catalog();
+        let providers = Providers::new();
+        let origin = Instant::now();
+        let packets = providers.packets(codec, 1, 1);
+        let mut playout =
+            unsafe { Playout::new(&catalog, codec, 0.0, providers.descriptor, origin) }.unwrap();
+        playout.receive(voice(&packets[0]), origin).unwrap();
+        fixture.select(fault);
+        let mut sink = Sink {
+            limit: 73,
+            ..Sink::default()
+        };
+        drain(&mut playout, origin, &mut sink);
+        assert_eq!((sink.audio.len(), sink.gaps), (expected_pcm, expected_gap));
+        assert_eq!(
+            (fixture.calls(false), fixture.calls(true)),
+            (1, expected_plc)
+        );
+        assert_eq!(playout.concealment().codec_samples, expected_pcm as u64);
+        assert_eq!(playout.concealment().gap_samples, expected_gap);
+    }
+}
+
+#[test]
+fn fatal_inspection_and_short_decode_cannot_publish_pcm() {
+    use rptadv_echolink::media::MediaError;
+    let fixture = codec_fault::FaultCodec::new(ProfileId::GsmFr);
+    let catalog = fixture.catalog();
+    let providers = Providers::new();
+    let origin = Instant::now();
+    let packets = providers.packets(Codec::GsmFr, 1, 1);
+    let mut playout =
+        unsafe { Playout::new(&catalog, Codec::GsmFr, 0.0, providers.descriptor, origin) }.unwrap();
+    fixture.select(1);
+    assert!(matches!(
+        playout.validate(&voice(&packets[0])),
+        Err(MediaError::Provider(_))
+    ));
+    assert_eq!((fixture.calls(false), fixture.calls(true)), (0, 0));
+    fixture.select(0);
+    playout.receive(voice(&packets[0]), origin).unwrap();
+    fixture.select(4);
+    let mut sink = Sink {
+        limit: 640,
+        ..Sink::default()
+    };
+    let mut error = None;
+    for millisecond in 180..500 {
+        if let Err(found) = playout.poll(origin + Duration::from_millis(millisecond), &mut sink) {
+            error = Some(found);
+            break;
+        }
+    }
+    assert!(matches!(error, Some(MediaError::Contract)));
+    assert!(sink.audio.is_empty());
+    assert_eq!(sink.gaps, 0);
 }
 
 // Script only the neutral capability's signed-offset decisions. Encoding, decoding and
@@ -613,6 +710,36 @@ mod offsets {
         }
         0
     }
+    unsafe extern "C" fn excessive_overlap(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            (*result).start_offset = -641;
+        }
+        0
+    }
+    unsafe extern "C" fn long_insertion(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            if (*context.cast::<Script>()).step == 0 {
+                (*result).span = 1280;
+            }
+        }
+        0
+    }
     struct ExcessSink;
     impl PcmSink for ExcessSink {
         fn audio(&mut self, _: u64, samples: &[f32]) -> usize {
@@ -629,10 +756,14 @@ mod offsets {
         let origin = Instant::now();
         let packets = providers.packets(Codec::GsmFr, 1, 1);
         let baseline = descriptor(true);
-        for getter in [
-            Some(wrong_span as unsafe extern "C" fn(_, _, _, _, _, _) -> _),
-            Some(unknown_format),
-            Some(empty_payload),
+        for (getter, jitter_rejection) in [
+            (
+                Some(wrong_span as unsafe extern "C" fn(_, _, _, _, _, _) -> _),
+                false,
+            ),
+            (Some(unknown_format), false),
+            (Some(empty_payload), false),
+            (Some(excessive_overlap), true),
         ] {
             let mut descriptor = baseline;
             descriptor.get = getter;
@@ -663,7 +794,10 @@ mod offsets {
                     }
                 }
             }
-            assert!(matches!(error, Some(MediaError::Contract)));
+            assert!(matches!(
+                (jitter_rejection, error),
+                (false, Some(MediaError::Contract)) | (true, Some(MediaError::Jitter(_)))
+            ));
             assert!(sink.audio.is_empty());
         }
         for positive in [false, true] {
@@ -684,6 +818,32 @@ mod offsets {
                 Err(MediaError::Contract)
             ));
         }
+    }
+    #[test]
+    fn multi_block_delay_insertion_retains_the_decision_until_all_samples_are_accepted() {
+        let providers = Providers::new();
+        let origin = Instant::now();
+        let packets = providers.packets(Codec::Speex, 1, 1);
+        let mut descriptor = descriptor(false);
+        descriptor.get = Some(long_insertion);
+        let mut playout = unsafe {
+            Playout::new(
+                &providers.catalog,
+                Codec::Speex,
+                0.0,
+                ptr::from_ref(&descriptor).cast(),
+                origin,
+            )
+        }
+        .unwrap();
+        playout.receive(voice(&packets[0]), origin).unwrap();
+        let mut sink = Sink {
+            limit: 73,
+            ..Sink::default()
+        };
+        drain(&mut playout, origin, &mut sink);
+        assert_eq!((sink.next, sink.gaps), (2000, 1280));
+        assert_eq!(sink.audio.len(), 720);
     }
     #[test]
     fn insertion_preserves_codec_history_and_overlap_is_trimmed_after_decode_once() {
