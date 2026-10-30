@@ -79,3 +79,80 @@ impl DirectSockets {
         self.socket(class).writable().await
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/settings.rs"]
+mod settings_fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        account::{
+            network::{AccountNetwork, NetworkEvent},
+            settings::PreparedSettings,
+        },
+        transport::direct::settings_fixture::{secrets, settings, span},
+    };
+    use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn real_udp_receive_errors_retire_the_account_with_the_original_io_cause() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let _directory = std::net::TcpListener::bind("127.0.0.37:5200").unwrap();
+            let servers = [span("127.0.0.37")];
+            let config = settings("K1ABC-R", "Loopback", &servers, &[]);
+            let settings = Arc::new(
+                unsafe { PreparedSettings::copy(&config, &secrets("fixture-password")) }.unwrap(),
+            );
+            for channel in [Channel::Audio, Channel::Control] {
+                let target = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                let closed = target.local_addr().unwrap();
+                drop(target);
+                let sockets = Arc::new(
+                    DirectSockets::bind(
+                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                // Connected loopback UDP gives a genuine asynchronous ICMP error,
+                // without closing/replacing a file descriptor owned by Tokio.
+                sockets.socket(channel).connect(closed).await.unwrap();
+                let (network, mut events) =
+                    AccountNetwork::direct(Arc::clone(&settings), Arc::clone(&sockets), || {
+                        (12, 30)
+                    })
+                    .unwrap();
+                tokio::task::yield_now().await;
+                sockets.socket(channel).send(b"probe").await.unwrap();
+                // ICMP alone may expose only writable error readiness. A real
+                // loopback datagram makes receive ready without consuming the
+                // pending kernel error from the connected socket.
+                let wake = std::net::UdpSocket::bind(closed).unwrap();
+                wake.send_to(b"readable", sockets.local_addr(channel).unwrap())
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        match events.recv().await {
+                            Some(NetworkEvent::TransportLost(error)) => {
+                                assert_eq!(error, io::ErrorKind::ConnectionRefused);
+                                break;
+                            }
+                            Some(_) => (),
+                            None => panic!("account retired without its receive error"),
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                network.stop().await.unwrap();
+            }
+        });
+    }
+}

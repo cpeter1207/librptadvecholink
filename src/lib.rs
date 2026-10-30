@@ -2,6 +2,9 @@
 //! The complete descriptor publishes lifecycle, network, prepared media and text.
 #![deny(missing_docs)]
 
+#[cfg(test)]
+extern crate self as rptadv_echolink;
+
 pub mod account;
 pub mod directory;
 pub mod ffi;
