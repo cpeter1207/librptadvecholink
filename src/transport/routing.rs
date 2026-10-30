@@ -68,13 +68,8 @@ struct Route {
 }
 
 impl Route {
-    fn accepts(
-        &self,
-        channel: Channel,
-        source: SocketAddr,
-        packet: &WirePacket<'_>,
-        only: bool,
-    ) -> bool {
+    // parse_datagram has already enforced channel/type compatibility.
+    fn accepts(&self, source: SocketAddr, packet: &WirePacket<'_>, only: bool) -> bool {
         match packet {
             WirePacket::Control(ControlPacket::Sdes {
                 callsign,
@@ -96,14 +91,12 @@ impl Route {
                         || (*id != 0 && self.control_source == Some(*id)))
             }
             WirePacket::Voice(voice) => {
-                channel == Channel::Audio
-                    && self.control_endpoint.is_some()
+                self.control_endpoint.is_some()
                     && self.audio_endpoint.map_or(only, |known| known == source)
                     && matches_source(self.audio_source, voice.ssrc)
             }
             WirePacket::Chat { .. } | WirePacket::StationInfo(_) => {
-                channel == Channel::Audio
-                    && self.control_endpoint.is_some()
+                self.control_endpoint.is_some()
                     && self.audio_endpoint.map_or(only, |known| known == source)
             }
             WirePacket::Ignored => false,
@@ -208,7 +201,7 @@ impl Router {
             let mut matches = routes
                 .iter()
                 .enumerate()
-                .filter(|(_, route)| route.accepts(channel, source, &packet, routes.len() == 1));
+                .filter(|(_, route)| route.accepts(source, &packet, routes.len() == 1));
             if let Some((index, _)) = matches.next() {
                 if matches.next().is_some() {
                     return RouteResult::Dropped;
@@ -349,3 +342,7 @@ impl Router {
 fn matches_source(known: Option<u32>, source: u32) -> bool {
     source == 0 || known.is_none_or(|known| known == source)
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/routing.rs"]
+mod tests;

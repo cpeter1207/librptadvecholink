@@ -193,6 +193,41 @@ fn callback_can_stop_before_attach_returns_and_detach_releases_captured_state() 
 }
 
 #[test]
+fn a_stopped_owner_never_calls_back_and_a_closed_ingress_is_reported_once() {
+    let runtime = runtime();
+    let control = Arc::new(Control::default());
+    control.stop();
+    let (_sender, receiver) = channel(1).unwrap();
+    let driver = PeerDriver::attach(Arc::clone(&runtime), control, receiver, |_| {
+        panic!("an already stopped owner must not call its consumer");
+    });
+    driver.detach();
+
+    let (sender, receiver) = channel(2).unwrap();
+    drop(sender);
+    let (seen, events) = std::sync::mpsc::channel();
+    let driver = PeerDriver::attach(
+        Arc::clone(&runtime),
+        Arc::new(Control::default()),
+        receiver,
+        move |event| {
+            if let PeerEvent::Io(kind) = event {
+                seen.send(kind).unwrap();
+                // Leave the owner open: it must park rather than repeatedly
+                // reporting the same closed receive queue.
+            }
+            Some(PeerWait::default())
+        },
+    );
+    assert_eq!(
+        events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert!(events.recv_timeout(Duration::from_millis(30)).is_err());
+    driver.detach();
+}
+
+#[test]
 fn thousand_peer_tasks_share_fixed_workers_and_isolate_a_stalled_connection() {
     let runtime = runtime();
     let processed = Arc::new(AtomicUsize::new(0));
