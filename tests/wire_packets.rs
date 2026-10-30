@@ -33,6 +33,8 @@ fn outgoing_wire_profiles_reject_oversize_and_missing_identity_fields() {
         payload: &vec![0; MAX_DATAGRAM],
     };
     assert_eq!(write_voice(&voice, &mut output), Err(WireError::TooLarge));
+    voice.payload = &[];
+    assert_eq!(write_voice(&voice, &mut output), Err(WireError::Malformed));
     voice.payload = &[1];
     voice.marker = false;
     assert_eq!(write_voice(&voice, &mut output), Err(WireError::Malformed));
