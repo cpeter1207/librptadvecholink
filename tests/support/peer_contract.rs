@@ -26,7 +26,18 @@ pub unsafe fn before_attach(api: &Descriptor, context: *mut Context, qso: *mut Q
     let mut read = ReadResult::default();
     let mut result = encoded();
     let mut registration = ptr::dangling_mut();
-    let errors = rejected(unsafe {
+    let mut info = PeerInfo {
+        struct_size: size_of::<PeerInfo>() as u32,
+        abi_version: 1,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut errors = rejected([unsafe { api.peer_info.unwrap()(qso, ptr::null_mut()) }]);
+    for (size, abi) in [(0, 1), (size_of::<PeerInfo>() as u32, 2)] {
+        info.struct_size = size;
+        info.abi_version = abi;
+        errors += rejected([unsafe { api.peer_info.unwrap()(qso, &mut info) }]);
+    }
+    errors += rejected(unsafe {
         [
             api.peer_read.unwrap()(qso, 0, ptr::null(), None, ptr::null_mut(), &mut read),
             api.peer_prepare_audio.unwrap()(

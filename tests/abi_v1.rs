@@ -348,7 +348,25 @@ fn disabled_accounts_have_no_network_side_effects_and_retain_context() {
     );
     assert!(!account.is_null());
     unsafe { api.context_destroy.unwrap()(context) };
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Ok
+    );
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Invalid
+    );
+    let mut qso = ptr::dangling_mut();
+    assert_eq!(
+        unsafe { api.dial.unwrap()(account, 1, &mut qso) },
+        Status::Closed
+    );
+    assert!(qso.is_null());
     assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Closed
+    );
     assert_eq!(unsafe { api.account_stop.unwrap()(account) }, Status::Ok);
     unsafe { api.account_destroy.unwrap()(account) };
     unsafe { api.account_destroy.unwrap()(ptr::null_mut()) };
@@ -425,6 +443,40 @@ fn unsupported_enabled_accounts_and_invalid_records_fail_closed() {
         unsafe { api.account_stop.unwrap()(ptr::null_mut()) },
         Status::Invalid
     );
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(ptr::null_mut(), None, ptr::null_mut()) },
+        Status::Invalid
+    );
+    assert_eq!(
+        unsafe {
+            api.account_reconfigure.unwrap()(
+                ptr::null_mut(),
+                &AccountConfig::default(),
+                ptr::null(),
+            )
+        },
+        Status::Invalid
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let mut qso = ptr::null_mut();
+    for status in unsafe {
+        [
+            api.account_activate.unwrap()(ptr::null_mut(), None, ptr::null_mut()),
+            api.account_reconfigure.unwrap()(
+                ptr::null_mut(),
+                &AccountConfig::default(),
+                ptr::null(),
+            ),
+            api.account_stop.unwrap()(ptr::null_mut()),
+            api.dial.unwrap()(ptr::null_mut(), 1, &mut qso),
+        ]
+    } {
+        assert_eq!(status, Status::Invalid);
+    }
+    drop(entered);
     unsafe { api.context_destroy.unwrap()(context) };
 }
 #[test]

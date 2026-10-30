@@ -270,11 +270,18 @@ fn network_status(error: NetworkError) -> Status {
 fn civil_time() -> (u8, u8) {
     #[cfg(unix)]
     {
-        let seconds = unsafe { libc::time(ptr::null_mut()) };
-        let mut local: libc::tm = unsafe { std::mem::zeroed() };
-        if !unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
-            return (local.tm_hour as u8, local.tm_mday as u8);
-        }
+        civil_time_at(unsafe { libc::time(ptr::null_mut()) })
+    }
+    #[cfg(not(unix))]
+    (255, 0)
+}
+
+/// Convert an absolute wall-clock reading; an unrepresentable date fails closed.
+#[cfg(unix)]
+fn civil_time_at(seconds: libc::time_t) -> (u8, u8) {
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    if !unsafe { libc::localtime_r(&seconds, &mut local) }.is_null() {
+        return (local.tm_hour as u8, local.tm_mday as u8);
     }
     // Invalid stamp fails directory serialization; never publish a fabricated date.
     (255, 0)

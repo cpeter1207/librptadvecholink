@@ -144,6 +144,38 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[test]
+    fn network_failures_preserve_public_admission_and_transport_categories() {
+        use crate::account::network::NetworkError;
+        for (error, status) in [
+            (NetworkError::Invalid, ffi::Status::Invalid),
+            (
+                NetworkError::Admission(crate::account::Admission::Unverified),
+                ffi::Status::Invalid,
+            ),
+            (NetworkError::Stopped, ffi::Status::Closed),
+            (NetworkError::Full, ffi::Status::Full),
+            (
+                NetworkError::Io(std::io::ErrorKind::TimedOut),
+                ffi::Status::Failed,
+            ),
+            (
+                NetworkError::Proxy(crate::transport::proxy::ProxyError::Closed),
+                ffi::Status::Failed,
+            ),
+        ] {
+            assert_eq!(super::super::network_status(error), status);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unrepresentable_wall_clock_does_not_publish_a_fabricated_directory_stamp() {
+        let (hour, day) = super::super::civil_time_at(0);
+        assert!(hour < 24 && (1..=31).contains(&day));
+        assert_eq!(super::super::civil_time_at(libc::time_t::MAX), (255, 0));
+    }
+
     struct Activated(Box<Account>);
     impl Activated {
         fn pointer(&self) -> *mut ffi::Account {

@@ -534,14 +534,13 @@ impl Owner {
                     }
                 },
                 packet = async { match &mut self.transport {
-                    Transport::Proxy(session) => session.recv().await,
+                    Transport::Proxy(session) => session.recv().await
+                        .ok_or_else(|| session.failure().unwrap_or(ProxyError::Closed)),
                     Transport::Direct(_) => std::future::pending().await,
                 }} => match packet {
-                    Some(packet) => self.route(packet.class(), packet.source(), packet.arrived(), packet.payload()),
-                    None => {
-                        if let Transport::Proxy(session) = &self.transport {
-                            terminal = Some(NetworkEvent::ProxyLost(session.failure().unwrap_or(ProxyError::Closed)));
-                        }
+                    Ok(packet) => self.route(packet.class(), packet.source(), packet.arrived(), packet.payload()),
+                    Err(error) => {
+                        terminal = Some(NetworkEvent::ProxyLost(error));
                         break;
                     }
                 },
