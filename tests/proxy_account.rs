@@ -114,6 +114,7 @@ struct Trace {
     finish: AtomicBool,
     drained: AtomicBool,
     limit: AtomicUsize,
+    blocked_reads: AtomicUsize,
     codec: Option<Arc<codec_fault::FaultCodec>>,
 }
 // Unwind in test code must still join foreign callbacks before releasing Trace.
@@ -174,6 +175,7 @@ fn attach(
         finish: AtomicBool::new(false),
         drained: AtomicBool::new(false),
         limit: AtomicUsize::new(if blocked { 0 } else { 73 }),
+        blocked_reads: AtomicUsize::new(0),
         codec,
     });
     let mut fixture = Attached {
@@ -397,6 +399,9 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
     }
     if read.finish_pending != 0 {
         trace.finish.store(true, Ordering::Release);
+    }
+    if read.progress == 2 {
+        trace.blocked_reads.fetch_add(1, Ordering::Release);
     }
     if read.state == 1 && !trace.sent.swap(true, Ordering::AcqRel) {
         let (status, result, packet) = prepared(trace);
@@ -843,6 +848,12 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
             && trace.pcm.load(Ordering::Acquire) == if blocked { 0 } else { expected_pcm }
             && trace.texts.load(Ordering::Acquire) == 1
     });
+    if blocked {
+        assert!(
+            wait(|| trace.blocked_reads.load(Ordering::Acquire) != 0),
+            "zero PCM credit must actually reach the blocked playout deadline"
+        );
+    }
     if received && !blocked && !faults && cause == 5 {
         // No callback means retained text, not permission to discard it or
         // consume the following message out of order.

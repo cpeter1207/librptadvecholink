@@ -32,6 +32,10 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(test)]
+#[path = "../../tests/unit/account_network.rs"]
+pub(crate) mod tests;
+
 /// Metadata-only account notifications. Incoming admission still requires accept/revalidation.
 pub enum NetworkEvent {
     /// One completed directory transaction, independent of existing QSO liveness.

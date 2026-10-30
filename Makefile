@@ -61,6 +61,7 @@ $(PC_FILE): $(PC_TEMPLATE) FORCE | build
 		-e 's|@VERSION@|$(PACKAGE_VERSION)|' -e 's|@ABI_VERSION@|$(SOVERSION)|' $< > $@
 
 test: all
+	$(PYTHON) tests/test_debian_manifest.py
 	$(CARGO) test --all-targets --locked
 	$(MAKE) $(SMOKE_BINARY)
 	LD_LIBRARY_PATH="$(CURDIR)/build:$${LD_LIBRARY_PATH}" ./$(SMOKE_BINARY)

@@ -139,6 +139,289 @@ impl Drop for DirectPeer {
     }
 }
 
+fn binding_for_test(
+    original: &Binding,
+    control: crate::account::network::NetworkControl,
+    settings: Arc<crate::account::settings::PreparedSettings>,
+) -> Arc<Binding> {
+    Arc::new(Binding {
+        runtime: Arc::clone(&original.runtime),
+        _resources: Arc::clone(&original._resources),
+        current: arc_swap::ArcSwap::from(Arc::clone(&settings)),
+        settings,
+        control,
+        generation: original.generation,
+        live: std::sync::atomic::AtomicBool::new(true),
+        drivers: std::sync::Mutex::new(Vec::new()),
+        first_failure: std::sync::Mutex::new(None),
+    })
+}
+
+#[test]
+fn account_bridge_revalidates_accepted_work_before_publishing_a_qso() {
+    use crate::account::{
+        directory::DirectoryState,
+        network::{NetworkEvent, tests::Harness},
+    };
+    type Events = std::sync::Mutex<Vec<(u32, Status)>>;
+    unsafe extern "C" fn observed(opaque: *mut c_void, event: *const ffi::Event) {
+        let events = unsafe { &*opaque.cast::<Events>() };
+        let event = unsafe { &*event };
+        events.lock().unwrap().push((event.kind, event.status));
+    }
+    let fixture = DirectPeer::open();
+    let original = unsafe { &*fixture.qso.cast::<Peer>() };
+    for case in 0..5 {
+        let events = Events::default();
+        let callback = (case != 0).then_some(crate::owner::Callback {
+            function: observed,
+            context: ptr::from_ref(&events).cast_mut().cast(),
+        });
+        original.binding.runtime.block_on(async {
+            let mut harness = Harness::new(Arc::clone(&original.binding.settings)).await;
+            let binding = binding_for_test(
+                &original.binding,
+                harness.control.clone(),
+                Arc::clone(&original.binding.settings),
+            );
+            let (stopping, stop) = tokio::sync::watch::channel(false);
+            if case == 4 {
+                let (input, output) = tokio::sync::mpsc::channel(1);
+                input
+                    .send(NetworkEvent::Directory {
+                        state: DirectoryState::Registering,
+                        fresh: true,
+                        failures: 0,
+                    })
+                    .await
+                    .unwrap();
+                drop(input);
+                crate::owner::bridge(binding, output, stop, callback).await;
+            } else {
+                harness.pending();
+                if case == 1 {
+                    harness.stale_directory();
+                }
+                let (_, empty) = tokio::sync::mpsc::channel(1);
+                let output = std::mem::replace(&mut harness.events, empty);
+                if case == 0 {
+                    drop(harness);
+                    crate::owner::bridge(binding, output, stop, callback).await;
+                } else {
+                    let reader = crate::owner::bridge(Arc::clone(&binding), output, stop, callback);
+                    let network = async {
+                        harness.service().await;
+                        match case {
+                            2 => binding.live.store(false, Ordering::Release),
+                            3 => {
+                                stopping.send_replace(true);
+                            }
+                            _ => {}
+                        }
+                        drop(harness);
+                    };
+                    tokio::join!(reader, network);
+                }
+            }
+        });
+        assert_eq!(
+            *events.lock().unwrap(),
+            match case {
+                1 => vec![(0, Status::Invalid)],
+                4 => vec![(0, Status::Pending)],
+                _ => Vec::new(),
+            },
+            "case {case} must not publish a stale or stopping QSO"
+        );
+    }
+}
+
+#[test]
+fn dial_preserves_admission_timeout_and_post_reply_revalidation_failures() {
+    use crate::account::network::tests::Harness;
+    let fixture = DirectPeer::open();
+    let account = unsafe { &*fixture.account.cast::<crate::owner::Account>() };
+    let original = Arc::clone(
+        &account
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .as_ref()
+            .unwrap()
+            .binding,
+    );
+    let mut configuration = unsafe { ptr::read(original.settings.as_abi()) };
+    configuration.policy.connect_timeout_ms = 20;
+    let settings = Arc::new(
+        unsafe {
+            crate::account::settings::PreparedSettings::copy(
+                &configuration,
+                &secrets("fixture-password"),
+            )
+        }
+        .unwrap(),
+    );
+    for case in 0..3 {
+        let mut harness = account
+            .runtime
+            .block_on(Harness::new(Arc::clone(&settings)));
+        let binding = binding_for_test(&original, harness.control.clone(), Arc::clone(&settings));
+        account
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .binding = Arc::clone(&binding);
+        if case == 0 {
+            harness.stale_directory();
+        }
+        let mut retained = Some(harness);
+        let network = (case != 1).then(|| {
+            let mut harness = retained.take().unwrap();
+            let binding = Arc::clone(&binding);
+            account.runtime.spawn(async move {
+                harness.service().await;
+                if case == 2 {
+                    binding.live.store(false, Ordering::Release);
+                }
+                harness
+            })
+        });
+        let mut output = ptr::null_mut();
+        let status = unsafe { fixture.api.dial.unwrap()(fixture.account, 123456, &mut output) };
+        account
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .binding = Arc::clone(&original);
+        if let Some(network) = network {
+            account.runtime.block_on(network).unwrap();
+        }
+        assert!(output.is_null());
+        assert_eq!(
+            status,
+            [Status::Invalid, Status::Failed, Status::Closed][case]
+        );
+    }
+}
+
+#[test]
+fn real_account_io_failure_preserves_reload_errors_and_retirement_ownership() {
+    for abort_bridge in [false, true] {
+        let fixture = DirectPeer::open();
+        let account = unsafe { &*fixture.account.cast::<crate::owner::Account>() };
+        let (binding, sockets) = {
+            let state = account.state.lock().unwrap();
+            let active = state.active.as_ref().unwrap();
+            if abort_bridge {
+                active.bridge.abort();
+            }
+            (
+                Arc::clone(&active.binding),
+                active.network.direct_sockets().unwrap(),
+            )
+        };
+        if abort_bridge {
+            assert!(proxy_login::wait(|| account
+                .state
+                .lock()
+                .unwrap()
+                .active
+                .as_ref()
+                .unwrap()
+                .bridge
+                .is_finished()));
+        }
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let endpoint = target.local_addr().unwrap();
+        drop(target);
+        account.runtime.block_on(async {
+            let socket = sockets.test_socket(Channel::Audio);
+            socket.connect(endpoint).await.unwrap();
+            socket.writable().await.unwrap();
+            socket.send(b"probe").await.unwrap();
+        });
+        // Preserve the pending ICMP error but make its socket read-ready.
+        let target = std::net::UdpSocket::bind(endpoint).unwrap();
+        target
+            .send_to(b"wake", sockets.local_addr(Channel::Audio).unwrap())
+            .unwrap();
+        assert!(proxy_login::wait(|| matches!(
+            account.runtime.block_on(binding.control.observe()),
+            Err(crate::account::network::NetworkError::Stopped)
+        )));
+        if !abort_bridge {
+            assert!(proxy_login::wait(|| !binding.live.load(Ordering::Acquire)));
+            assert!(matches!(
+                *binding.first_failure.lock().unwrap(),
+                Some(crate::owner::TransportFailure::Io(
+                    std::io::ErrorKind::ConnectionRefused
+                ))
+            ));
+        }
+        let previous = Arc::clone(&binding.settings);
+        let mut next = unsafe { ptr::read(previous.as_abi()) };
+        next.policy.receive_gain_db = -6.0;
+        assert_eq!(
+            unsafe {
+                fixture.api.account_reconfigure.unwrap()(
+                    fixture.account,
+                    &next,
+                    &secrets("fixture-password"),
+                )
+            },
+            if abort_bridge {
+                Status::Closed
+            } else {
+                Status::Ok
+            }
+        );
+        // A stopped network owner is distinct from a failed bridge join. The
+        // former may be replaced; the latter must reject the handoff.
+        next.transport.kind = 1;
+        next.transport.proxy_host = span("127.0.0.1");
+        next.transport.proxy_port = previous
+            .directory_servers()
+            .next()
+            .unwrap()
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .port();
+        assert_eq!(
+            unsafe {
+                fixture.api.account_reconfigure.unwrap()(
+                    fixture.account,
+                    &next,
+                    &secrets("fixture-password"),
+                )
+            },
+            Status::Failed
+        );
+        if abort_bridge {
+            assert!(account.state.lock().unwrap().active.is_none());
+        } else {
+            assert!(
+                account
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .binding
+                    .generation
+                    > binding.generation
+            );
+        }
+    }
+}
+
 #[test]
 fn internal_lock_poison_cannot_publish_or_consume_an_attachment() {
     unsafe extern "C" fn step(opaque: *mut c_void) -> i32 {
@@ -147,6 +430,12 @@ fn internal_lock_poison_cannot_publish_or_consume_an_attachment() {
     }
     let mut fixture = DirectPeer::open();
     let peer = unsafe { &*fixture.qso.cast::<Peer>() };
+    assert_eq!(
+        unsafe {
+            fixture.api.account_reconfigure.unwrap()(fixture.account, ptr::null(), ptr::null())
+        },
+        Status::Invalid
+    );
     let calls = AtomicUsize::new(0);
     for drivers in [true, false] {
         assert!(
@@ -195,6 +484,26 @@ fn internal_lock_poison_cannot_publish_or_consume_an_attachment() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(!fixture.registration.is_null());
+    let context = unsafe { &*fixture.context.cast::<crate::Context>() };
+    {
+        let _executor = context.runtime.enter();
+        // An invalid teardown context must not consume any of these real
+        // retained owners. Their ordinary off-executor Drop still joins them.
+        unsafe {
+            fixture.api.peer_detach.unwrap()(fixture.registration);
+            fixture.api.peer_destroy.unwrap()(fixture.qso);
+            fixture.api.account_destroy.unwrap()(fixture.account);
+        }
+    }
+    let mut info = ffi::PeerInfo {
+        struct_size: size_of::<ffi::PeerInfo>() as u32,
+        abi_version: 1,
+        ..unsafe { std::mem::zeroed() }
+    };
+    assert_eq!(
+        unsafe { fixture.api.validate_pending.unwrap()(fixture.qso, &mut info) },
+        Status::Ok
+    );
 }
 
 #[test]
@@ -253,7 +562,38 @@ fn serial_direct_sends_preserve_readiness_credit_and_the_original_os_failure() {
                     Some(crate::session::Cause::TransportLost)
                 );
                 assert!(serial.cause_detail.starts_with(b"ConnectionRefused"));
+                serial.cause_detail.fill(0);
+                serial.remember(&"later failure");
+                assert_eq!(serial.cause_detail, [0; 32]);
             }
+            peer.binding.live.store(false, Ordering::Release);
+            assert_eq!(
+                serial.send(peer, Channel::Control, b"", None),
+                Status::Closed
+            );
+            let mut encoded = rptadv_codec_client::EncodeResultRaw {
+                struct_size: size_of::<rptadv_codec_client::EncodeResultRaw>() as u32,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe {
+                    peer_prepare_audio(
+                        probe.qso,
+                        ptr::null(),
+                        0,
+                        ptr::null_mut(),
+                        0,
+                        0,
+                        ptr::from_mut(&mut encoded).cast(),
+                    )
+                },
+                Status::Closed
+            );
+            assert_eq!(
+                unsafe { peer_send_prepared(probe.qso, ffi::ByteSpan::default(), 0, 0) },
+                Status::Closed
+            );
+            peer.binding.live.store(true, Ordering::Release);
         }))
         .map_err(|_| "serial direct-send contract failed".to_owned());
         let _ = probe.result.send(result);
@@ -353,6 +693,8 @@ fn proxy_credit_keeps_the_exact_control_packet_until_the_writer_resumes() {
                 let blocked = serial.blocked_sends;
                 serial.flush_control(peer);
                 assert_eq!(serial.control.as_ref(), Some(&packet));
+                serial.action(peer, Some(QsoAction::Heartbeat));
+                assert_eq!(serial.control.as_ref(), Some(&packet));
                 assert_eq!(serial.blocked_sends, blocked + 1);
                 assert!(matches!(
                     serial.writable,
@@ -435,6 +777,138 @@ fn heartbeat_serialization_failure_closes_with_owner_failure_not_transport_loss(
             assert!(serial.control.is_none());
         }))
         .map_err(|_| "heartbeat serialization failure lost its owner cause".to_owned());
+        let _ = probe.result.send(result);
+        -1
+    }
+    let mut fixture = DirectPeer::open();
+    let (result, observed) = std::sync::mpsc::channel();
+    let probe = Probe {
+        qso: fixture.qso,
+        result,
+    };
+    assert_eq!(
+        unsafe {
+            fixture.api.peer_attach.unwrap()(
+                fixture.context,
+                fixture.qso,
+                Some(step),
+                ptr::from_ref(&probe).cast_mut().cast(),
+                &mut fixture.registration,
+            )
+        },
+        Status::Ok
+    );
+    let result = observed.recv_timeout(Duration::from_secs(3));
+    unsafe { fixture.api.peer_detach.unwrap()(fixture.registration) };
+    fixture.registration = ptr::null_mut();
+    result.unwrap().unwrap();
+}
+
+#[test]
+fn retired_serial_turn_and_failed_capabilities_cannot_enter_the_host() {
+    struct Probe {
+        qso: *mut ffi::Qso,
+        result: std::sync::mpsc::Sender<Result<(), String>>,
+    }
+    unsafe extern "C" fn failed_observation(
+        _: *const c_void,
+        _: *mut rptadv_jitter_client::abi::Observation,
+    ) -> i32 {
+        -1
+    }
+    unsafe extern "C" fn count(opaque: *mut c_void) -> i32 {
+        unsafe { &*opaque.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Release);
+        0
+    }
+    unsafe extern "C" fn step(opaque: *mut c_void) -> i32 {
+        let probe = unsafe { &*opaque.cast::<Probe>() };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let peer = unsafe { &*probe.qso.cast::<Peer>() };
+            let resources = &peer.binding._resources;
+            let mut descriptor = unsafe {
+                ptr::read(
+                    resources
+                        .jitter_descriptor()
+                        .cast::<rptadv_jitter_client::abi::Descriptor>(),
+                )
+            };
+            descriptor.observe = Some(failed_observation);
+            let origin = Instant::now();
+            let playout = unsafe {
+                Playout::new(
+                    resources.catalog(),
+                    Codec::GsmFr,
+                    0.0,
+                    ptr::from_ref(&descriptor).cast(),
+                    origin,
+                )
+            }
+            .unwrap();
+            let coordinator = crate::account::coordination::Coordinator::new(
+                crate::transport::routing::Router::new(
+                    crate::account::Account::new(1, Vec::new(), Vec::new()).unwrap(),
+                    1,
+                    Duration::from_secs(30),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let replacement = Receiver::new(
+                Qso::new(
+                    peer.identity.clone(),
+                    peer.generation,
+                    timers(&peer.binding.settings.as_abi().policy),
+                    origin,
+                )
+                .unwrap(),
+                playout,
+                CodecChoice::new(resources.catalog()).unwrap(),
+                coordinator.port(
+                    peer.identity.node_number,
+                    peer.generation,
+                    Arc::clone(&peer.control),
+                ),
+            );
+            let original = {
+                let serial = unsafe { (*peer.serial.get()).as_mut() }.unwrap();
+                std::mem::replace(&mut serial.receiver, replacement)
+            };
+            let mut observation = ffi::PeerObservation {
+                struct_size: size_of::<ffi::PeerObservation>() as u32,
+                abi_version: 1,
+                ..Default::default()
+            };
+            let observed = unsafe { peer_observe(probe.qso, &mut observation) };
+            {
+                let serial = unsafe { (*peer.serial.get()).as_mut() }.unwrap();
+                serial.receiver = original; // Drop before the stack descriptor.
+                let writer = crate::transport::proxy::ProxyWriter::new(tokio::io::sink());
+                let output = writer.output();
+                drop(writer); // A genuinely closed queue, not a fabricated IO result.
+                let transport =
+                    std::mem::replace(&mut serial.transport, PeerTransport::Proxy(output));
+                let sent =
+                    serial.send(peer, Channel::Control, &[0xc0, 201, 0, 1, 0, 0, 0, 0], None);
+                serial.transport = transport;
+                assert_eq!(sent, Status::Closed);
+            }
+            assert_eq!(observed, Status::Failed);
+            peer.control.stop();
+            let calls = AtomicUsize::new(0);
+            assert!(
+                serial_turn(
+                    peer,
+                    Callback {
+                        function: count,
+                        context: ptr::from_ref(&calls).cast_mut().cast(),
+                    },
+                    PeerEvent::Wake
+                )
+                .is_none()
+            );
+            assert_eq!(calls.load(Ordering::Acquire), 0);
+        }))
+        .map_err(|_| "retired serial/capability contract failed".to_owned());
         let _ = probe.result.send(result);
         -1
     }

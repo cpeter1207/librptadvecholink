@@ -223,39 +223,38 @@ pub(crate) unsafe extern "C" fn peer_attach(
         Arc::clone(&peer.binding.runtime),
         Arc::clone(&peer.control),
         prepared.ingress,
-        move |event| {
-            if active.control.is_stopped() {
-                return None;
-            }
-            {
-                let serial =
-                    unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
-                serial.event(&active, event);
-            }
-            if callback.call() < 0 {
-                return None;
-            }
-            if active.control.is_stopped() {
-                return None;
-            }
-            // End all prior borrows before callback.call: it may reenter this QSO.
-            let serial = unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
-            let now = Instant::now();
-            serial.flush_control(&active);
-            Some(PeerWait {
-                receive: !serial.blocked && serial.receiver.can_receive() && serial.text.is_none(),
-                deadline: [serial.deadline, serial.receiver.deadline(now)]
-                    .into_iter()
-                    .flatten()
-                    .min(),
-                writable: serial.writable.take(),
-            })
-        },
+        move |event| serial_turn(&active, callback, event),
     ));
     drivers.retain(|driver| driver.strong_count() != 0);
     drivers.push(Arc::downgrade(&driver));
     *output = Box::into_raw(Box::new(Registration { driver, peer })).cast();
     Status::Ok
+}
+
+/// One serialized turn, with no mutable borrow across the reentrant host call.
+/// Stop may race the driver dispatch, so check again before entering the host.
+fn serial_turn(active: &Peer, callback: Callback, event: PeerEvent) -> Option<PeerWait> {
+    if active.control.is_stopped() {
+        return None;
+    }
+    {
+        let serial = unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
+        serial.event(active, event);
+    }
+    if callback.call() < 0 || active.control.is_stopped() {
+        return None;
+    }
+    let serial = unsafe { (*active.serial.get()).as_mut() }.expect("attached serial owner");
+    let now = Instant::now();
+    serial.flush_control(active);
+    Some(PeerWait {
+        receive: !serial.blocked && serial.receiver.can_receive() && serial.text.is_none(),
+        deadline: [serial.deadline, serial.receiver.deadline(now)]
+            .into_iter()
+            .flatten()
+            .min(),
+        writable: serial.writable.take(),
+    })
 }
 
 fn timers(policy: &ffi::AccountPolicy) -> Timers {

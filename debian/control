@@ -10,7 +10,10 @@ Rules-Requires-Root: no
 Package: librptadvecholink1
 Architecture: any
 Multi-Arch: same
-Depends: ${misc:Depends}, ${shlibs:Depends}
+Depends: ${misc:Depends}, ${shlibs:Depends},
+ librptadv-codec-gsm1 (>= 0.1.0~alpha1),
+ librptadv-codec-speex1 (>= 0.1.0~alpha1),
+ librptadv-jitter-adapter1
 Description: EchoLink protocol provider for RPT Advanced
  Independently versioned provider for EchoLink account, protocol and media work.
 

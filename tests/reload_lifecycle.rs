@@ -407,8 +407,9 @@ fn exclusive_reload_quiesces_retained_peers_and_restores_configuration_on_bind_f
             Status::Ok
         );
         wait(|| step.entered.load(Ordering::Acquire));
-        let occupied = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let occupied = UdpSocket::bind("127.0.0.2:0").unwrap();
         if failed_replacement {
+            config.transport.bind_address = span("127.0.0.2");
             config.transport.audio_port = occupied.local_addr().unwrap().port();
         }
         let address = account as usize;

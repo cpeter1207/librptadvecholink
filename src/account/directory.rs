@@ -450,11 +450,11 @@ fn valid_policy(servers: &[String], policy: DirectoryPolicy) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    #[test]
-    fn completion_tokens_never_wrap_or_reuse_an_old_job() {
+    /// Build the finite-token boundary without looping through prior jobs.
+    pub(crate) fn at_token(next_id: u64) -> DirectoryControl {
         let policy = DirectoryPolicy {
             operation_timeout: Duration::from_secs(1),
             registration_refresh: Duration::from_secs(300),
@@ -462,7 +462,13 @@ mod tests {
             retry: Duration::from_secs(20),
         };
         let mut owner = DirectoryControl::new(vec!["server".into()], policy).unwrap();
-        owner.next_id = u64::MAX - 1;
+        owner.next_id = next_id;
+        owner
+    }
+
+    #[test]
+    fn completion_tokens_never_wrap_or_reuse_an_old_job() {
+        let mut owner = at_token(u64::MAX - 1);
         let now = Instant::now();
         let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
         let last = owner.poll(&snapshot, now).unwrap().unwrap();
