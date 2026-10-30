@@ -4,7 +4,7 @@ use crate::wire::{Channel, MAX_DATAGRAM};
 use std::{
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -114,11 +114,26 @@ pub struct Producer {
     media_slots: Arc<Semaphore>,
     budget: Arc<Budget>,
     generation: u64,
+    full_drops: Arc<AtomicU64>,
 }
 
 impl Producer {
     /// Reserve a FIFO slot, media allowance and byte budget before copying the payload.
     pub fn try_push(
+        &self,
+        class: Channel,
+        source: SocketAddr,
+        arrived: Instant,
+        payload: &[u8],
+    ) -> Result<(), PushError> {
+        let result = self.push(class, source, arrived, payload);
+        if result == Err(PushError::Full) {
+            self.full_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn push(
         &self,
         class: Channel,
         source: SocketAddr,
@@ -164,9 +179,14 @@ impl Producer {
 /// Unique serial receive owner; close then drain before dropping callback state.
 pub struct Consumer {
     receiver: mpsc::Receiver<Datagram>,
+    observer: Observer,
 }
 
 impl Consumer {
+    /// Copy a metadata-only weak route observer before transferring this owner.
+    pub fn observer(&self) -> Observer {
+        self.observer.clone()
+    }
     /// Poll one packet without waiting; callers process at most 16 per owner turn.
     pub fn try_recv(&mut self) -> Option<Datagram> {
         self.receiver.try_recv().ok()
@@ -181,19 +201,68 @@ impl Consumer {
     }
 }
 
+/// Copied ingress accounting; reservations count as queued until released.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Observation {
+    /// Reserved/queued slots, excluding a packet already lent to the consumer.
+    pub queued_packets: u32,
+    /// Total route slots; zero means the producer is no longer available.
+    pub capacity_packets: u32,
+    /// Failed slot, media or byte-credit admissions; never a hangup.
+    pub full_drops: u64,
+    /// Bytes charged to queued and currently borrowed packets.
+    pub retained_bytes: u64,
+}
+
+/// Observes current credit without retaining a routing producer or consumer.
+#[derive(Clone)]
+pub struct Observer {
+    sender: mpsc::WeakSender<Datagram>,
+    budget: Weak<Budget>,
+    full_drops: Arc<AtomicU64>,
+}
+impl Observer {
+    /// Copy independently sampled counters without borrowing the receive owner.
+    pub fn observe(&self) -> Observation {
+        let (queued_packets, capacity_packets) = self.sender.upgrade().map_or((0, 0), |sender| {
+            (
+                (sender.max_capacity() - sender.capacity()) as u32,
+                sender.max_capacity() as u32,
+            )
+        });
+        Observation {
+            queued_packets,
+            capacity_packets,
+            full_drops: self.full_drops.load(Ordering::Relaxed),
+            retained_bytes: self
+                .budget
+                .upgrade()
+                .map_or(0, |budget| budget.retained_bytes() as u64),
+        }
+    }
+}
+
 /// Allocate one nonzero generation's bounded route outside real-time callbacks.
 pub fn channel(generation: u64) -> Option<(Producer, Consumer)> {
     if generation == 0 {
         return None;
     }
     let (sender, receiver) = mpsc::channel(64);
+    let budget = Arc::new(Budget::default());
+    let full_drops = Arc::new(AtomicU64::new(0));
+    let observer = Observer {
+        sender: sender.downgrade(),
+        budget: Arc::downgrade(&budget),
+        full_drops: Arc::clone(&full_drops),
+    };
     Some((
         Producer {
             sender,
             media_slots: Arc::new(Semaphore::new(56)),
-            budget: Arc::new(Budget::default()),
+            budget,
             generation,
+            full_drops,
         },
-        Consumer { receiver },
+        Consumer { receiver, observer },
     ))
 }

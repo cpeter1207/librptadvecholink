@@ -282,6 +282,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         speex: bool,
         calls: AtomicUsize,
         errors: AtomicUsize,
+        ingress_capacity: AtomicUsize,
         packet: std::sync::Mutex<Vec<u8>>,
         packet_time: AtomicUsize,
         texts: AtomicUsize,
@@ -497,6 +498,12 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         {
             trace.errors.fetch_add(1, Ordering::Release);
         }
+        if result.state == 1 {
+            trace.ingress_capacity.store(
+                observation.ingress_capacity_packets as usize,
+                Ordering::Release,
+            );
+        }
         trace.closed.store(closed, Ordering::Release);
         if unsafe { trace.api.peer_info.unwrap()(trace.qso, &mut identity) } != Status::Ok
             || identity.node_number != 123456
@@ -686,6 +693,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             speex,
             calls: AtomicUsize::new(0),
             errors: AtomicUsize::new(0),
+            ingress_capacity: AtomicUsize::new(0),
             packet: std::sync::Mutex::new(Vec::new()),
             packet_time: AtomicUsize::new(0),
             texts: AtomicUsize::new(0),
@@ -816,5 +824,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             api.peer_destroy.unwrap()(outgoing);
         }
         server.join().unwrap();
+        // Evaluate new diagnostic assertions only after every callback barrier.
+        assert_eq!(serial.ingress_capacity.load(Ordering::Acquire), 64);
     }
 }

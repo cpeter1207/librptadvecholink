@@ -489,6 +489,7 @@ impl Owner {
             Transport::Proxy(_) => None,
         };
         let mut work: Option<DirectoryWork> = None;
+        let mut terminal = None;
         loop {
             if *self.stop.borrow() {
                 break;
@@ -518,13 +519,19 @@ impl Owner {
                     Some(sockets) => sockets.recv(Channel::Audio, &mut audio).await,
                     None => std::future::pending().await,
                 }} => {
-                    if !self.received(Channel::Audio, result, &audio) { break; }
+                    if let Err(error) = self.received(Channel::Audio, result, &audio) {
+                        terminal = Some(NetworkEvent::TransportLost(error));
+                        break;
+                    }
                 },
                 result = async { match sockets.as_ref() {
                     Some(sockets) => sockets.recv(Channel::Control, &mut control).await,
                     None => std::future::pending().await,
                 }} => {
-                    if !self.received(Channel::Control, result, &control) { break; }
+                    if let Err(error) = self.received(Channel::Control, result, &control) {
+                        terminal = Some(NetworkEvent::TransportLost(error));
+                        break;
+                    }
                 },
                 packet = async { match &mut self.transport {
                     Transport::Proxy(session) => session.recv().await,
@@ -533,7 +540,7 @@ impl Owner {
                     Some(packet) => self.route(packet.class(), packet.source(), packet.arrived(), packet.payload()),
                     None => {
                         if let Transport::Proxy(session) = &self.transport {
-                            let _ = self.events.try_send(NetworkEvent::ProxyLost(session.failure().unwrap_or(ProxyError::Closed)));
+                            terminal = Some(NetworkEvent::ProxyLost(session.failure().unwrap_or(ProxyError::Closed)));
                         }
                         break;
                     }
@@ -554,6 +561,14 @@ impl Owner {
             }
             // A permanently ready socket/command queue cannot monopolize the executor.
             tokio::task::yield_now().await;
+        }
+        if let Some(event) = terminal {
+            // This account has stopped routing. Retain its first cause behind
+            // ordinary health events, but never prevent lifecycle quiescence.
+            tokio::select! {
+                _ = self.events.send(event) => {},
+                _ = self.stop.changed() => {},
+            }
         }
         drop(work);
         self.commands.close();
@@ -601,18 +616,10 @@ impl Owner {
         class: Channel,
         result: io::Result<(usize, SocketAddr)>,
         bytes: &[u8],
-    ) -> bool {
-        let (length, source) = match result {
-            Ok(packet) => packet,
-            Err(error) => {
-                let _ = self
-                    .events
-                    .try_send(NetworkEvent::TransportLost(error.kind()));
-                return false;
-            }
-        };
+    ) -> Result<(), io::ErrorKind> {
+        let (length, source) = result.map_err(|error| error.kind())?;
         self.route(class, source, Instant::now(), &bytes[..length]);
-        true
+        Ok(())
     }
 
     fn route(&mut self, class: Channel, source: SocketAddr, arrived: Instant, bytes: &[u8]) {

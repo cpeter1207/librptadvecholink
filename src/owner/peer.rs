@@ -39,6 +39,7 @@ pub(super) struct Serial {
     settings: Arc<crate::account::settings::PreparedSettings>,
     deadline: Option<Instant>,
     receiver: Receiver,
+    ingress: crate::transport::mailbox::Observer,
     encoder: PreparedMedia,
     transport: PeerTransport,
     control: Option<Vec<u8>>,
@@ -185,6 +186,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         settings,
         deadline: None,
         receiver,
+        ingress: prepared.ingress.observer(),
         encoder,
         transport: prepared.transport,
         control: None,
@@ -780,6 +782,7 @@ pub(crate) unsafe extern "C" fn peer_observe(
         Err(_) => return Status::Failed,
     };
     let jitter = observed.jitter;
+    let ingress = serial.ingress.observe();
     let result = ffi::PeerObservation {
         struct_size: size_of::<ffi::PeerObservation>() as u32,
         abi_version: 1,
@@ -831,6 +834,10 @@ pub(crate) unsafe extern "C" fn peer_observe(
         proxy_admitted: serial.proxy_admitted,
         text_admitted: serial.text_admitted,
         text_rejected: serial.text_rejected,
+        ingress_full_packets: ingress.full_drops,
+        ingress_queued_packets: ingress.queued_packets,
+        ingress_capacity_packets: ingress.capacity_packets,
+        ingress_retained_bytes: ingress.retained_bytes,
     };
     unsafe { ptr::write(output, result) };
     Status::Ok

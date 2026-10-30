@@ -7,6 +7,50 @@ use rptadv_echolink::{
 use std::{net::SocketAddr, time::Instant};
 
 #[test]
+fn copied_ingress_observation_retains_byte_charges_without_keeping_a_route_open() {
+    let (sender, mut receiver) = channel(7).unwrap();
+    let observer = receiver.observer();
+    let source = "192.0.2.1:5198".parse().unwrap();
+    let now = Instant::now();
+    for _ in 0..56 {
+        sender
+            .try_push(Channel::Audio, source, now, &[1, 2])
+            .unwrap();
+    }
+    assert_eq!(
+        sender.try_push(Channel::Audio, source, now, &[1]),
+        Err(PushError::Full)
+    );
+    let record = observer.observe();
+    assert_eq!(
+        (
+            record.queued_packets,
+            record.capacity_packets,
+            record.full_drops,
+            record.retained_bytes
+        ),
+        (56, 64, 1, 112)
+    );
+    let borrowed = receiver.try_recv().unwrap();
+    assert_eq!(observer.observe().queued_packets, 55);
+    assert_eq!(
+        observer.observe().retained_bytes,
+        112,
+        "dequeue does not release a borrowed packet"
+    );
+    drop(borrowed);
+    assert_eq!(observer.observe().retained_bytes, 110);
+    drop(sender);
+    assert_eq!(
+        observer.observe().capacity_packets,
+        0,
+        "observer must not keep routing admission open"
+    );
+    while receiver.try_recv().is_some() {}
+    assert_eq!(observer.observe().retained_bytes, 0);
+}
+
+#[test]
 fn control_survives_media_backpressure_without_reordering_admitted_packets() {
     let (sender, mut receiver) = channel(7).unwrap();
     let source: SocketAddr = "192.0.2.1:5198".parse().unwrap();

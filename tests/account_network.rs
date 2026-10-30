@@ -227,6 +227,94 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
 }
 
 #[test]
+fn terminal_proxy_cause_survives_a_full_account_event_queue_and_stop_remains_bounded() {
+    use rptadv_echolink::transport::proxy::ProxyError;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                async fn frame(socket: &mut tokio::net::TcpStream) -> u8 {
+                    let mut header = [0; 9];
+                    socket.read_exact(&mut header).await.unwrap();
+                    let mut payload =
+                        vec![0; u32::from_le_bytes(header[5..].try_into().unwrap()) as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    header[0]
+                }
+                async fn send(socket: &mut tokio::net::TcpStream, kind: u8, payload: &[u8]) {
+                    let mut packet = vec![kind, 0, 0, 0, 0];
+                    packet.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                    packet.extend_from_slice(payload);
+                    socket.write_all(&packet).await.unwrap();
+                }
+                for drain in [true, false] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let (close, wait) = tokio::sync::oneshot::channel();
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        socket.write_all(b"12345678").await.unwrap();
+                        socket.read_exact(&mut [0; 25]).await.unwrap();
+                        for response in [b"OK".as_slice(), b"@@@\n0\n+++\n"] {
+                            assert_eq!(frame(&mut socket).await, 1);
+                            send(&mut socket, 4, &[0; 4]).await;
+                            assert_eq!(frame(&mut socket).await, 2);
+                            send(&mut socket, 2, response).await;
+                            assert_eq!(frame(&mut socket).await, 3);
+                            send(&mut socket, 3, &[]).await;
+                        }
+                        wait.await.unwrap(); // Close with both directory health events still queued.
+                    });
+                    let base = settings_at("127.0.0.1", 300000, 1, 5198, port);
+                    // C scalars and borrowed spans only; keep base alive through copy.
+                    let mut config = unsafe { std::ptr::read(base.as_abi()) };
+                    config.policy.max_stations = 1;
+                    config.policy.max_pending_handshakes = 1;
+                    let secret = AccountSecrets {
+                        struct_size: size_of::<AccountSecrets>() as u32,
+                        abi_version: 1,
+                        directory_password: span("fixture-password"),
+                        proxy_password: ByteSpan::default(),
+                    };
+                    let config =
+                        Arc::new(unsafe { PreparedSettings::copy(&config, &secret) }.unwrap());
+                    let (network, mut events) =
+                        AccountNetwork::open(config, || (9, 3)).await.unwrap();
+                    while events.len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                    close.send(()).unwrap();
+                    server.await.unwrap();
+                    // Let the reader and account owner observe EOF before freeing event credit.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if drain {
+                        assert!(matches!(
+                            events.recv().await,
+                            Some(NetworkEvent::Directory { .. })
+                        ));
+                        assert!(matches!(
+                            events.recv().await,
+                            Some(NetworkEvent::Directory { .. })
+                        ));
+                        assert!(
+                            matches!(
+                                events.recv().await,
+                                Some(NetworkEvent::ProxyLost(ProxyError::Closed))
+                            ),
+                            "terminal cause was silently dropped behind ordinary health events"
+                        );
+                    }
+                    network.stop().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+}
+
+#[test]
 fn proxy_account_uses_its_selected_proxy_for_directory_and_peer_traffic() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

@@ -267,6 +267,10 @@ struct rptadv_echolink_peer_observation_v1 {
     uint64_t proxy_admitted; /**< Proxy queue admissions, not TCP sends. */
     uint64_t text_admitted; /**< Human messages admitted by selected transport. */
     uint64_t text_rejected; /**< Human messages rejected before admission. */
+    uint64_t ingress_full_packets; /**< Per-QSO slot/media/byte-credit drops. */
+    uint32_t ingress_queued_packets; /**< Reserved/queued slots, excluding lent packet. */
+    uint32_t ingress_capacity_packets; /**< Route slots; zero if producer unavailable. */
+    uint64_t ingress_retained_bytes; /**< Queued and currently borrowed payload bytes. */
 };
 
 /** Immutable table; unavailable slots are not advertised as capabilities. */

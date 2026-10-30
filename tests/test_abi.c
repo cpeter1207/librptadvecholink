@@ -10,7 +10,7 @@ _Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,
                "complete borrowed incoming event layout");
 _Static_assert(sizeof(struct rptadv_echolink_account_observation_v1) == 280,
                "complete account metadata layout");
-_Static_assert(sizeof(struct rptadv_echolink_peer_observation_v1) == 264,
+_Static_assert(sizeof(struct rptadv_echolink_peer_observation_v1) == 288,
                "complete serial peer metadata layout");
 _Static_assert(offsetof(struct rptadv_echolink_peer_observation_v1, jitter) == 120,
                "source-clock jitter metadata layout");
