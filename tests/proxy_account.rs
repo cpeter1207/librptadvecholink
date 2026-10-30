@@ -158,6 +158,7 @@ struct Trace {
     cause: AtomicUsize,
     sent: AtomicBool,
     prepare_status: AtomicI32,
+    receive_fault: AtomicI32,
     checked: AtomicBool,
     closing_checked: AtomicBool,
     pcm: AtomicUsize,
@@ -217,6 +218,7 @@ fn attach(
         cause: AtomicUsize::new(0),
         sent: AtomicBool::new(false),
         prepare_status: AtomicI32::new(Status::Pending as i32),
+        receive_fault: AtomicI32::new(0),
         checked: AtomicBool::new(false),
         closing_checked: AtomicBool::new(false),
         pcm: AtomicUsize::new(0),
@@ -444,6 +446,9 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
     };
     if status != Status::Ok {
         trace.errors.fetch_add(1, Ordering::Release);
+        if let Some(codec) = &trace.codec {
+            codec.select(0);
+        }
     }
     if read.activity == 1 {
         trace.keyed.store(true, Ordering::Release);
@@ -490,6 +495,10 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
             } != Status::Ok
         {
             trace.errors.fetch_add(1, Ordering::Release);
+        }
+        let fault = trace.receive_fault.swap(0, Ordering::AcqRel);
+        if fault != 0 {
+            trace.codec.as_ref().unwrap().select(fault);
         }
     }
     if read.state == 2 && !trace.closing_checked.swap(true, Ordering::AcqRel) {
@@ -777,6 +786,54 @@ fn attached_peer_reports_setup_and_liveness_expiry_without_failing_its_account()
         );
         assert_eq!(fixture.trace.errors.load(Ordering::Acquire), 0);
         assert_eq!(fixture.trace.pcm.load(Ordering::Acquire), 0);
+        let mut health = AccountObservation {
+            struct_size: size_of::<AccountObservation>() as u32,
+            abi_version: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { api.account_observe.unwrap()(account, &mut health) },
+            Status::Ok
+        );
+        assert_eq!(health.available, 1);
+        assert_eq!(health.first_cause, 0);
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
+}
+
+#[test]
+fn fatal_received_codec_failure_keeps_owner_cause_separate_from_transport_failure() {
+    for fault in [1, 5] {
+        let codec = Arc::new(codec_fault::FaultCodec::new(
+            rptadv_codec_client::ProfileId::GsmFr,
+        ));
+        let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+        let context = fault_context(api, &codec, rptadv_codec_client::ProfileId::GsmFr);
+        let _context = ContextOwner(api, context);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || registered(&listener));
+        let servers = [span("127.0.0.1")];
+        let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+        config.transport.kind = 1;
+        config.transport.proxy_host = span("127.0.0.1");
+        config.transport.proxy_port = port;
+        let account = prepare(api, context, &config);
+        assert_eq!(
+            unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+            Status::Ok
+        );
+        let mut socket = server.join().unwrap();
+        let fixture = attach(api, context, account, false, Some(codec));
+        fixture.trace.receive_fault.store(fault, Ordering::Release);
+        fixture.trace.drained.store(true, Ordering::Release);
+        start_media(&mut socket, false);
+        assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 3));
+        assert_eq!(fixture.trace.cause.load(Ordering::Acquire), 6);
+        assert_eq!(
+            fixture.trace.errors.load(Ordering::Acquire),
+            usize::from(fault == 5)
+        );
         let mut health = AccountObservation {
             struct_size: size_of::<AccountObservation>() as u32,
             abi_version: 1,
