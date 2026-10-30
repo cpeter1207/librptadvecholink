@@ -148,6 +148,12 @@ struct Trace {
     closing_checked: AtomicBool,
     pcm: AtomicUsize,
     texts: AtomicUsize,
+    text_enabled: AtomicBool,
+    queued: AtomicUsize,
+    concealed: AtomicUsize,
+    gaps: AtomicUsize,
+    codec_plc: AtomicUsize,
+    fallback: AtomicUsize,
     errors: AtomicUsize,
     keyed: AtomicBool,
     unkeyed: AtomicBool,
@@ -200,6 +206,12 @@ fn attach(
         closing_checked: AtomicBool::new(false),
         pcm: AtomicUsize::new(0),
         texts: AtomicUsize::new(0),
+        text_enabled: AtomicBool::new(true),
+        queued: AtomicUsize::new(0),
+        concealed: AtomicUsize::new(0),
+        gaps: AtomicUsize::new(0),
+        codec_plc: AtomicUsize::new(0),
+        fallback: AtomicUsize::new(0),
         errors: AtomicUsize::new(0),
         keyed: AtomicBool::new(false),
         unkeyed: AtomicBool::new(false),
@@ -297,20 +309,35 @@ unsafe extern "C" fn audio(
     _: u64,
     _: *const f32,
     count: usize,
-    _: u32,
+    concealed: u32,
 ) -> usize {
     let trace = unsafe { &*opaque.cast::<Trace>() };
     let accepted = count.min(trace.limit.load(Ordering::Acquire));
     trace.pcm.fetch_add(accepted, Ordering::Release);
+    if concealed != 0 {
+        trace.concealed.fetch_add(accepted, Ordering::Release);
+    }
     accepted
 }
-unsafe extern "C" fn gap(_: *mut std::ffi::c_void, _: u64, count: u32) -> u32 {
-    count
+unsafe extern "C" fn gap(opaque: *mut std::ffi::c_void, _: u64, count: u32) -> u32 {
+    let trace = unsafe { &*opaque.cast::<Trace>() };
+    let accepted = (count as usize).min(trace.limit.load(Ordering::Acquire));
+    trace.gaps.fetch_add(accepted, Ordering::Release);
+    accepted as u32
 }
-unsafe extern "C" fn text(opaque: *mut std::ffi::c_void, _: ByteSpan, _: ByteSpan) {
-    unsafe { &*opaque.cast::<Trace>() }
-        .texts
-        .fetch_add(1, Ordering::Release);
+unsafe extern "C" fn text(opaque: *mut std::ffi::c_void, sender: ByteSpan, body: ByteSpan) {
+    let trace = unsafe { &*opaque.cast::<Trace>() };
+    let index = trace.texts.load(Ordering::Acquire);
+    let expected = [
+        b"Incoming message".as_slice(),
+        b"Second message",
+        b"Third message",
+    ];
+    let bytes = |span: ByteSpan| unsafe { std::slice::from_raw_parts(span.data, span.length) };
+    if bytes(sender) != b"W1XYZ-R" || expected.get(index).copied() != Some(bytes(body)) {
+        trace.errors.fetch_add(1, Ordering::Release);
+    }
+    trace.texts.fetch_add(1, Ordering::Release);
 }
 // Use the released encoder for state/expiry probes, not invented RTP bytes.
 fn prepared(trace: &Trace) -> (Status, rptadv_codec_client::EncodeResultRaw, [u8; 264]) {
@@ -392,7 +419,7 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
             trace.qso,
             u32::from(trace.drained.load(Ordering::Acquire)),
             &sink,
-            Some(text),
+            trace.text_enabled.load(Ordering::Acquire).then_some(text),
             opaque,
             &mut read,
         )
@@ -471,6 +498,15 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
         ..Default::default()
     };
     if unsafe { trace.api.peer_observe.unwrap()(trace.qso, &mut observed) } == Status::Ok {
+        trace
+            .queued
+            .store(observed.ingress_queued_packets as usize, Ordering::Release);
+        trace
+            .codec_plc
+            .store(observed.codec_plc_samples as usize, Ordering::Release);
+        trace
+            .fallback
+            .store(observed.fallback_gap_samples as usize, Ordering::Release);
         trace
             .cause
             .store(observed.first_cause as usize, Ordering::Release);
@@ -680,12 +716,58 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
     let mut fixture = attach(api, context, account, blocked, codec);
     let trace = fixture.trace.as_ref();
     let (media, chat) = start_media(&mut socket, speex);
+    let loss_trial = !blocked && !faults && cause == 5;
+    if loss_trial {
+        // Admit the later packet before the first packet's playout deadline,
+        // keeping the missing span inside one known finite jitter timeline.
+        let mut later = media.clone();
+        let sequence = u16::from_be_bytes(later[2..4].try_into().unwrap()).wrapping_add(2);
+        let timestamp = u32::from_be_bytes(later[4..8].try_into().unwrap()).wrapping_add(1280);
+        later[2..4].copy_from_slice(&sequence.to_be_bytes());
+        later[4..8].copy_from_slice(&timestamp.to_be_bytes());
+        send(&mut socket, 5, [127, 0, 0, 2], &later);
+    }
+    let expected_pcm = if loss_trial {
+        if speex { 1920 } else { 1280 }
+    } else {
+        640
+    };
     let connected = wait(|| trace.state.load(Ordering::Acquire) == 1);
     let received = wait(|| {
         trace.keyed.load(Ordering::Acquire)
-            && trace.pcm.load(Ordering::Acquire) == if blocked { 0 } else { 640 }
+            && trace.pcm.load(Ordering::Acquire) == if blocked { 0 } else { expected_pcm }
             && trace.texts.load(Ordering::Acquire) == 1
     });
+    if received && !blocked && !faults && cause == 5 {
+        // No callback means retained text, not permission to discard it or
+        // consume the following message out of order.
+        trace.text_enabled.store(false, Ordering::Release);
+        for body in [b"Second message".as_slice(), b"Third message"] {
+            let mut packet = b"oNDATAW1XYZ-R>".to_vec();
+            packet.extend(body);
+            packet.extend(b"\r\n\0");
+            send(&mut socket, 5, [127, 0, 0, 2], &packet);
+        }
+        assert!(wait(|| trace.queued.load(Ordering::Acquire) != 0));
+        assert_eq!(trace.texts.load(Ordering::Acquire), 1);
+        trace.text_enabled.store(true, Ordering::Release);
+        unsafe { api.peer_wake.unwrap()(fixture.registration) };
+        assert!(wait(|| trace.texts.load(Ordering::Acquire) == 3));
+        unsafe { api.peer_wake.unwrap()(fixture.registration) };
+        // GSM reports a ring gap; Speex supplies its own codec-native PLC.
+        assert_eq!(
+            trace.concealed.load(Ordering::Acquire),
+            if speex { 640 } else { 0 }
+        );
+        assert_eq!(
+            trace.gaps.load(Ordering::Acquire),
+            if speex { 0 } else { 640 }
+        );
+        assert!(wait(|| trace.codec_plc.load(Ordering::Acquire)
+            == if speex { 640 } else { 0 }
+            && trace.fallback.load(Ordering::Acquire)
+                == if speex { 0 } else { 640 }));
+    }
     match cause {
         1 => unsafe { api.peer_stop.unwrap()(fixture.registration) },
         2 => {
@@ -746,7 +828,7 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
         trace.errors.load(Ordering::Acquire)
     );
     assert_eq!(trace.errors.load(Ordering::Acquire), 0);
-    assert_eq!(trace.pcm.load(Ordering::Acquire), 640);
+    assert_eq!(trace.pcm.load(Ordering::Acquire), expected_pcm);
     assert!(trace.closing_checked.load(Ordering::Acquire));
     assert!(account_observed);
     if cause == 5 {
