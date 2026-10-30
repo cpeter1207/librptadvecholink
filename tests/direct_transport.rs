@@ -100,3 +100,39 @@ fn direct_minimum_and_maximum_datagrams_are_not_truncated_or_treated_as_hangups(
         );
     });
 }
+
+#[test]
+fn unsupported_endpoints_and_real_send_failures_remain_distinct_from_backpressure() {
+    run(async {
+        let ipv4: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let ipv6: SocketAddr = "[::1]:0".parse().unwrap();
+        for (audio, control) in [(ipv6, ipv4), (ipv4, ipv6)] {
+            assert_eq!(
+                DirectSockets::bind(audio, control)
+                    .await
+                    .err()
+                    .unwrap()
+                    .kind(),
+                ErrorKind::InvalidInput
+            );
+        }
+        let account = DirectSockets::bind(ipv4, ipv4).await.unwrap();
+        assert_eq!(
+            account.try_send(Channel::Audio, ipv6, b"voice"),
+            Err(SendError::Failed(ErrorKind::InvalidInput))
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match account.try_send(Channel::Audio, ipv4, b"voice") {
+                    Err(SendError::Pending) => account.writable(Channel::Audio).await.unwrap(),
+                    result => {
+                        assert_eq!(result, Err(SendError::Failed(ErrorKind::InvalidInput)));
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+    });
+}

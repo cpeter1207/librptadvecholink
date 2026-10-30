@@ -158,17 +158,65 @@ fn runtime_resources_load_real_dsos_and_keep_the_legacy_prefix_usable() {
         data: value.as_ptr(),
         length: value.len(),
     };
-    let mut config = RuntimeConfig {
+    let complete = || RuntimeConfig {
         worker_threads: 1,
         gsm_library: span(&gsm),
         speex_library: span(&speex),
         jitter_library: span(&jitter),
         ..Default::default()
     };
+    let mut config = complete();
     let create = api.context_create.unwrap();
     let mut output = ptr::null_mut();
     assert_eq!(unsafe { create(&config, &mut output) }, Status::Ok);
     unsafe { api.context_destroy.unwrap()(output) };
+    for (gsm_library, speex_library, jitter_library) in [
+        (ByteSpan::default(), ByteSpan::default(), span(&jitter)),
+        (span(&gsm), ByteSpan::default(), ByteSpan::default()),
+        (
+            ByteSpan {
+                data: ptr::null(),
+                length: 1,
+            },
+            span(&speex),
+            span(&jitter),
+        ),
+        (
+            ByteSpan {
+                data: gsm.as_ptr(),
+                length: 4097,
+            },
+            span(&speex),
+            span(&jitter),
+        ),
+        (span("bad\0path"), span(&speex), span(&jitter)),
+    ] {
+        config = RuntimeConfig {
+            gsm_library,
+            speex_library,
+            jitter_library,
+            ..complete()
+        };
+        output = ptr::dangling_mut();
+        assert_eq!(unsafe { create(&config, &mut output) }, Status::Invalid);
+        assert!(output.is_null());
+    }
+    config = RuntimeConfig {
+        speex_library: ByteSpan::default(),
+        ..complete()
+    };
+    assert_eq!(unsafe { create(&config, &mut output) }, Status::Ok);
+    unsafe { api.context_destroy.unwrap()(output) };
+    for library in ["/nonexistent/jitter.so", &gsm] {
+        config = RuntimeConfig {
+            jitter_library: span(library),
+            ..complete()
+        };
+        output = ptr::dangling_mut();
+        assert_eq!(unsafe { create(&config, &mut output) }, Status::Failed);
+        assert!(output.is_null());
+    }
+    config = complete();
     config.gsm_library = ByteSpan::default();
     output = ptr::dangling_mut();
     assert_eq!(unsafe { create(&config, &mut output) }, Status::Invalid);

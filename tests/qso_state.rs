@@ -359,3 +359,87 @@ fn available_identifiers_and_connect_deadlines_do_not_authenticate_early_audio()
     );
     assert_eq!(call.state(), QsoState::Connected);
 }
+
+#[test]
+fn setup_validation_and_foreign_control_sources_cannot_extend_a_call() {
+    let now = Instant::now();
+    let mut directory = DirectorySnapshot::new(Duration::from_secs(900));
+    directory
+        .update(b"@@@\n1\nK1ABC-R\nNorth\n123456\n192.0.2.1\n+++\n", now)
+        .unwrap();
+    let peer = directory.by_node(123456, now).unwrap();
+    let valid = Timers {
+        heartbeat: Duration::from_secs(10),
+        liveness: Duration::from_secs(100),
+        connect: Duration::from_secs(30),
+    };
+    assert!(Qso::new(peer.clone(), 0, valid, now).is_none());
+    for timers in [
+        Timers {
+            heartbeat: Duration::ZERO,
+            ..valid
+        },
+        Timers {
+            liveness: Duration::ZERO,
+            ..valid
+        },
+        Timers {
+            connect: Duration::ZERO,
+            ..valid
+        },
+    ] {
+        assert!(Qso::new(peer.clone(), 1, timers, now).is_none());
+    }
+    let mut call = qso(now, 1);
+    assert_eq!(call.observe(now).liveness_due_ms, 30_000);
+    assert_eq!(call.handle(1, QsoEvent::Drained, now), None);
+    assert_eq!(
+        call.handle(1, packet(Packet::Bye { source: 123 }), now),
+        None
+    );
+    assert_eq!(call.state(), QsoState::Connecting);
+    call.handle(
+        1,
+        packet(Packet::Sdes {
+            callsign: "K1ABC-R".into(),
+            source: 123,
+        }),
+        now,
+    );
+    assert_eq!(call.handle(1, QsoEvent::Drained, now), None);
+    for invalid in [
+        Packet::Sdes {
+            callsign: "K1ABC-R".into(),
+            source: 789,
+        },
+        Packet::Report { source: 789 },
+    ] {
+        assert_eq!(
+            call.handle(1, packet(invalid), now + Duration::from_secs(99)),
+            None
+        );
+        assert_eq!(
+            call.observe(now + Duration::from_secs(99))
+                .last_valid_age_ms,
+            99_000
+        );
+    }
+    assert_eq!(
+        call.handle(1, QsoEvent::Poll, now + Duration::from_secs(100)),
+        Some(QsoAction::Closing {
+            cause: Cause::LivenessExpired,
+            send_bye: true,
+        })
+    );
+    call.handle(1, QsoEvent::Drained, now + Duration::from_secs(100));
+    assert_eq!(
+        call.handle(
+            1,
+            packet(Packet::Voice { source: 123 }),
+            now + Duration::from_secs(101)
+        ),
+        None
+    );
+    assert_eq!(call.state(), QsoState::Closed);
+    assert_eq!(call.first_cause(), Some(Cause::LivenessExpired));
+}

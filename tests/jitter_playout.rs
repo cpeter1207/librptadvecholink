@@ -420,6 +420,30 @@ fn malformed_or_wrong_codec_does_not_revive_a_burst_or_shift_sequence_epoch() {
     );
 }
 
+#[test]
+fn gsm_only_resources_cannot_accept_or_start_a_speex_stream() {
+    let path = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap());
+    let catalog = CodecCatalog::load(&[ProviderSelection {
+        path: path.join("librptadv_codec_gsm.so.1"),
+        profiles: vec![ProfileId::GsmFr],
+    }])
+    .unwrap();
+    let providers = Providers::new();
+    let origin = Instant::now();
+    assert!(matches!(
+        unsafe { Playout::new(&catalog, Codec::Speex, 0.0, providers.descriptor, origin) },
+        Err(rptadv_echolink::media::MediaError::Invalid)
+    ));
+    let mut playout =
+        unsafe { Playout::new(&catalog, Codec::GsmFr, 0.0, providers.descriptor, origin) }.unwrap();
+    let packets = providers.packets(Codec::Speex, 1, 1);
+    assert_eq!(
+        playout.receive(voice(&packets[0]), origin).unwrap(),
+        Reception::Invalid
+    );
+    assert!(playout.drained());
+}
+
 // Script only the neutral capability's signed-offset decisions. Encoding, decoding and
 // native PLC remain the real dynamic Speex provider, so its history is independently checked.
 mod offsets {
@@ -545,6 +569,120 @@ mod offsets {
             get: Some(get),
             advance: Some(advance),
             observe: Some(observe),
+        }
+    }
+    unsafe extern "C" fn wrong_span(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            (*result).span = 320;
+        }
+        0
+    }
+    unsafe extern "C" fn unknown_format(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            *output = 2;
+        }
+        0
+    }
+    unsafe extern "C" fn empty_payload(
+        context: *mut c_void,
+        now: u64,
+        span: u32,
+        output: *mut u8,
+        capacity: usize,
+        result: *mut RawDecision,
+    ) -> i32 {
+        unsafe {
+            get(context, now, span, output, capacity, result);
+            (*result).length = 0;
+        }
+        0
+    }
+    struct ExcessSink;
+    impl PcmSink for ExcessSink {
+        fn audio(&mut self, _: u64, samples: &[f32]) -> usize {
+            samples.len() + 1
+        }
+        fn gap(&mut self, _: u64, samples: u32) -> u32 {
+            samples + 1
+        }
+    }
+    #[test]
+    fn provider_metadata_and_sink_credit_cannot_corrupt_the_playout_cursor() {
+        use rptadv_echolink::media::MediaError;
+        let providers = Providers::new();
+        let origin = Instant::now();
+        let packets = providers.packets(Codec::GsmFr, 1, 1);
+        let baseline = descriptor(true);
+        for getter in [
+            Some(wrong_span as unsafe extern "C" fn(_, _, _, _, _, _) -> _),
+            Some(unknown_format),
+            Some(empty_payload),
+        ] {
+            let mut descriptor = baseline;
+            descriptor.get = getter;
+            let mut playout = unsafe {
+                Playout::new(
+                    &providers.catalog,
+                    Codec::GsmFr,
+                    0.0,
+                    ptr::from_ref(&descriptor).cast(),
+                    origin,
+                )
+            }
+            .unwrap();
+            playout.receive(voice(&packets[0]), origin).unwrap();
+            let mut sink = Sink {
+                limit: 640,
+                ..Sink::default()
+            };
+            // Positive offset first requests PLC; the next turn validates the
+            // retained encoded packet before accepting any of its decoded PCM.
+            let mut error = None;
+            for _ in 0..3 {
+                match playout.poll(origin + Duration::from_millis(180), &mut sink) {
+                    Ok(_) => {}
+                    Err(found) => {
+                        error = Some(found);
+                        break;
+                    }
+                }
+            }
+            assert!(matches!(error, Some(MediaError::Contract)));
+            assert!(sink.audio.is_empty());
+        }
+        for positive in [false, true] {
+            let descriptor = descriptor(positive);
+            let mut playout = unsafe {
+                Playout::new(
+                    &providers.catalog,
+                    Codec::Speex,
+                    0.0,
+                    ptr::from_ref(&descriptor).cast(),
+                    origin,
+                )
+            }
+            .unwrap();
+            playout.receive(voice(&packets[0]), origin).unwrap();
+            assert!(matches!(
+                playout.poll(origin + Duration::from_millis(180), &mut ExcessSink),
+                Err(MediaError::Contract)
+            ));
         }
     }
     #[test]

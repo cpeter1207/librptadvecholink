@@ -126,3 +126,19 @@ fn directory_tcp_early_eof_does_not_fabricate_a_successful_snapshot() {
         server.await.unwrap();
     });
 }
+
+#[test]
+fn directory_connect_failure_preserves_its_os_error_category() {
+    run(async {
+        assert!(matches!(
+            directory_exchange(
+                "127.0.0.1:0".parse().unwrap(),
+                b"F0\r",
+                ReplyKind::Directory,
+                Duration::from_secs(2)
+            )
+            .await,
+            Err(TransactionError::Io(_))
+        ));
+    });
+}

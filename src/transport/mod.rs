@@ -209,3 +209,45 @@ fn io_error(error: std::io::Error) -> TransactionError {
         TransactionError::Io(error.kind())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn compressed_directory_limits_reject_truncation_trailing_data_and_expansion() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let compressed = |payload: &[u8], level| {
+                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
+                encoder.write_all(payload).unwrap();
+                let mut wire = vec![0; 4];
+                wire.extend(encoder.finish().unwrap());
+                wire
+            };
+            let mut trailing = compressed(b"@@@\n0\n+++\n", flate2::Compression::fast());
+            trailing.push(0x7f);
+            for (wire, expected) in [
+                (vec![0; 4], TransactionError::Truncated),
+                (trailing, TransactionError::Malformed),
+                (
+                    compressed(&vec![0; MAX_EXPANDED + 1], flate2::Compression::fast()),
+                    TransactionError::Limit,
+                ),
+                (
+                    compressed(&vec![0; MAX_COMPRESSED], flate2::Compression::none()),
+                    TransactionError::Limit,
+                ),
+            ] {
+                assert_eq!(
+                    read_reply(BufReader::new(wire.as_slice()), ReplyKind::Directory).await,
+                    Err(expected)
+                );
+            }
+        });
+    }
+}

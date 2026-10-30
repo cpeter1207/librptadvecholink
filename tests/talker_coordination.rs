@@ -124,6 +124,48 @@ fn stale_ports_and_cancelled_requests_cannot_claim_another_generation() {
 }
 
 #[test]
+fn account_shutdown_cancels_a_pending_talker_offer_without_retaining_it() {
+    let now = Instant::now();
+    let (owner, _, connections) = setup(now);
+    let mut port = owner.port(1, connections[0].generation, Arc::new(Control::default()));
+    port.offer(now).unwrap();
+    drop(owner);
+    assert_eq!(port.selection(), Err(OfferError::Closed));
+    assert_eq!(port.selection(), Ok(None));
+}
+
+#[test]
+fn unrepresentable_quiet_deadline_does_not_wrap_or_release_a_selected_talker() {
+    run(async {
+        let now = Instant::now();
+        let (mut owner, _, connections) = setup(now);
+        // The public owner accepts caller-supplied Instants. Find this platform's
+        // last representable one without assuming its monotonic epoch or width.
+        let mut low = 0_u128;
+        let mut high = u128::from(u64::MAX) * 1_000_000_000 + 999_999_999;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let duration = Duration::new(
+                (middle / 1_000_000_000) as u64,
+                (middle % 1_000_000_000) as u32,
+            );
+            if now.checked_add(duration).is_some() {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        let last = now + Duration::new((low / 1_000_000_000) as u64, (low % 1_000_000_000) as u32);
+        let mut port = owner.port(1, connections[0].generation, Arc::new(Control::default()));
+        port.offer(last).unwrap();
+        owner.service().await;
+        assert_eq!(port.selection(), Ok(Some(Selection::Selected)));
+        assert_eq!(owner.deadline(last), None);
+        assert_eq!(owner.poll(last), None);
+    });
+}
+
+#[test]
 fn full_control_queue_returns_credit_failure_without_waiting_or_closing_peers() {
     run(async {
         let now = Instant::now();
