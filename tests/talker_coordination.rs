@@ -58,6 +58,7 @@ fn grant_precedes_drain_and_selected_unkey_has_one_consumer() {
         owner.service().await;
         // No quiet timer can unkey/release a grant before its pending PCM drains.
         assert_eq!(owner.poll(now + Duration::from_millis(320)), None);
+        assert_eq!(owner.deadline(now + Duration::from_millis(320)), None);
         assert_eq!(first.selection().unwrap(), Some(Selection::Selected));
         second.offer(now + Duration::from_millis(100)).unwrap();
         owner.service().await;
@@ -175,6 +176,7 @@ fn full_control_queue_returns_credit_failure_without_waiting_or_closing_peers() 
         assert_eq!(first.selection().unwrap(), None);
         for value in [true, false, true, false] {
             first.report_drained(value).unwrap();
+            first.report_drained(value).unwrap(); // Duplicate state must not consume queue credit.
         }
         assert_eq!(second.offer(now), Err(OfferError::Full));
         assert_eq!(owner.overflows(), 1);

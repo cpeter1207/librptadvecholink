@@ -239,6 +239,11 @@ fn first_terminal_cause_is_retained_through_drain_and_later_failures() {
             Some(QsoAction::Closing { cause, send_bye })
         );
         assert_eq!(call.state(), QsoState::Closing);
+        let closing = call.observe(now);
+        assert_eq!(
+            (closing.heartbeat_due_ms, closing.liveness_due_ms),
+            (u64::MAX, u64::MAX)
+        );
         assert_eq!(call.handle(1, QsoEvent::TransportLost, now), None);
         assert_eq!(call.handle(1, QsoEvent::Drained, now), None);
         assert_eq!(call.state(), QsoState::Closed);
@@ -250,6 +255,7 @@ fn first_terminal_cause_is_retained_through_drain_and_later_failures() {
 fn fresh_sdes_endpoint_and_generation_are_required_before_voice() {
     let now = Instant::now();
     let mut call = qso(now, 2);
+    assert_eq!(call.generation(), 2);
     assert_eq!(
         call.handle(2, packet(Packet::Voice { source: 0 }), now),
         None

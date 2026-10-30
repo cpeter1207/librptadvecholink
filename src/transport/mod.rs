@@ -232,6 +232,7 @@ mod tests {
             let mut trailing = compressed(b"@@@\n0\n+++\n", flate2::Compression::fast());
             trailing.push(0x7f);
             for (wire, expected) in [
+                (vec![0; 3], TransactionError::Truncated),
                 (vec![0; 4], TransactionError::Truncated),
                 (trailing, TransactionError::Malformed),
                 (
