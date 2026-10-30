@@ -290,7 +290,9 @@ impl DirectoryControl {
         if let Some(failed) = self.retry_since {
             return failed.checked_add(self.policy.retry);
         }
-        if self.must_register || self.last_registration.is_none() || self.last_snapshot.is_none() {
+        // Only a successful registration clears must_register; it also sets
+        // last_registration in that same owner turn.
+        if self.must_register || self.last_snapshot.is_none() {
             return Some(now);
         }
         [
@@ -443,4 +445,32 @@ fn valid_policy(servers: &[String], policy: DirectoryPolicy) -> bool {
         ]
         .iter()
         .all(|value| !value.is_zero() && *value <= Duration::from_millis(u32::MAX.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completion_tokens_never_wrap_or_reuse_an_old_job() {
+        let policy = DirectoryPolicy {
+            operation_timeout: Duration::from_secs(1),
+            registration_refresh: Duration::from_secs(300),
+            directory_refresh: Duration::from_secs(240),
+            retry: Duration::from_secs(20),
+        };
+        let mut owner = DirectoryControl::new(vec!["server".into()], policy).unwrap();
+        owner.next_id = u64::MAX - 1;
+        let now = Instant::now();
+        let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+        let last = owner.poll(&snapshot, now).unwrap().unwrap();
+        assert_eq!(last.id, u64::MAX);
+        owner.finish(last.id, Ok(b"OK"), &mut snapshot, now);
+        assert!(matches!(
+            owner.poll(&snapshot, now),
+            Err(ScheduleError::Exhausted)
+        ));
+        assert_eq!(owner.state(), DirectoryState::Stopped);
+        assert!(owner.poll(&snapshot, now).unwrap().is_none());
+    }
 }

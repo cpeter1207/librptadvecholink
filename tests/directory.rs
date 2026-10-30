@@ -218,3 +218,67 @@ fn bounded_decompression_and_line_limits_reject_before_publication() {
     );
     assert_eq!(snapshot.snapshot_id(), "first");
 }
+
+#[test]
+fn malformed_identity_headers_and_stream_tails_preserve_the_snapshot() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    snapshot.update(FULL, now).unwrap();
+    let mut trailing = compressed(FULL);
+    trailing.push(0);
+    let mut invalid = vec![
+        b"@@@\n0\n+++\n\0".to_vec(),
+        b"@@@bad\n0\n+++\n".to_vec(),
+        b"@@@\n0:bad token\n+++\n".to_vec(),
+        b"@@@\n\n+++\n".to_vec(),
+        b"@@@\n1x\n+++\n".to_vec(),
+        trailing,
+    ];
+    for call in [String::new(), "A".repeat(16), "K1ABC!".into()] {
+        invalid.push(format!("@@@\n1\n{call}\nSite\n1\n192.0.2.1\n+++\n").into_bytes());
+    }
+    for response in invalid {
+        assert_eq!(
+            snapshot.update(&response, now),
+            Err(DirectoryError::Malformed)
+        );
+        assert_eq!(snapshot.snapshot_id(), "first");
+        assert_eq!(snapshot.by_node(123456, now).unwrap().callsign, "K1ABC-R");
+    }
+}
+
+#[test]
+fn expanded_and_record_budgets_include_ignored_records_and_delta_results() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    snapshot.update(FULL, now).unwrap();
+    let mut plain = b"@@@\n".to_vec();
+    plain.resize(16 * 1024 * 1024 + 1, b'\n');
+    for response in [
+        plain,
+        b"@@@\n100001\n+++\n".to_vec(),
+        format!("@@@\n0\n{}+++\n", ".\n\n\n\n".repeat(100001)).into_bytes(),
+        format!("DDD\n0:new\n+++\n{}+++\n", "K1ABC-R\n".repeat(100001)).into_bytes(),
+    ] {
+        assert_eq!(snapshot.update(&response, now), Err(DirectoryError::Limit));
+        assert_eq!(snapshot.snapshot_id(), "first");
+        assert_eq!(snapshot.by_node(123456, now).unwrap().callsign, "K1ABC-R");
+    }
+    let mut maximum = String::from("@@@\n100000:maximum\n");
+    use std::fmt::Write as _;
+    for node in 1..=100000 {
+        writeln!(maximum, "N{node:06}\nSite\n{node}\n192.0.2.1").unwrap();
+    }
+    maximum.push_str("+++\n");
+    snapshot.update(maximum.as_bytes(), now).unwrap();
+    assert_eq!(
+        snapshot.update(
+            b"DDD\n1:overflow\nN100001\nSite\n100001\n192.0.2.1\n+++\n+++\n",
+            now
+        ),
+        Err(DirectoryError::Limit)
+    );
+    assert_eq!(snapshot.snapshot_id(), "maximum");
+    assert_eq!(snapshot.by_node(100000, now).unwrap().callsign, "N100000");
+    assert_eq!(snapshot.by_node(100001, now), Err(AdmissionError::Unknown));
+}

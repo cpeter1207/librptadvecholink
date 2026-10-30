@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn live_settings_update_preserves_inflight_tokens_and_renews_changed_metadata() {
+    for refresh in [false, true] {
+        live_settings_update(refresh);
+    }
+}
+fn live_settings_update(refresh: bool) {
     let now = Instant::now();
     let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
     snapshot
@@ -22,7 +27,7 @@ fn live_settings_update_preserves_inflight_tokens_and_renews_changed_metadata() 
         directory_refresh: Duration::from_secs(120),
         ..policy()
     };
-    assert!(owner.reconfigure(vec!["second".into()], changed, true));
+    assert!(owner.reconfigure(vec!["second".into()], changed, refresh));
     assert!(
         owner.poll(&snapshot, now).unwrap().is_none(),
         "never overlap directory transactions"
@@ -85,6 +90,14 @@ fn directory_requests_follow_reference_login_logout_and_snapshot_framing() {
         description: "North site",
         email: "operator@example.invalid",
     };
+    assert_eq!(
+        DirectoryLogin {
+            password: "",
+            ..login
+        }
+        .request(&Operation::Register, 9, 3),
+        Err(TransactionError::Malformed)
+    );
     assert_eq!(
         login.request(&Operation::Register, 9, 3).unwrap(),
         b"lK1ABC-R\xac\xacnot-a-real-password\rONLINE1.00R(9: 3)\rNorth site\roperator@example.invalid\r"
@@ -329,6 +342,41 @@ fn directory_deadlines_park_inflight_work_and_choose_the_next_real_operation() {
     assert_eq!(owner.deadline(later), None);
     owner.finish(logout.id, Ok(b"OK"), &mut snapshot, later);
     assert_eq!(owner.deadline(later), None);
+}
+
+#[test]
+fn invalid_policy_and_matching_registration_rejection_are_visible() {
+    assert!(DirectoryControl::new(vec![], policy()).is_none());
+    for timeout in [
+        Duration::ZERO,
+        Duration::from_millis(u64::from(u32::MAX) + 1),
+    ] {
+        assert!(
+            DirectoryControl::new(
+                vec!["server".into()],
+                DirectoryPolicy {
+                    operation_timeout: timeout,
+                    ..policy()
+                }
+            )
+            .is_none()
+        );
+    }
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    let mut owner = DirectoryControl::new(vec!["server".into()], policy()).unwrap();
+    let job = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert_eq!(
+        owner.finish(job.id, Ok(b"NO"), &mut snapshot, now),
+        Some(
+            rptadv_echolink::account::directory::DirectoryFailure::Transport(
+                TransactionError::Rejected
+            )
+        )
+    );
+    assert_eq!(owner.state(), DirectoryState::Retrying);
+    assert_eq!(owner.failures(), 1);
+    assert_eq!(owner.deadline(now), Some(now + Duration::from_secs(20)));
 }
 
 #[test]
