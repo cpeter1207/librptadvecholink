@@ -17,6 +17,13 @@ fn demand_snapshot_refresh_coalesces_and_obeys_the_existing_retry_budget() {
     assert!(owner.request_snapshot(now));
     let initial = owner.poll(&snapshot, now).unwrap().unwrap();
     owner.finish(initial.id, Ok(b"@@@\n0\n+++\n"), &mut snapshot, now);
+    let now = now + policy().directory_refresh;
+    let periodic = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert!(matches!(periodic.operation, Operation::Snapshot { .. }));
+    assert!(owner.request_snapshot(now));
+    assert!(owner.poll(&snapshot, now).unwrap().is_none());
+    owner.finish(periodic.id, Ok(b"@@@\n0\n+++\n"), &mut snapshot, now);
+    // Sharing a scheduled fetch must not spend the later demand-refresh budget.
     assert!(owner.request_snapshot(now));
     let fetch = owner.poll(&snapshot, now).unwrap().unwrap();
     assert!(matches!(fetch.operation, Operation::Snapshot { .. }));

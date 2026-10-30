@@ -47,7 +47,7 @@ async fn aprs_uses_the_selected_transport_and_live_blank_disables_it() {
                     stream.read_exact(&mut payload).await.unwrap();
                     if header[0] == 6 {
                         assert_eq!(&header[1..5], &[127, 0, 0, 2]);
-                        return payload;
+                        return (payload, stream);
                     }
                 }
             }));
@@ -64,6 +64,7 @@ async fn aprs_uses_the_selected_transport_and_live_blank_disables_it() {
         }
         assert!(harness.owner.aprs_due.unwrap() > Instant::now() + Duration::from_secs(9));
         harness.owner.aprs_due = Some(Instant::now());
+        let mut proxy_socket = None;
         let received = tokio::time::timeout(Duration::from_secs(2), async {
             let run = harness.owner.connected();
             tokio::pin!(run);
@@ -72,7 +73,11 @@ async fn aprs_uses_the_selected_transport_and_live_blank_disables_it() {
                 _ = &mut run => panic!("metadata must not stop an account"),
                 result = async {
                     match server {
-                        Some(server) => server.await.unwrap(),
+                        Some(server) => {
+                            let (payload, stream) = server.await.unwrap();
+                            proxy_socket = Some(stream);
+                            payload
+                        },
                         None => {
                             let (count,_) = udp.recv_from(&mut bytes).await.unwrap();
                             bytes[..count].to_vec()
@@ -83,10 +88,15 @@ async fn aprs_uses_the_selected_transport_and_live_blank_disables_it() {
         })
         .await
         .unwrap();
-        let mut expected = [0; 512];
-        let location = harness.owner.settings.aprs_location("").unwrap();
-        let count = crate::wire::write_aprs("K1ABC-R", &location, &mut expected).unwrap();
-        assert_eq!(received, expected[..count]);
+        // Hand-derived RR/SDES fixture, independent of the producer's builders.
+        let mut expected = vec![
+            0x80, 201, 0, 1, 0, 0, 0, 0, 0x81, 202, 0, 19, 0, 0, 0, 0, 1, 15,
+        ];
+        expected.extend_from_slice(b"K1ABC-R/K1ABC-R");
+        expected.extend_from_slice(&[5, 48]);
+        expected.extend_from_slice(b")EL-K1ABC-!4500.00NE09300.00W0PHG3204/146520/114");
+        expected.extend_from_slice(&[0; 5]);
+        assert_eq!(received, expected);
         assert!(harness.owner.aprs_due.unwrap() > Instant::now() + Duration::from_secs(599));
         config.aprs_server = span("");
         let settings = Arc::new(
@@ -97,6 +107,7 @@ async fn aprs_uses_the_selected_transport_and_live_blank_disables_it() {
         if let Transport::Proxy(session) = harness.owner.transport {
             session.stop().await.unwrap();
         }
+        drop(proxy_socket);
     }
 }
 impl Harness {
@@ -194,6 +205,21 @@ impl Harness {
         self.owner.snapshot.set_freshness(Duration::ZERO);
         self.owner.view.publish(&self.owner.snapshot);
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aprs_ipv6_only_resolution_is_a_nonfatal_publication_error() {
+    // Debian's loopback-only IPv6 alias: no test station leaves this host.
+    let servers = [span("127.0.0.1:1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.aprs_server = span("ip6-localhost:5199");
+    let settings =
+        Arc::new(unsafe { PreparedSettings::copy(&config, &secrets("fixture-password")) }.unwrap());
+    let harness = Harness::new(Arc::clone(&settings)).await;
+    assert_eq!(
+        aprs::publish(settings, harness.owner.transport.peer().unwrap()).await,
+        Err(ProxyError::Io(io::ErrorKind::AddrNotAvailable))
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
