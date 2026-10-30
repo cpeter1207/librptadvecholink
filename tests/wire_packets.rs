@@ -136,6 +136,26 @@ fn gsm_four_units_is_144_bytes() {
 }
 
 #[test]
+fn speex_preserves_its_marker_and_continuous_bitstream() {
+    let packet = VoicePacket {
+        codec: Codec::Speex,
+        marker: true,
+        sequence: 42,
+        timestamp: 0,
+        ssrc: 0,
+        payload: &[1, 2],
+    };
+    let reference = [0xc0, 0x96, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2];
+    let mut output = [0; 14];
+    assert_eq!(write_voice(&packet, &mut output), Ok(14));
+    assert_eq!(output, reference);
+    assert_eq!(
+        parse_datagram(Channel::Audio, &reference),
+        Ok(WirePacket::Voice(packet))
+    );
+}
+
+#[test]
 fn control_unknown_optional_is_skipped() {
     let fixtures: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/echolib-control.json")).unwrap();
@@ -273,6 +293,8 @@ fn proxy_split_and_coalesced_records() {
             records.push((record.kind, record.address, record.payload.to_vec()))
         };
         assert_eq!(parser.push(&bytes[..split], &mut emit), Ok(split));
+        // Polling with no new TCP bytes must neither lose nor emit a partial body.
+        assert_eq!(parser.push(&[], &mut emit), Ok(0));
         assert_eq!(
             parser.push(&bytes[split..], &mut emit),
             Ok(bytes.len() - split)
