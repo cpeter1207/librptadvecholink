@@ -216,6 +216,17 @@ fn live_policy_and_metadata_update_preserves_the_existing_route() {
             assert_eq!(live.directory.failures, 0);
             assert!(live.fresh);
             assert_eq!(connection.connection.generation, generation);
+            let capacity = connection.connection.ingress.observer().observe().capacity_packets;
+            for _ in 0..=capacity {
+                remote.send_to(&bytes[..count], sockets.local_addr(Channel::Control).unwrap()).await.unwrap();
+            }
+            let overloaded = loop {
+                let observed = commands.observe().await.unwrap();
+                if observed.routed_packets + observed.dropped_packets >= u64::from(capacity) + 3 { break observed; }
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(overloaded.ingress_full_packets, 1);
+            while connection.connection.ingress.try_recv().is_some() {}
             candidate.callsign = span("N1OTHER-R");
             let exclusive = Arc::new(unsafe { PreparedSettings::copy(&candidate, &secrets) }.unwrap());
             assert_eq!(commands.reconfigure(exclusive).await, Err(NetworkError::Invalid),

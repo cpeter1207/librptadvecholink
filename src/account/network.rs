@@ -715,13 +715,13 @@ impl Owner {
         let previous = self.settings.directory_login();
         let next = settings.directory_login();
         let refresh = previous.description != next.description || previous.email != next.email;
-        if !self.directory.reconfigure(
+        // PreparedSettings already validates these positive-u32 timings and
+        // servers. Commands close before the owner stops its directory worker.
+        self.directory.reconfigure(
             settings.directory_servers().map(str::to_owned).collect(),
             directory_policy(&settings),
             refresh,
-        ) {
-            return Err(NetworkError::Stopped);
-        }
+        );
         self.coordinator.router().update_policy(&settings);
         self.snapshot.set_freshness(Duration::from_millis(
             settings.as_abi().policy.directory_freshness_ms.into(),
@@ -784,5 +784,13 @@ fn directory_policy(settings: &PreparedSettings) -> DirectoryPolicy {
         registration_refresh: Duration::from_millis(policy.registration_refresh_ms.into()),
         directory_refresh: Duration::from_millis(policy.directory_refresh_ms.into()),
         retry: Duration::from_millis(policy.directory_retry_ms.into()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Cancel only a fixture's actual owner task to exercise join-failure cleanup.
+    pub(crate) fn abort_owner(network: &super::AccountNetwork) {
+        network.task.as_ref().unwrap().abort();
     }
 }

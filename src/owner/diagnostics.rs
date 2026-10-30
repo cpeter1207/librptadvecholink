@@ -363,6 +363,55 @@ mod tests {
             .is_err()
         );
         assert_eq!(account.observation().0, ffi::Status::Failed);
+        unsafe extern "C" fn failure_callback(
+            context: *mut std::ffi::c_void,
+            event: *const ffi::Event,
+        ) {
+            let event = unsafe { &*event };
+            if event.kind == 0 && event.status == ffi::Status::Failed {
+                unsafe { &*context.cast::<std::sync::atomic::AtomicUsize>() }
+                    .fetch_add(1, Ordering::Release);
+            }
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        binding.failure(
+            TransportFailure::Io(std::io::ErrorKind::BrokenPipe),
+            Some(super::super::Callback {
+                function: failure_callback,
+                context: ptr::from_ref(&calls).cast_mut().cast(),
+            }),
+        );
+        assert!(!binding.live.load(Ordering::Acquire));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cancelled_backend_tasks_are_reported_after_account_retirement() {
+        for cancel_bridge in [false, true] {
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let (account, directory) = active(runtime);
+            drop(directory);
+            {
+                let state = account.0.state.lock().unwrap();
+                let active = state.active.as_ref().unwrap();
+                if cancel_bridge {
+                    active.bridge.abort();
+                } else {
+                    crate::account::network::test_support::abort_owner(&active.network);
+                }
+            }
+            assert_eq!(
+                unsafe { super::super::account_stop(account.pointer()) },
+                ffi::Status::Failed
+            );
+            assert!(account.0.state.lock().unwrap().active.is_none());
+        }
     }
 
     #[test]
