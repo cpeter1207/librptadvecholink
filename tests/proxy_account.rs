@@ -504,6 +504,76 @@ fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
         socket.shutdown(Shutdown::Both).unwrap();
     }
 }
+
+#[test]
+fn pending_peer_revalidation_observes_timeout_staleness_and_changed_directory_identity() {
+    for mode in 0..3 {
+        let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+        let context = context::resource_context(api);
+        let _context = ContextOwner(api, context);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || registered(&listener));
+        let servers = [span("127.0.0.1")];
+        let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+        config.transport.kind = 1;
+        config.transport.proxy_host = span("127.0.0.1");
+        config.transport.proxy_port = port;
+        match mode {
+            0 => config.policy.connect_timeout_ms = 100,
+            1 => config.policy.directory_freshness_ms = 100,
+            _ => config.policy.directory_refresh_ms = 100,
+        }
+        let account = prepare(api, context, &config);
+        let _account = PreparedAccount(api, account);
+        assert_eq!(
+            unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+            Status::Ok
+        );
+        let mut socket = server.join().unwrap();
+        fresh(api, account);
+        let mut qso = ptr::null_mut();
+        assert_eq!(
+            unsafe { api.dial.unwrap()(account, 123456, &mut qso) },
+            Status::Ok
+        );
+        if mode == 2 {
+            assert_eq!(begin_directory(&mut socket), b"F0\r");
+            end_directory(
+                &mut socket,
+                b"@@@\n1\nW1XYZ-R\nPeer\n654321\n127.0.0.2\n+++\n",
+            );
+        }
+        let mut info = PeerInfo {
+            struct_size: size_of::<PeerInfo>() as u32,
+            abi_version: 1,
+            ..unsafe { std::mem::zeroed() }
+        };
+        let expected = [Status::Closed, Status::Pending, Status::Invalid][mode];
+        assert!(wait(|| unsafe {
+            api.validate_pending.unwrap()(qso, &mut info)
+        } == expected));
+        unsafe extern "C" fn no_work(_: *mut std::ffi::c_void) -> i32 {
+            -1
+        }
+        let mut registration = ptr::dangling_mut();
+        assert_eq!(
+            unsafe {
+                api.peer_attach.unwrap()(
+                    context,
+                    qso,
+                    Some(no_work),
+                    ptr::null_mut(),
+                    &mut registration,
+                )
+            },
+            expected
+        );
+        assert!(registration.is_null());
+        unsafe { api.peer_destroy.unwrap()(qso) };
+        socket.shutdown(Shutdown::Both).unwrap();
+    }
+}
 fn proxy_case(speex: bool, blocked: bool, faults: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

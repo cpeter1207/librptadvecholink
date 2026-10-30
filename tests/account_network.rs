@@ -127,6 +127,38 @@ fn an_ipv6_only_directory_records_failure_without_dialing_an_unverified_peer() {
 }
 
 #[test]
+fn direct_activation_rejects_proxy_settings_and_requires_an_entered_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sockets = runtime.block_on(async {
+        Arc::new(
+            DirectSockets::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+    });
+    assert!(matches!(
+        AccountNetwork::direct(
+            settings("127.0.0.1", 300_000, 0),
+            Arc::clone(&sockets),
+            || (9, 3)
+        ),
+        Err(NetworkError::Invalid)
+    ));
+    runtime.block_on(async {
+        assert!(matches!(
+            AccountNetwork::direct(settings("127.0.0.1", 300_000, 1), sockets, || (9, 3)),
+            Err(NetworkError::Invalid)
+        ));
+    });
+}
+
+#[test]
 fn live_policy_and_metadata_update_preserves_the_existing_route() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         tokio::time::timeout(Duration::from_secs(5), async {
