@@ -234,16 +234,6 @@ impl AccountNetwork {
         Self::start(settings, Transport::Direct(sockets), civil_time)
     }
 
-    /// Start an account on its selected authenticated Proxy; all directory and peer
-    /// traffic shares that transport, with no direct UDP/TCP fallback.
-    pub fn proxy(
-        settings: Arc<PreparedSettings>,
-        session: ProxySession,
-        civil_time: fn() -> (u8, u8),
-    ) -> Result<(Self, mpsc::Receiver<NetworkEvent>), NetworkError> {
-        Self::start(settings, Transport::Proxy(session), civil_time)
-    }
-
     fn start(
         settings: Arc<PreparedSettings>,
         transport: Transport,

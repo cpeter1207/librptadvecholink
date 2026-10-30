@@ -155,10 +155,9 @@ impl Account {
         state
             .active
             .as_ref()
-            .filter(|active| {
-                active.binding.live.load(Ordering::Acquire)
-                    && active.binding.available.load(Ordering::Acquire)
-            })
+            // Retirement takes Active out of State before closing its live
+            // gate; only transport availability changes while retained here.
+            .filter(|active| active.binding.available.load(Ordering::Acquire))
             .map(|active| Arc::clone(&active.binding))
             .ok_or(Status::Closed)
     }
@@ -381,10 +380,7 @@ impl Account {
             )
         };
         if let (Some(old), Some(next), Some(binding)) = (&old, &next, &binding) {
-            if !old.requires_handoff(next)
-                && binding.live.load(Ordering::Acquire)
-                && binding.available.load(Ordering::Acquire)
-            {
+            if !old.requires_handoff(next) && binding.available.load(Ordering::Acquire) {
                 if let Err(error) = self
                     .runtime
                     .block_on(binding.control.reconfigure(Arc::clone(next)))

@@ -208,6 +208,137 @@ impl Harness {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn pending_dials_share_finite_credit_and_revalidate_before_publication() {
+    fn dial(
+        owner: &mut Owner,
+        node: u32,
+    ) -> oneshot::Receiver<Result<PeerConnection, NetworkError>> {
+        let (reply, response) = oneshot::channel();
+        owner.command(Command::Dial(node, reply));
+        response
+    }
+    let servers = [span("127.0.0.1:1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.policy.max_pending_handshakes = 1;
+    let keys = secrets("fixture-password");
+    let prepared = Arc::new(unsafe { PreparedSettings::copy(&config, &keys) }.unwrap());
+    let mut harness = Harness::new(prepared).await;
+    let first = dial(&mut harness.owner, 999001);
+    assert_eq!(
+        dial(&mut harness.owner, 999001).await.unwrap().err(),
+        Some(NetworkError::Admission(Admission::Duplicate))
+    );
+    assert_eq!(
+        dial(&mut harness.owner, 999002).await.unwrap().err(),
+        Some(NetworkError::Admission(Admission::Unverified))
+    );
+    harness.owner.retry_dials(Instant::now());
+    assert_eq!(
+        harness.owner.pending_dials.len(),
+        1,
+        "missing station remains pending without another task"
+    );
+    drop(first);
+    harness.owner.retry_dials(Instant::now());
+    assert!(
+        harness.owner.pending_dials.is_empty(),
+        "caller cancellation releases its exact credit"
+    );
+    let expired = dial(&mut harness.owner, 999003);
+    let deadline = harness.owner.pending_dials[&999003].deadline;
+    harness.owner.retry_dials(deadline);
+    assert_eq!(
+        expired.await.unwrap().err(),
+        Some(NetworkError::Admission(Admission::Unverified))
+    );
+    harness.stale_directory();
+    let denied = dial(&mut harness.owner, 123456);
+    let deny = [span("W*")];
+    config.policy.deny = crate::ffi::StringList {
+        items: deny.as_ptr(),
+        count: 1,
+    };
+    let changed = unsafe { PreparedSettings::copy(&config, &keys) }.unwrap();
+    harness.owner.coordinator.router().update_policy(&changed);
+    harness
+        .owner
+        .snapshot
+        .set_freshness(Duration::from_secs(900));
+    harness.owner.retry_dials(Instant::now());
+    assert_eq!(
+        denied.await.unwrap().err(),
+        Some(NetworkError::Admission(Admission::Denied))
+    );
+    let pending = dial(&mut harness.owner, 999004);
+    harness.owner.transport = Transport::Offline(ProxyError::Closed);
+    assert!(harness.owner.transport.peer().is_none());
+    for incoming in [false, true] {
+        let (reply, response) = oneshot::channel();
+        // Both command identities are positive; transport retirement rejects
+        // before directory admission or pending-token lookup.
+        harness.owner.command(if incoming {
+            Command::Accept(1, reply)
+        } else {
+            Command::Dial(1, reply)
+        });
+        assert_eq!(
+            response.await.unwrap().err(),
+            Some(NetworkError::Proxy(ProxyError::Closed))
+        );
+    }
+    harness.owner.commands.close();
+    assert_eq!(
+        harness.control.remove(123456, 1),
+        Err(NetworkError::Stopped)
+    );
+    drop(harness.control);
+    assert!(!harness.owner.recover_proxy(ProxyError::Closed).await);
+    assert_eq!(
+        pending.await.unwrap().err(),
+        Some(NetworkError::Proxy(ProxyError::Closed))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unavailable_proxy_retries_with_original_transport_failure_until_stopped() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let servers = [span("127.0.0.1:1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.transport.kind = 1;
+    config.transport.proxy_host = span("127.0.0.1");
+    config.transport.proxy_port = port;
+    config.policy.directory_retry_ms = 1;
+    config.policy.directory_timeout_ms = 10;
+    let settings =
+        Arc::new(unsafe { PreparedSettings::copy(&config, &secrets("fixture-password")) }.unwrap());
+    let mut harness = Harness::new(settings).await;
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            harness.owner.recover_proxy(ProxyError::Closed)
+        )
+        .await
+        .is_err()
+    );
+    assert!(matches!(
+        harness.owner.transport,
+        Transport::Offline(ProxyError::Io(io::ErrorKind::ConnectionRefused))
+    ));
+    assert!(matches!(
+        harness.events.recv().await,
+        Some(NetworkEvent::ProxyLost(ProxyError::Closed))
+    ));
+    assert!(
+        harness.events.try_recv().is_err(),
+        "retry failure does not flood account events"
+    );
+    harness.control.stopping.send_replace(true);
+    assert!(!harness.owner.recover_proxy(ProxyError::Closed).await);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn aprs_ipv6_only_resolution_is_a_nonfatal_publication_error() {
     // Debian's loopback-only IPv6 alias: no test station leaves this host.
     let servers = [span("127.0.0.1:1")];

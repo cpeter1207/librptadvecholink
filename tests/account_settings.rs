@@ -322,6 +322,10 @@ fn aprs_endpoint_is_owned_optional_and_nonexclusive() {
             );
         }
     }
+    let oversized_host = format!("{}:5199", "a".repeat(254));
+    config.transport.kind = 0;
+    config.aprs_server = span(&oversized_host);
+    assert!(unsafe { PreparedSettings::copy(&config, &keys) }.is_err());
 }
 
 #[path = "support/context.rs"]

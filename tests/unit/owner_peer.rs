@@ -263,7 +263,7 @@ fn dial_preserves_admission_timeout_and_post_reply_revalidation_failures() {
         }
         .unwrap(),
     );
-    for case in 0..3 {
+    for case in 0..4 {
         let mut harness = account
             .runtime
             .block_on(Harness::new(Arc::clone(&settings)));
@@ -279,6 +279,13 @@ fn dial_preserves_admission_timeout_and_post_reply_revalidation_failures() {
         if case == 0 {
             harness.stale_directory();
         }
+        let admitted = (case == 3).then(|| {
+            account.runtime.block_on(async {
+                let control = harness.control.clone();
+                let (connection, ()) = tokio::join!(control.dial(123456), harness.service());
+                connection.unwrap()
+            })
+        });
         let mut retained = Some(harness);
         let network = (case != 1).then(|| {
             let mut harness = retained.take().unwrap();
@@ -307,8 +314,14 @@ fn dial_preserves_admission_timeout_and_post_reply_revalidation_failures() {
         assert!(output.is_null());
         assert_eq!(
             status,
-            [Status::Failed, Status::Failed, Status::Closed][case]
+            [
+                Status::Failed,
+                Status::Failed,
+                Status::Closed,
+                Status::Invalid
+            ][case]
         );
+        drop(admitted);
     }
 }
 
@@ -765,7 +778,8 @@ fn long_location_does_not_poison_heartbeat_serialization() {
             let mut config = unsafe { ptr::read(serial.settings.as_abi()) };
             config.station.name = ffi::ByteSpan::default();
             config.station.location = span(&long_location);
-            serial.settings = Arc::new(
+            config.station.status_message = span("Updated");
+            let replacement = Arc::new(
                 unsafe {
                     crate::account::settings::PreparedSettings::copy(
                         &config,
@@ -774,11 +788,41 @@ fn long_location_does_not_poison_heartbeat_serialization() {
                 }
                 .unwrap(),
             );
+            peer.binding.current.store(replacement);
+            serial.event(peer, PeerEvent::Wake);
+            assert!(
+                serial.information.is_none(),
+                "Connecting peers do not receive station information yet"
+            );
             serial.control = None;
             serial.action(peer, Some(QsoAction::Heartbeat));
             let observation = serial.receiver.observe(Instant::now()).unwrap();
             assert_eq!(observation.session.first_cause, None);
             assert!(serial.control.is_some());
+            let writer = crate::transport::proxy::ProxyWriter::new(tokio::io::sink());
+            let output = writer.output();
+            while output
+                .try_queue(
+                    ProxyRecord {
+                        kind: ProxyKind::UdpControl,
+                        address: peer.identity.address,
+                        payload: &[0],
+                    },
+                    None,
+                )
+                .is_ok()
+            {}
+            let original = std::mem::replace(&mut serial.transport, PeerTransport::Proxy(output));
+            serial.control = None;
+            serial.queue_information();
+            serial.flush_control(peer);
+            assert_eq!(
+                serial.information.as_deref(),
+                Some(b"oNDATA\rUpdated\0".as_slice()),
+                "metadata must retain its exact bytes while credit is full"
+            );
+            serial.transport = original;
+            serial.information = None;
         }))
         .map_err(|_| "long location prevented a valid heartbeat".to_owned());
         let _ = probe.result.send(result);
@@ -898,6 +942,7 @@ fn retired_serial_turn_and_failed_capabilities_cannot_enter_the_host() {
             }
             assert_eq!(observed, Status::Failed);
             peer.control.stop();
+            assert_eq!(peer.validate(), Status::Closed);
             let calls = AtomicUsize::new(0);
             assert!(
                 serial_turn(
