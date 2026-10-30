@@ -15,7 +15,9 @@ use crate::{
         mailbox::Consumer,
         routing::PendingHandshake,
     },
-    wire::{Channel, Codec, ControlPacket, ProxyKind, ProxyRecord, write_control},
+    wire::{
+        Channel, Codec, ControlPacket, ProxyKind, ProxyRecord, write_control, write_station_info,
+    },
 };
 use std::{
     ffi::c_void,
@@ -47,6 +49,7 @@ pub(super) struct Serial {
     encoder: PreparedMedia,
     transport: PeerTransport,
     control: Option<Vec<u8>>,
+    information: Option<Vec<u8>>,
     writable: Option<crate::transport::driver::PeerWritable>,
     text: Option<(String, String)>,
     blocked: bool,
@@ -181,9 +184,10 @@ pub(crate) unsafe extern "C" fn peer_attach(
     )
     .expect("admission validated generation and timers");
     let mut receiver = Receiver::new(qso_state, playout, codecs, prepared.talker);
-    if let Some(initial) = &prepared.initial {
-        receiver.initial(initial);
-    }
+    let initial_action = prepared
+        .initial
+        .as_ref()
+        .and_then(|initial| receiver.initial(initial));
     let mut serial = Serial {
         settings,
         deadline: None,
@@ -192,6 +196,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         encoder,
         transport: prepared.transport,
         control: None,
+        information: None,
         writable: None,
         text: None,
         blocked: false,
@@ -202,9 +207,8 @@ pub(crate) unsafe extern "C" fn peer_attach(
         text_rejected: 0,
         cause_detail: [0; 32],
     };
-    if serial.queue_control(peer, false).is_err() {
-        return Status::Invalid;
-    }
+    serial.queue_control(peer, false);
+    serial.action(peer, initial_action);
     unsafe {
         *peer.serial.get() = Some(serial);
     }
@@ -276,7 +280,7 @@ impl Serial {
             self.cause_detail = super::diagnostics::detail(error);
         }
     }
-    fn queue_control(&mut self, peer: &Peer, bye: bool) -> Result<(), Status> {
+    fn queue_control(&mut self, peer: &Peer, bye: bool) {
         let packet = if bye {
             ControlPacket::Bye {
                 source: self.settings.as_abi().node_number,
@@ -296,20 +300,37 @@ impl Serial {
             }
         };
         let mut output = [0; 512];
-        let count = write_control(&packet, &mut output).map_err(|_| Status::Invalid)?;
+        let count = write_control(&packet, &mut output).expect("prepared bounded SDES identity");
         self.control = Some(output[..count].to_vec());
-        Ok(())
     }
 
     fn action(&mut self, peer: &Peer, action: Option<QsoAction>) {
         let bye = match action {
+            Some(QsoAction::Connected) => {
+                self.queue_information();
+                return;
+            }
             Some(QsoAction::Heartbeat) if self.control.is_none() => false,
-            Some(QsoAction::Closing { send_bye: true, .. }) => true,
+            Some(QsoAction::Closing { send_bye, .. }) => {
+                self.information = None;
+                if !send_bye {
+                    self.control = None;
+                    return;
+                }
+                true
+            }
             _ => return,
         };
-        if self.queue_control(peer, bye).is_err() {
-            self.receiver.control(QsoEvent::OwnerFailed, Instant::now());
-        }
+        self.queue_control(peer, bye);
+    }
+
+    /// One bounded latest-information slot; metadata cannot accumulate behind a slow peer.
+    fn queue_information(&mut self) {
+        let body = self.settings.station_information();
+        let mut output = vec![0; body.len() + 8];
+        let length = write_station_info(body, &mut output).expect("prepared bounded station text");
+        output.truncate(length);
+        self.information = Some(output);
     }
 
     fn send(
@@ -387,12 +408,17 @@ impl Serial {
     fn event(&mut self, peer: &Peer, event: PeerEvent) {
         let settings = peer.binding.current.load_full();
         if !Arc::ptr_eq(&self.settings, &settings) {
+            let information_changed =
+                self.settings.station_information() != settings.station_information();
             let policy = &settings.as_abi().policy;
             self.receiver
                 .reconfigure(policy.receive_gain_db, timers(policy))
                 .and_then(|_| self.encoder.set_gain(policy.transmit_gain_db))
                 .expect("prepared finite gains and positive timers");
             self.settings = settings;
+            if information_changed && self.receiver.state() == QsoState::Connected {
+                self.queue_information();
+            }
         }
         if self
             .deadline
@@ -426,13 +452,26 @@ impl Serial {
     }
 
     fn flush_control(&mut self, peer: &Peer) {
-        if let Some(packet) = self.control.take() {
-            match self.send(peer, Channel::Control, &packet, None) {
+        for channel in [Channel::Control, Channel::Audio] {
+            let packet = match channel {
+                Channel::Control => self.control.take(),
+                Channel::Audio => self.information.take(),
+            };
+            let Some(packet) = packet else { continue };
+            match self.send(peer, channel, &packet, None) {
                 Status::Ok => {}
-                Status::Pending | Status::Full => self.control = Some(packet),
+                Status::Pending | Status::Full => {
+                    match channel {
+                        Channel::Control => self.control = Some(packet),
+                        Channel::Audio => self.information = Some(packet),
+                    }
+                    break;
+                }
                 _ => {
                     self.receiver
                         .control(QsoEvent::TransportLost, Instant::now());
+                    self.information = None;
+                    break;
                 }
             }
         }

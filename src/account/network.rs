@@ -1,7 +1,7 @@
 //! One real account I/O owner; directory waits never suspend packet routing or peer turns.
 
 use super::{
-    Account, Admission,
+    Account, Admission, aprs,
     coordination::{Coordinator, TalkerPort},
     directory::{DirectoryControl, DirectoryJob, DirectoryPolicy, DirectoryState, Operation},
     settings::PreparedSettings,
@@ -38,6 +38,8 @@ pub(crate) mod tests;
 
 /// Metadata-only account notifications. Incoming admission still requires accept/revalidation.
 pub enum NetworkEvent {
+    /// Selected Proxy is authenticated again; new QSO generations may be admitted.
+    TransportReady,
     /// One completed directory transaction, independent of existing QSO liveness.
     Directory {
         /// Current registration/refresh health.
@@ -120,12 +122,14 @@ pub struct Observation {
 enum Transport {
     Direct(Arc<DirectSockets>),
     Proxy(ProxySession),
+    Offline(ProxyError),
 }
 impl Transport {
-    fn peer(&self) -> PeerTransport {
+    fn peer(&self) -> Option<PeerTransport> {
         match self {
-            Self::Direct(sockets) => PeerTransport::Direct(Arc::clone(sockets)),
-            Self::Proxy(session) => PeerTransport::Proxy(session.output()),
+            Self::Direct(sockets) => Some(PeerTransport::Direct(Arc::clone(sockets))),
+            Self::Proxy(session) => Some(PeerTransport::Proxy(session.output())),
+            Self::Offline(_) => None,
         }
     }
 }
@@ -158,9 +162,15 @@ impl Drop for ConnectionLease {
     }
 }
 
+type DialReply = oneshot::Sender<Result<PeerConnection, NetworkError>>;
+struct PendingDial {
+    reply: DialReply,
+    deadline: Instant,
+}
+
 enum Command {
-    Dial(u32, oneshot::Sender<Result<PeerConnection, NetworkError>>),
-    Accept(u64, oneshot::Sender<Result<PeerConnection, NetworkError>>),
+    Dial(u32, DialReply),
+    Accept(u64, DialReply),
     Remove(u32, u64),
     Observe(oneshot::Sender<Result<Observation, NetworkError>>),
     Reconfigure(
@@ -188,8 +198,8 @@ pub struct NetworkControl {
 
 impl AccountNetwork {
     /// Activate the configured transport on the caller's existing Tokio pool.
-    /// Direct binding and the complete Proxy DNS/connect/authentication sequence
-    /// finish before publishing the account. Proxy failure never selects UDP.
+    /// Direct bind failures reject activation. An unavailable selected Proxy
+    /// remains an observable retrying account; it never selects direct UDP.
     pub async fn open(
         settings: Arc<PreparedSettings>,
         civil_time: fn() -> (u8, u8),
@@ -207,27 +217,11 @@ impl AccountNetwork {
                 .map_err(|error| NetworkError::Io(error.kind()))?;
             return Self::direct(settings, Arc::new(sockets), civil_time);
         }
-        let timeout = Duration::from_millis(config.policy.directory_timeout_ms.into());
-        let transport = tokio::time::timeout(timeout, async {
-            let address =
-                tokio::net::lookup_host((settings.proxy_host(), config.transport.proxy_port))
-                    .await
-                    .map_err(|error| NetworkError::Io(error.kind()))?
-                    .next()
-                    .ok_or(NetworkError::Io(io::ErrorKind::AddrNotAvailable))?;
-            connect(
-                address,
-                settings.callsign(),
-                settings.proxy_password(),
-                timeout,
-            )
-            .await
-            .map_err(NetworkError::Proxy)
-        })
-        .await
-        .map_err(|_| NetworkError::Proxy(ProxyError::Timeout))??;
-        let session = ProxySession::start(transport, timeout).map_err(NetworkError::Proxy)?;
-        Self::proxy(settings, session, civil_time)
+        let transport = match open_proxy(Arc::clone(&settings)).await {
+            Ok(session) => Transport::Proxy(session),
+            Err(error) => Transport::Offline(error),
+        };
+        Self::start(settings, transport, civil_time)
     }
 
     /// Start a direct account with already-bound sockets and an off-audio civil-time source.
@@ -258,7 +252,7 @@ impl AccountNetwork {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| NetworkError::Invalid)?;
         let mode = match &transport {
             Transport::Direct(_) => 0,
-            Transport::Proxy(_) => 1,
+            Transport::Proxy(_) | Transport::Offline(_) => 1,
         };
         if settings.as_abi().transport.kind != mode {
             return Err(NetworkError::Invalid);
@@ -295,9 +289,11 @@ impl AccountNetwork {
         let retired = Arc::new(Notify::new());
         let direct = match &transport {
             Transport::Direct(sockets) => Some(Arc::clone(sockets)),
-            Transport::Proxy(_) => None,
+            Transport::Proxy(_) | Transport::Offline(_) => None,
         };
         let owner = Owner {
+            aprs_due: aprs::first_due(&settings),
+            aprs_work: None,
             settings,
             transport,
             civil_time,
@@ -306,6 +302,7 @@ impl AccountNetwork {
             snapshot,
             view: view.clone(),
             peers: BTreeMap::new(),
+            pending_dials: BTreeMap::new(),
             commands: receiver,
             events,
             stop,
@@ -432,8 +429,36 @@ impl Drop for AccountNetwork {
 }
 
 type DirectoryWork = Pin<Box<dyn Future<Output = (u64, Result<Vec<u8>, TransactionError>)> + Send>>;
+type AprsWork = Pin<Box<dyn Future<Output = Result<(), ProxyError>> + Send>>;
+
+/// One selected-Proxy attempt, bounded across DNS, connect and authentication.
+async fn open_proxy(settings: Arc<PreparedSettings>) -> Result<ProxySession, ProxyError> {
+    let timeout = Duration::from_millis(settings.as_abi().policy.directory_timeout_ms.into());
+    tokio::time::timeout(timeout, async {
+        let address = tokio::net::lookup_host((
+            settings.proxy_host(),
+            settings.as_abi().transport.proxy_port,
+        ))
+        .await
+        .map_err(|error| ProxyError::Io(error.kind()))?
+        .next()
+        .ok_or(ProxyError::Io(io::ErrorKind::AddrNotAvailable))?;
+        let transport = connect(
+            address,
+            settings.callsign(),
+            settings.proxy_password(),
+            timeout,
+        )
+        .await?;
+        ProxySession::start(transport, timeout)
+    })
+    .await
+    .unwrap_or(Err(ProxyError::Timeout))
+}
 
 struct Owner {
+    aprs_due: Option<Instant>,
+    aprs_work: Option<AprsWork>,
     settings: Arc<PreparedSettings>,
     transport: Transport,
     civil_time: fn() -> (u8, u8),
@@ -442,6 +467,7 @@ struct Owner {
     snapshot: DirectorySnapshot,
     view: DirectoryView,
     peers: BTreeMap<(u32, u64), Arc<Control>>,
+    pending_dials: BTreeMap<u32, PendingDial>,
     commands: mpsc::Receiver<Command>,
     events: mpsc::Sender<NetworkEvent>,
     stop: watch::Receiver<bool>,
@@ -464,14 +490,14 @@ impl Owner {
             router.malformed_packets(),
         );
         let proxy = match &self.transport {
-            Transport::Direct(_) => None,
+            Transport::Direct(_) | Transport::Offline(_) => None,
             Transport::Proxy(session) => Some(session.output().observe()),
         };
         Observation {
             directory: self.directory.observe(now),
             fresh: self.snapshot.require_fresh(now).is_ok(),
             snapshot_age_ms: self.snapshot.age_ms(now),
-            transport: u32::from(proxy.is_some()),
+            transport: self.settings.as_abi().transport.kind,
             admitted,
             pending,
             selected,
@@ -485,12 +511,15 @@ impl Owner {
             proxy,
         }
     }
-    async fn run(mut self) {
+    async fn connected(&mut self) -> Option<NetworkEvent> {
+        if let Transport::Offline(error) = &self.transport {
+            return Some(NetworkEvent::ProxyLost(*error));
+        }
         let mut audio = vec![0; MAX_DATAGRAM];
         let mut control = vec![0; MAX_DATAGRAM];
         let sockets = match &self.transport {
             Transport::Direct(sockets) => Some(Arc::clone(sockets)),
-            Transport::Proxy(_) => None,
+            Transport::Proxy(_) | Transport::Offline(_) => None,
         };
         let mut work: Option<DirectoryWork> = None;
         let mut terminal = None;
@@ -500,6 +529,13 @@ impl Owner {
             }
             let now = Instant::now();
             self.coordinator.poll(now);
+            if self.aprs_work.is_none() && self.aprs_due.is_some_and(|due| now >= due) {
+                self.aprs_work = Some(Box::pin(aprs::publish(
+                    Arc::clone(&self.settings),
+                    self.transport.peer().expect("connected transport"),
+                )));
+                self.aprs_due = Some(now + aprs::INTERVAL);
+            }
             if work.is_none() {
                 match self.directory.poll(&self.snapshot, now) {
                     Ok(Some(job)) => work = Some(self.directory_work(job)),
@@ -507,10 +543,15 @@ impl Owner {
                     Err(_) => break,
                 }
             }
-            let deadline = [self.directory.deadline(now), self.coordinator.deadline(now)]
-                .into_iter()
-                .flatten()
-                .min();
+            let deadline = [
+                self.directory.deadline(now),
+                self.coordinator.deadline(now),
+                self.pending_dials.values().map(|dial| dial.deadline).min(),
+                self.aprs_due.filter(|_| self.aprs_work.is_none()),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             tokio::select! {
                 _ = self.stop.changed() => break,
                 _ = self.retired.notified() => self.reap_retired(),
@@ -540,7 +581,7 @@ impl Owner {
                 packet = async { match &mut self.transport {
                     Transport::Proxy(session) => session.recv().await
                         .ok_or_else(|| session.failure().unwrap_or(ProxyError::Closed)),
-                    Transport::Direct(_) => std::future::pending().await,
+                    Transport::Direct(_) | Transport::Offline(_) => std::future::pending().await,
                 }} => match packet {
                     Ok(packet) => self.route(packet.class(), packet.source(), packet.arrived(), packet.payload()),
                     Err(error) => {
@@ -555,31 +596,52 @@ impl Owner {
                     work = None;
                     self.directory.finish(id, result.as_deref().map_err(|error| *error), &mut self.snapshot, Instant::now());
                     self.view.publish(&self.snapshot);
+                    self.retry_dials(Instant::now());
                     self.health();
+                },
+                _ = async { match self.aprs_work.as_mut() {
+                    Some(work) => work.await,
+                    None => std::future::pending().await,
+                }} => {
+                    // Metadata is best effort, not peer liveness. Retry on the
+                    // next reference interval; never terminate or redial a QSO.
+                    self.aprs_work = None;
                 },
                 _ = async { match deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
                     None => std::future::pending().await,
-                }} => {},
+                }} => self.retry_dials(Instant::now()),
             }
             // A permanently ready socket/command queue cannot monopolize the executor.
             tokio::task::yield_now().await;
         }
-        let failed = terminal.is_some();
-        if let Some(event) = terminal {
-            // This account has stopped routing. Retain its first cause behind
-            // ordinary health events, but never prevent lifecycle quiescence.
-            tokio::select! {
-                _ = self.events.send(event) => {},
-                _ = self.stop.changed() => {},
+        terminal
+    }
+
+    async fn run(mut self) {
+        let mut failed = false;
+        loop {
+            match self.connected().await {
+                Some(NetworkEvent::ProxyLost(error)) => {
+                    if !self.recover_proxy(error).await {
+                        break;
+                    }
+                }
+                Some(event) => {
+                    failed = true;
+                    tokio::select! {
+                        _ = self.events.send(event) => {},
+                        _ = self.stop.changed() => {},
+                    }
+                    break;
+                }
+                None => break,
             }
         }
-        drop(work);
         self.commands.close();
+        self.aprs_work = None;
         for ((node, generation), peer) in std::mem::take(&mut self.peers) {
             self.coordinator.remove(node, generation);
-            // Failure wakes even a backpressured peer so its host can finish
-            // finite media. Only requested shutdown cancels the serial owner.
             if failed {
                 peer.transport_lost();
             } else {
@@ -598,6 +660,77 @@ impl Owner {
         }
         if let Transport::Proxy(session) = self.transport {
             let _ = session.stop().await;
+        }
+    }
+
+    /// Recover only account transport/registration. Ordinary QSOs are never redialed.
+    /// The existing owner services stop, commands and old finite tails during backoff.
+    async fn recover_proxy(&mut self, error: ProxyError) -> bool {
+        self.aprs_work = None;
+        self.directory.transport_lost();
+        self.coordinator.router().clear_pending();
+        for (&(node, generation), peer) in &self.peers {
+            self.coordinator.unroute(node, generation);
+            peer.transport_lost();
+        }
+        for (_, dial) in std::mem::take(&mut self.pending_dials) {
+            let _ = dial.reply.send(Err(NetworkError::Proxy(error)));
+        }
+        let previous = std::mem::replace(&mut self.transport, Transport::Offline(error));
+        if let Transport::Proxy(session) = previous {
+            let _ = session.stop().await;
+        }
+        {
+            // This account has stopped routing. Retain its first cause behind
+            // ordinary health events, but never prevent lifecycle quiescence.
+            tokio::select! {
+                _ = self.events.send(NetworkEvent::ProxyLost(error)) => {},
+                _ = self.stop.changed() => return false,
+            }
+        }
+        loop {
+            let settings = Arc::clone(&self.settings);
+            let mut attempt = Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(
+                    settings.as_abi().policy.directory_retry_ms.into(),
+                ))
+                .await;
+                open_proxy(settings).await
+            });
+            loop {
+                if *self.stop.borrow() {
+                    return false;
+                }
+                let now = Instant::now();
+                self.coordinator.poll(now);
+                let deadline = self.coordinator.deadline(now);
+                tokio::select! {
+                    _ = self.stop.changed() => return false,
+                    _ = self.retired.notified() => self.reap_retired(),
+                    _ = self.coordinator.service() => {},
+                    command = self.commands.recv() => match command {
+                        Some(command) => self.command(command),
+                        None => return false,
+                    },
+                    result = &mut attempt => match result {
+                        Ok(session) => {
+                            self.transport = Transport::Proxy(session);
+                            self.aprs_due = aprs::first_due(&self.settings);
+                            self.directory.transport_ready();
+                            tokio::select! {
+                                _ = self.events.send(NetworkEvent::TransportReady) => return true,
+                                _ = self.stop.changed() => return false,
+                            }
+                        }
+                        Err(error) => { self.transport = Transport::Offline(error); break; }
+                    },
+                    _ = async { match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending().await,
+                    }} => {},
+                }
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -642,6 +775,10 @@ impl Owner {
                 let _ = self.events.try_send(NetworkEvent::Pending(pending));
             }
             RouteResult::Routed => self.routed_packets = self.routed_packets.saturating_add(1),
+            RouteResult::RefreshRequired => {
+                self.dropped_packets = self.dropped_packets.saturating_add(1);
+                self.directory.request_snapshot(arrived);
+            }
             outcome => {
                 self.dropped_packets = self.dropped_packets.saturating_add(1);
                 if matches!(
@@ -655,13 +792,42 @@ impl Owner {
     }
 
     fn command(&mut self, command: Command) {
+        if let Transport::Offline(error) = &self.transport {
+            match command {
+                Command::Dial(_, reply) | Command::Accept(_, reply) => {
+                    let _ = reply.send(Err(NetworkError::Proxy(*error)));
+                    return;
+                }
+                _ => {}
+            }
+        }
         let (connection, reply) = match command {
-            Command::Dial(node, reply) => (
-                self.coordinator
-                    .router()
-                    .dial(&self.snapshot, node, Instant::now()),
-                reply,
-            ),
+            Command::Dial(node, reply) => {
+                let now = Instant::now();
+                let result = if self.pending_dials.contains_key(&node) {
+                    Err(Admission::Duplicate)
+                } else {
+                    self.coordinator.router().dial(&self.snapshot, node, now)
+                };
+                if matches!(result, Err(Admission::Unverified))
+                    && self.pending_dials.len()
+                        < self.settings.as_abi().policy.max_pending_handshakes as usize
+                    && self.directory.request_snapshot(now)
+                {
+                    self.pending_dials.insert(
+                        node,
+                        PendingDial {
+                            reply,
+                            deadline: now
+                                + Duration::from_millis(
+                                    self.settings.as_abi().policy.connect_timeout_ms.into(),
+                                ),
+                        },
+                    );
+                    return;
+                }
+                (result, reply)
+            }
             Command::Accept(token, reply) => (
                 self.coordinator
                     .router()
@@ -691,6 +857,34 @@ impl Owner {
                 return;
             }
         };
+        self.publish(connection, reply);
+    }
+
+    /// Retry only after directory completion/deadline; no task or poll per pending dial.
+    fn retry_dials(&mut self, now: Instant) {
+        for (node, dial) in std::mem::take(&mut self.pending_dials) {
+            if dial.reply.is_closed() {
+                continue;
+            }
+            if now >= dial.deadline {
+                let _ = dial
+                    .reply
+                    .send(Err(NetworkError::Admission(Admission::Unverified)));
+                continue;
+            }
+            match self.coordinator.router().dial(&self.snapshot, node, now) {
+                Ok(connection) => self.publish(connection, dial.reply),
+                Err(Admission::Unverified) => {
+                    self.pending_dials.insert(node, dial);
+                }
+                Err(error) => {
+                    let _ = dial.reply.send(Err(NetworkError::Admission(error)));
+                }
+            }
+        }
+    }
+
+    fn publish(&mut self, connection: Connection, reply: DialReply) {
         let identity = (connection.identity.node_number, connection.generation);
         let control = Arc::new(Control::default());
         let peer = PeerConnection {
@@ -703,7 +897,10 @@ impl Owner {
                 .port(identity.0, identity.1, Arc::clone(&control)),
             connection,
             control: Arc::clone(&control),
-            transport: self.transport.peer(),
+            transport: self
+                .transport
+                .peer()
+                .expect("admission requires a live transport"),
         };
         if reply.send(Ok(peer)).is_ok() {
             self.peers.insert(identity, control);
@@ -731,6 +928,8 @@ impl Owner {
             settings.as_abi().policy.directory_freshness_ms.into(),
         ));
         self.view.publish(&self.snapshot);
+        self.aprs_work = None;
+        self.aprs_due = aprs::first_due(&settings);
         self.settings = settings;
         Ok(())
     }
@@ -740,7 +939,7 @@ impl Owner {
         let (hour, day) = (self.civil_time)();
         let proxy = match &self.transport {
             Transport::Proxy(session) => Some(session.directory()),
-            Transport::Direct(_) => None,
+            Transport::Direct(_) | Transport::Offline(_) => None,
         };
         Box::pin(async move {
             let result = tokio::time::timeout(job.timeout, async {

@@ -1,7 +1,10 @@
 //! Raw IPv4 UDP boundary; protocol admission and packet routing stay with the account.
 
 use crate::wire::{Channel, MAX_DATAGRAM};
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::{SocketAddr, SocketAddrV4},
+};
 use tokio::net::UdpSocket;
 
 /// Nonblocking send outcome; retain the same prepared packet on Pending.
@@ -82,6 +85,16 @@ impl DirectSockets {
     /// Wait only after an actual Pending result; other peers retain independent owners.
     pub async fn writable(&self, class: Channel) -> io::Result<()> {
         self.socket(class).writable().await
+    }
+
+    /// Submit prepared account metadata off audio. Tokio owns readiness/retry;
+    /// the account polls this bounded operation alongside packet routing.
+    pub(crate) async fn send_control(
+        &self,
+        destination: SocketAddrV4,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        self.control.send_to(payload, destination).await.map(|_| ())
     }
 }
 

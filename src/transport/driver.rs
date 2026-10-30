@@ -52,6 +52,11 @@ impl Control {
         *self.stop.borrow()
     }
 
+    /// Transport retirement is permanent for this QSO, including after its failure turn.
+    pub(crate) fn is_transport_retired(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// Account transport failure must reach a peer even while its input is
     /// backpressured. Unlike stop, this preserves the finite-media owner.
     pub(crate) fn transport_lost(&self) {
@@ -166,13 +171,15 @@ impl PeerDriver {
             let mut event = PeerEvent::Wake;
             let mut turns = 0;
             let mut receive_open = true;
+            let mut failure_delivered = false;
             loop {
                 // End the watch borrow before a callback can reenter Control::stop.
                 let stopped = *stopping.borrow();
                 if stopped {
                     break;
                 }
-                if active.failed.swap(false, Ordering::AcqRel) {
+                if !failure_delivered && active.is_transport_retired() {
+                    failure_delivered = true;
                     event = PeerEvent::Io(io::ErrorKind::BrokenPipe);
                 } else if active.close.swap(false, Ordering::AcqRel) {
                     event = PeerEvent::Close;

@@ -249,7 +249,7 @@ fn start_media(socket: &mut TcpStream, speex: bool) -> (Vec<u8>, Vec<u8>) {
     while media.is_empty() || chat.is_empty() {
         let (kind, payload) = receive(socket);
         if kind == 5 {
-            if payload.starts_with(b"oNDATA") {
+            if payload.starts_with(b"oNDATA") && !payload.starts_with(b"oNDATA\r") {
                 chat = payload;
             } else {
                 media = payload;
@@ -504,6 +504,143 @@ fn proxy_closure_delivers_a_final_serial_turn_with_the_first_cause() {
     ] {
         proxy_case(speex, blocked, faults, cause);
     }
+}
+
+#[test]
+fn station_information_is_sent_on_establishment_and_live_metadata_update() {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = context::resource_context(api);
+    let _context = ContextOwner(api, context);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || registered(&listener));
+    let servers = [span("127.0.0.1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.transport.kind = 1;
+    config.transport.proxy_host = span("127.0.0.1");
+    config.transport.proxy_port = port;
+    config.station.status_message = span("First station information");
+    let account = prepare(api, context, &config);
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Ok
+    );
+    let mut socket = server.join().unwrap();
+    let _fixture = attach(api, context, account, false, None);
+    send_sdes(&mut socket, false);
+    let info = |socket: &mut TcpStream| loop {
+        let (kind, bytes) = receive(socket);
+        if kind == 5 && bytes.starts_with(b"oNDATA\r") {
+            break bytes;
+        }
+    };
+    assert_eq!(info(&mut socket), b"oNDATA\rFirst station information\0");
+    config.station.status_message = span("Updated station information");
+    assert_eq!(
+        unsafe { api.account_reconfigure.unwrap()(account, &config, &secrets("fixture-password")) },
+        Status::Ok
+    );
+    assert_eq!(info(&mut socket), b"oNDATA\rUpdated station information\0");
+    socket.shutdown(Shutdown::Both).unwrap();
+}
+
+#[test]
+fn failed_proxy_recovers_registration_without_reviving_old_qsos() {
+    for initial_failure in [false, true] {
+        proxy_transport_recovery(initial_failure);
+    }
+}
+
+fn proxy_transport_recovery(initial_failure: bool) {
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = context::resource_context(api);
+    let _context = ContextOwner(api, context);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (sockets, connected) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        if initial_failure {
+            let (socket, _) = listener.accept().unwrap();
+            socket.shutdown(Shutdown::Both).unwrap();
+            sockets.send(None).unwrap();
+        } else {
+            sockets.send(Some(registered(&listener))).unwrap();
+        }
+        resumed.recv_timeout(Duration::from_secs(3)).unwrap();
+        sockets.send(Some(registered(&listener))).unwrap();
+    });
+    let servers = [span("127.0.0.1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.transport.kind = 1;
+    config.transport.proxy_host = span("127.0.0.1");
+    config.transport.proxy_port = port;
+    config.policy.directory_retry_ms = 25;
+    let account = prepare(api, context, &config);
+    let _account = PreparedAccount(api, account);
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Ok
+    );
+    let first = connected.recv_timeout(Duration::from_secs(3)).unwrap();
+    let mut old = ptr::null_mut();
+    let old_generation = if let Some(first) = first {
+        fresh(api, account);
+        assert_eq!(
+            unsafe { api.dial.unwrap()(account, 123456, &mut old) },
+            Status::Ok
+        );
+        let generation = identity(api, old).1;
+        first.shutdown(Shutdown::Both).unwrap();
+        Some(generation)
+    } else {
+        None
+    };
+    let mut observed = AccountObservation {
+        struct_size: size_of::<AccountObservation>() as u32,
+        abi_version: 1,
+        ..Default::default()
+    };
+    assert!(wait(|| unsafe {
+        api.account_observe.unwrap()(account, &mut observed) == Status::Ok
+            && observed.first_cause == 2
+    }));
+    resume.send(()).unwrap();
+    let second = connected
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Proxy account did not reconnect")
+        .unwrap();
+    server.join().unwrap();
+    fresh(api, account);
+    assert_eq!(
+        unsafe { api.account_observe.unwrap()(account, &mut observed) },
+        Status::Ok
+    );
+    assert_eq!((observed.admitted, observed.first_cause), (0, 0));
+    let mut pending = PeerInfo {
+        struct_size: size_of::<PeerInfo>() as u32,
+        abi_version: 1,
+        ..unsafe { std::mem::zeroed() }
+    };
+    if old_generation.is_some() {
+        assert_eq!(
+            unsafe { api.validate_pending.unwrap()(old, &mut pending) },
+            Status::Closed
+        );
+    }
+    let mut replacement = ptr::null_mut();
+    assert_eq!(
+        unsafe { api.dial.unwrap()(account, 123456, &mut replacement) },
+        Status::Ok
+    );
+    if let Some(old_generation) = old_generation {
+        assert_ne!(identity(api, replacement).1, old_generation);
+    }
+    unsafe {
+        api.peer_destroy.unwrap()(old);
+        api.peer_destroy.unwrap()(replacement);
+    }
+    second.shutdown(Shutdown::Both).unwrap();
 }
 
 #[test]

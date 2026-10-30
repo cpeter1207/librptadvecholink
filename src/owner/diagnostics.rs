@@ -381,7 +381,8 @@ mod tests {
                 context: ptr::from_ref(&calls).cast_mut().cast(),
             }),
         );
-        assert!(!binding.live.load(Ordering::Acquire));
+        assert!(!binding.available.load(Ordering::Acquire));
+        assert!(binding.live.load(Ordering::Acquire));
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 

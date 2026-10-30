@@ -154,6 +154,7 @@ fn binding_for_test(
         live: std::sync::atomic::AtomicBool::new(true),
         drivers: std::sync::Mutex::new(Vec::new()),
         first_failure: std::sync::Mutex::new(None),
+        available: std::sync::atomic::AtomicBool::new(true),
     })
 }
 
@@ -306,7 +307,7 @@ fn dial_preserves_admission_timeout_and_post_reply_revalidation_failures() {
         assert!(output.is_null());
         assert_eq!(
             status,
-            [Status::Invalid, Status::Failed, Status::Closed][case]
+            [Status::Failed, Status::Failed, Status::Closed][case]
         );
     }
 }
@@ -357,7 +358,9 @@ fn real_account_io_failure_preserves_reload_errors_and_retirement_ownership() {
             Err(crate::account::network::NetworkError::Stopped)
         )));
         if !abort_bridge {
-            assert!(proxy_login::wait(|| !binding.live.load(Ordering::Acquire)));
+            assert!(proxy_login::wait(|| !binding
+                .available
+                .load(Ordering::Acquire)));
             assert!(matches!(
                 *binding.first_failure.lock().unwrap(),
                 Some(crate::owner::TransportFailure::Io(
@@ -401,7 +404,11 @@ fn real_account_io_failure_preserves_reload_errors_and_retirement_ownership() {
                     &secrets("fixture-password"),
                 )
             },
-            Status::Failed
+            if abort_bridge {
+                Status::Failed
+            } else {
+                Status::Ok
+            }
         );
         if abort_bridge {
             assert!(account.state.lock().unwrap().active.is_none());
@@ -539,7 +546,7 @@ fn serial_direct_sends_preserve_readiness_credit_and_the_original_os_failure() {
                     &mut serial.transport,
                     PeerTransport::Direct(Arc::new(sockets)),
                 );
-                serial.queue_control(peer, false).unwrap();
+                serial.queue_control(peer, false);
                 let packet = serial.control.as_ref().unwrap().clone();
                 let blocked = serial.blocked_sends;
                 let status = serial.send(peer, Channel::Control, &packet, None);
@@ -669,7 +676,7 @@ fn proxy_credit_keeps_the_exact_control_packet_until_the_writer_resumes() {
                     panic!("selected Proxy transport missing")
                 };
                 let output = output.clone();
-                serial.queue_control(peer, false).unwrap();
+                serial.queue_control(peer, false);
                 let packet = serial.control.as_ref().unwrap().clone();
                 let mut queued = 0;
                 loop {
@@ -742,7 +749,7 @@ fn proxy_credit_keeps_the_exact_control_packet_until_the_writer_resumes() {
 }
 
 #[test]
-fn heartbeat_serialization_failure_closes_with_owner_failure_not_transport_loss() {
+fn long_location_does_not_poison_heartbeat_serialization() {
     struct Probe {
         qso: *mut ffi::Qso,
         result: std::sync::mpsc::Sender<Result<(), String>>,
@@ -770,13 +777,10 @@ fn heartbeat_serialization_failure_closes_with_owner_failure_not_transport_loss(
             serial.control = None;
             serial.action(peer, Some(QsoAction::Heartbeat));
             let observation = serial.receiver.observe(Instant::now()).unwrap();
-            assert_eq!(
-                observation.session.first_cause,
-                Some(crate::session::Cause::OwnerFailed)
-            );
-            assert!(serial.control.is_none());
+            assert_eq!(observation.session.first_cause, None);
+            assert!(serial.control.is_some());
         }))
-        .map_err(|_| "heartbeat serialization failure lost its owner cause".to_owned());
+        .map_err(|_| "long location prevented a valid heartbeat".to_owned());
         let _ = probe.result.send(result);
         -1
     }

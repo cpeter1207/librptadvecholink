@@ -1,5 +1,6 @@
 //! Serialized account admission and EchoLink-only first-talker ownership.
 
+mod aprs;
 pub mod coordination;
 pub mod directory;
 pub mod network;

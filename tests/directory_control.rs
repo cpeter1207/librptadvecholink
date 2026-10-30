@@ -8,6 +8,41 @@ use rptadv_echolink::{
 use std::time::{Duration, Instant};
 
 #[test]
+fn demand_snapshot_refresh_coalesces_and_obeys_the_existing_retry_budget() {
+    let now = Instant::now();
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    let mut owner = DirectoryControl::new(vec!["first".into()], policy()).unwrap();
+    let register = owner.poll(&snapshot, now).unwrap().unwrap();
+    owner.finish(register.id, Ok(b"OK"), &mut snapshot, now);
+    assert!(owner.request_snapshot(now));
+    let initial = owner.poll(&snapshot, now).unwrap().unwrap();
+    owner.finish(initial.id, Ok(b"@@@\n0\n+++\n"), &mut snapshot, now);
+    assert!(owner.request_snapshot(now));
+    let fetch = owner.poll(&snapshot, now).unwrap().unwrap();
+    assert!(matches!(fetch.operation, Operation::Snapshot { .. }));
+    for _ in 0..100 {
+        assert!(owner.request_snapshot(now));
+        assert!(owner.poll(&snapshot, now).unwrap().is_none());
+    }
+    owner.finish(fetch.id, Ok(b"@@@\n0\n+++\n"), &mut snapshot, now);
+    assert!(!owner.request_snapshot(now));
+    assert!(owner.request_snapshot(now + policy().retry));
+    let failed = owner
+        .poll(&snapshot, now + policy().retry)
+        .unwrap()
+        .unwrap();
+    owner.finish(
+        failed.id,
+        Err(TransactionError::Timeout),
+        &mut snapshot,
+        now + policy().retry,
+    );
+    assert!(!owner.request_snapshot(now + policy().retry));
+    owner.stop().unwrap();
+    assert!(!owner.request_snapshot(now + policy().retry));
+}
+
+#[test]
 fn live_settings_update_preserves_inflight_tokens_and_renews_changed_metadata() {
     for refresh in [false, true] {
         live_settings_update(refresh);

@@ -65,6 +65,8 @@ struct Binding {
     control: NetworkControl,
     generation: u64,
     live: AtomicBool,
+    // Transport recovery may restore availability, never the lifecycle gate above.
+    available: AtomicBool,
     // Attach/publication gate only; weak entries never prolong a QSO/runtime.
     drivers: Mutex<Vec<Weak<crate::transport::driver::PeerDriver>>>,
     first_failure: Mutex<Option<TransportFailure>>,
@@ -153,7 +155,10 @@ impl Account {
         state
             .active
             .as_ref()
-            .filter(|active| active.binding.live.load(Ordering::Acquire))
+            .filter(|active| {
+                active.binding.live.load(Ordering::Acquire)
+                    && active.binding.available.load(Ordering::Acquire)
+            })
             .map(|active| Arc::clone(&active.binding))
             .ok_or(Status::Closed)
     }
@@ -214,6 +219,7 @@ impl Account {
             control: network.control(),
             generation,
             live: AtomicBool::new(true),
+            available: AtomicBool::new(true),
             drivers: Mutex::new(Vec::new()),
             first_failure: Mutex::new(None),
         });
@@ -375,7 +381,10 @@ impl Account {
             )
         };
         if let (Some(old), Some(next), Some(binding)) = (&old, &next, &binding) {
-            if !old.requires_handoff(next) && binding.live.load(Ordering::Acquire) {
+            if !old.requires_handoff(next)
+                && binding.live.load(Ordering::Acquire)
+                && binding.available.load(Ordering::Acquire)
+            {
                 if let Err(error) = self
                     .runtime
                     .block_on(binding.control.reconfigure(Arc::clone(next)))
@@ -492,6 +501,10 @@ async fn bridge(
             event = events.recv() => match event { Some(event) => event, None => break },
         };
         match event {
+            NetworkEvent::TransportReady => {
+                *binding.first_failure.lock().unwrap() = None;
+                binding.available.store(true, Ordering::Release);
+            }
             NetworkEvent::Pending(pending) => {
                 let Some(callback) = callback else {
                     continue;
@@ -555,7 +568,7 @@ impl Binding {
         if let Ok(mut first) = self.first_failure.lock() {
             first.get_or_insert(error);
         }
-        self.live.store(false, Ordering::Release);
+        self.available.store(false, Ordering::Release);
         if let Some(callback) = callback {
             callback.emit(
                 0,
@@ -644,7 +657,10 @@ pub(crate) unsafe extern "C" fn dial(
 
 impl Peer {
     fn live(&self) -> bool {
-        self.binding.live.load(Ordering::Acquire) && !self.control.is_stopped()
+        self.binding.live.load(Ordering::Acquire)
+            && self.binding.available.load(Ordering::Acquire)
+            && !self.control.is_stopped()
+            && !self.control.is_transport_retired()
     }
 
     fn validate(&self) -> Status {

@@ -287,6 +287,43 @@ fn aprs_location_quantizes_physical_metadata_and_carries_minutes() {
     assert!(unsafe { PreparedSettings::copy(&config, &secret) }.is_err());
 }
 
+#[test]
+fn aprs_endpoint_is_owned_optional_and_nonexclusive() {
+    let servers = [span("directory.example.invalid")];
+    let keys = secrets("fixture-password");
+    let mut config = settings("K1ABC-R", "North", &servers, &[]);
+    let baseline = unsafe { PreparedSettings::copy(&config, &keys) }.unwrap();
+    assert_eq!(baseline.aprs_server(), None);
+    let mut endpoint = String::from("localhost:5199");
+    config.aprs_server = span(&endpoint);
+    let prepared = unsafe { PreparedSettings::copy(&config, &keys) }.unwrap();
+    endpoint.clear();
+    assert_eq!(prepared.aprs_server(), Some(("localhost", 5199)));
+    assert!(!baseline.requires_handoff(&prepared));
+    for (value, direct, proxy) in [
+        ("", true, true),
+        ("localhost:5199", true, true),
+        ("127.0.0.1:60000", true, false),
+        ("host", false, false),
+        (":5199", false, false),
+        ("host:bad", false, false),
+        ("host:0", false, false),
+        ("host:65536", false, false),
+        ("[::1]:5199", false, false),
+        ("bad host:5199", false, false),
+    ] {
+        for (transport, expected) in [(0, direct), (1, proxy)] {
+            config.transport.kind = transport;
+            config.aprs_server = span(value);
+            assert_eq!(
+                unsafe { PreparedSettings::copy(&config, &keys) }.is_ok(),
+                expected,
+                "{transport}: {value}"
+            );
+        }
+    }
+}
+
 #[path = "support/context.rs"]
 mod context;
 use context::resource_context;
@@ -842,6 +879,8 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         unsafe { api.context_destroy.unwrap()(context) };
         wait(|| serial.calls.load(Ordering::Acquire) >= 3);
         let mut chat = [0; 128];
+        let (count, _) = media.recv_from(&mut chat).unwrap();
+        assert_eq!(&chat[..count], b"oNDATA\rAvailable\0");
         let (count, _) = media.recv_from(&mut chat).unwrap();
         assert_eq!(&chat[..count], b"oNDATAK1ABC-R>Test message\r\n\0");
         media

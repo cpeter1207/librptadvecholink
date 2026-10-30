@@ -187,6 +187,7 @@ pub struct DirectoryControl {
     register_again: bool,
     last_registration: Option<Instant>,
     last_snapshot: Option<Instant>,
+    last_requested_snapshot: Option<Instant>,
     retry_since: Option<Instant>,
     failures: u64,
 }
@@ -228,6 +229,7 @@ impl DirectoryControl {
             register_again: false,
             last_registration: None,
             last_snapshot: None,
+            last_requested_snapshot: None,
             retry_since: None,
             failures: 0,
         })
@@ -270,6 +272,50 @@ impl DirectoryControl {
     /// Metadata-only health; it does not claim that remote clients can reach this account.
     pub fn state(&self) -> DirectoryState {
         self.state
+    }
+
+    /// Coalesce missing/stale-identity refreshes on the existing directory worker.
+    /// The normal retry interval bounds refresh floods; a pending fetch is shared.
+    pub fn request_snapshot(&mut self, now: Instant) -> bool {
+        if matches!(
+            self.state,
+            DirectoryState::Retrying | DirectoryState::Stopping | DirectoryState::Stopped
+        ) {
+            return false;
+        }
+        if self.last_snapshot.is_none()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|job| matches!(job.operation, Operation::Snapshot { .. }))
+        {
+            return true;
+        }
+        if self
+            .last_requested_snapshot
+            .is_some_and(|last| now.saturating_duration_since(last) < self.policy.retry)
+        {
+            return false;
+        }
+        self.last_requested_snapshot = Some(now);
+        self.last_snapshot = None;
+        true
+    }
+
+    /// Invalidate only current registration/work, not the last snapshot or token sequence.
+    pub(crate) fn transport_lost(&mut self) {
+        self.pending = None;
+        self.registered = false;
+        self.must_register = true;
+        // Request a new fetch after login without renewing the retained snapshot's age.
+        self.last_snapshot = None;
+        self.state = DirectoryState::Retrying;
+    }
+
+    /// A recovered transport renews registration immediately after its own backoff.
+    pub(crate) fn transport_ready(&mut self) {
+        self.retry_since = None;
+        self.state = DirectoryState::Registering;
     }
 
     /// Failed matching transactions, including parse failures but excluding stale completions.

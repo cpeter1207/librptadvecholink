@@ -127,6 +127,121 @@ fn an_ipv6_only_directory_records_failure_without_dialing_an_unverified_peer() {
 }
 
 #[test]
+fn a_missing_dial_target_requests_one_bounded_directory_refresh() {
+    for incoming in [false, true] {
+        missing_identity_refresh(incoming);
+    }
+}
+
+fn missing_identity_refresh(incoming: bool) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap().to_string();
+                let server = tokio::spawn(async move {
+                    for response in [
+                        b"OK".as_slice(),
+                        b"@@@\n0\n+++\n",
+                        b"@@@\n1\nK1ABC-R\nPeer\n123456\n127.0.0.1\n+++\n",
+                        b"OK",
+                    ] {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        let mut reader = BufReader::new(socket);
+                        let mut first = Vec::new();
+                        reader.read_until(b'\r', &mut first).await.unwrap();
+                        if first[0] == b'l' {
+                            for _ in 0..3 {
+                                let mut field = Vec::new();
+                                reader.read_until(b'\r', &mut field).await.unwrap();
+                                // Offline has two fields after the password, online has three.
+                                if field.starts_with(b"OFF-") {
+                                    let mut qth = Vec::new();
+                                    reader.read_until(b'\r', &mut qth).await.unwrap();
+                                    break;
+                                }
+                            }
+                        }
+                        reader.get_mut().write_all(response).await.unwrap();
+                    }
+                });
+                let sockets = Arc::new(
+                    DirectSockets::bind(
+                        "127.0.0.1:0".parse().unwrap(),
+                        "127.0.0.1:0".parse().unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                );
+                let (network, mut events) = AccountNetwork::direct(
+                    settings(&address, 300_000, 0),
+                    Arc::clone(&sockets),
+                    || (9, 3),
+                )
+                .unwrap();
+                while !matches!(
+                    events.recv().await,
+                    Some(NetworkEvent::Directory { fresh: true, .. })
+                ) {}
+                let input = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let connection = if incoming {
+                    let mut bytes = [0; 512];
+                    let length = write_control(
+                        &ControlPacket::Sdes {
+                            source: 123456,
+                            callsign: "K1ABC-R".into(),
+                            station_name: "Peer".into(),
+                            speex: false,
+                        },
+                        &mut bytes,
+                    )
+                    .unwrap();
+                    for _ in 0..100 {
+                        input
+                            .send_to(
+                                &bytes[..length],
+                                sockets.local_addr(Channel::Control).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    while !matches!(
+                        events.recv().await,
+                        Some(NetworkEvent::Directory { fresh: true, .. })
+                    ) {}
+                    input
+                        .send_to(
+                            &bytes[..length],
+                            sockets.local_addr(Channel::Control).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let pending = loop {
+                        if let Some(NetworkEvent::Pending(pending)) = events.recv().await {
+                            break pending;
+                        }
+                    };
+                    network.accept(pending.token()).await.unwrap()
+                } else {
+                    network
+                        .dial(123456)
+                        .await
+                        .expect("missing station must be retried after its fresh snapshot")
+                };
+                assert_eq!(connection.connection.identity.callsign, "K1ABC-R");
+                drop(connection);
+                network.stop().await.unwrap();
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+}
+
+#[test]
 fn direct_activation_rejects_proxy_settings_and_requires_an_entered_runtime() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -435,13 +550,20 @@ fn terminal_proxy_cause_survives_a_full_account_event_queue_and_stop_remains_bou
                             "terminal cause was silently dropped behind ordinary health events"
                         );
                         let commands = network.control();
-                        assert!(matches!(
-                            commands.observe().await,
-                            Err(NetworkError::Stopped)
-                        ));
-                        assert_eq!(commands.remove(1, 1), Err(NetworkError::Stopped));
+                        let recovering = commands.observe().await.unwrap();
+                        assert_eq!(
+                            recovering.directory.state,
+                            rptadv_echolink::account::directory::DirectoryState::Retrying
+                        );
+                        assert!(!recovering.directory.registered);
+                        assert_eq!(commands.remove(1, 1), Ok(()));
                     }
+                    let commands = network.control();
                     network.stop().await.unwrap();
+                    assert!(matches!(
+                        commands.observe().await,
+                        Err(NetworkError::Stopped)
+                    ));
                 }
             })
             .await

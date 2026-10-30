@@ -253,6 +253,11 @@ impl Coordinator {
         }
     }
 
+    /// Transport loss retires routing but leaves accepted tail drain/discard to its owner.
+    pub(crate) fn unroute(&mut self, node: u32, generation: u64) {
+        self.router.remove(node, generation);
+    }
+
     /// Stop new control admission, then service remaining commands until service returns false.
     pub fn close(&mut self) {
         self.receiver.close();

@@ -111,6 +111,7 @@ struct rptadv_echolink_account_config_v1 {
     struct rptadv_echolink_station_v1 station; /**< Advertised metadata. */
     struct rptadv_echolink_transport_v1 transport; /**< Selected transport. */
     struct rptadv_echolink_policy_v1 policy; /**< Resolved policy. */
+    struct rptadv_echolink_bytes_v1 aprs_server; /**< IPv4/DNS host:port; empty disables APRS. Proxy requires5199. */
 };
 /** Account-specific secrets, never printable. */
 struct rptadv_echolink_secrets_v1 {

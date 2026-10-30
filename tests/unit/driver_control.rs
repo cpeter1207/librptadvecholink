@@ -37,6 +37,10 @@ fn transport_failure_wakes_an_owner_with_no_ingress_credit() {
     let result = observed.recv_timeout(Duration::from_secs(2));
     driver.detach();
     assert_eq!(result.unwrap(), std::io::ErrorKind::BrokenPipe);
+    assert!(
+        control.failed.load(std::sync::atomic::Ordering::Acquire),
+        "delivering the failure must not revive this transport generation"
+    );
 }
 
 #[test]

@@ -4,6 +4,11 @@
 #include <assert.h>
 #include <string.h>
 
+_Static_assert(offsetof(struct rptadv_echolink_account_config_v1, aprs_server) == 344,
+               "APRS endpoint appends without moving existing account fields");
+_Static_assert(sizeof(struct rptadv_echolink_account_config_v1) == 360,
+               "complete account configuration extent");
+
 _Static_assert(offsetof(struct rptadv_echolink_event_v1, taken) == 32,
                "incoming ownership acknowledgement layout");
 _Static_assert(sizeof(struct rptadv_echolink_event_v1) == 40,

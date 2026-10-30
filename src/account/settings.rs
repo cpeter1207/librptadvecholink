@@ -57,6 +57,7 @@ impl PreparedSettings {
         owned.secrets.struct_size = size_of::<AccountSecrets>() as u32;
         owned.config.local_node = unsafe { owned.bytes(config.local_node, 32)? };
         owned.config.callsign = unsafe { owned.bytes(config.callsign, 15)? };
+        owned.config.aprs_server = unsafe { owned.bytes(config.aprs_server, 259)? };
         owned.config.station.name = unsafe { owned.bytes(config.station.name, 240)? };
         owned.config.station.location = unsafe { owned.bytes(config.station.location, 4096)? };
         owned.config.station.email = unsafe { owned.bytes(config.station.email, 4096)? };
@@ -99,6 +100,21 @@ impl PreparedSettings {
                 && !owned.proxy_host().is_empty()
                 && !owned.proxy_host().chars().any(char::is_whitespace) => {}
             _ => return Err(Status::Invalid),
+        }
+        let endpoint = owned.known(owned.config.aprs_server);
+        if !endpoint.is_empty() {
+            let (host, port) = endpoint.rsplit_once(':').ok_or(Status::Invalid)?;
+            let port = port.parse::<u16>().map_err(|_| Status::Invalid)?;
+            if host.is_empty()
+                || host.len() > 253
+                || !host
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+                || port == 0
+                || (owned.config.transport.kind == 1 && port != 5199)
+            {
+                return Err(Status::Invalid);
+            }
         }
         Ok(owned)
     }
@@ -220,6 +236,19 @@ impl PreparedSettings {
     /// Bounded peer SDES NAME, separate from the directory's longer QTH fallback.
     pub fn station_name(&self) -> &str {
         self.known(self.config.station.name)
+    }
+    /// Public station information for connected peers, never human chat.
+    pub fn station_information(&self) -> &str {
+        self.known(self.config.station.status_message)
+    }
+    /// Optional owned metadata destination; it does not select a QSO transport.
+    pub fn aprs_server(&self) -> Option<(&str, u16)> {
+        let endpoint = self.known(self.config.aprs_server);
+        if endpoint.is_empty() {
+            return None;
+        }
+        let (host, port) = endpoint.rsplit_once(':').expect("prepared APRS endpoint");
+        Some((host, port.parse().expect("prepared APRS port")))
     }
     pub(crate) fn bind_address(&self) -> &str {
         self.known(self.config.transport.bind_address)

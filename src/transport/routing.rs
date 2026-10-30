@@ -39,6 +39,8 @@ pub enum RouteResult {
     Routed,
     /// New verified candidate; the control owner must explicitly accept or reject it.
     Pending(PendingHandshake),
+    /// Valid establishment needs a missing/stale directory identity refreshed.
+    RefreshRequired,
     /// Malformed, unverified, ambiguous, repeated-pending or setup-budget-limited input.
     Dropped,
     /// Exact mailbox admission result, retained for observability.
@@ -223,8 +225,12 @@ impl Router {
         else {
             return RouteResult::Dropped;
         };
-        let Ok(identity) = directory.lookup(&callsign, *endpoint.ip(), arrived) else {
-            return RouteResult::Dropped;
+        let identity = match directory.lookup(&callsign, *endpoint.ip(), arrived) {
+            Ok(identity) => identity,
+            Err(
+                crate::directory::AdmissionError::Stale | crate::directory::AdmissionError::Unknown,
+            ) => return RouteResult::RefreshRequired,
+            Err(_) => return RouteResult::Dropped,
         };
         if self.pending.len() >= self.maximum_pending
             || self
@@ -336,6 +342,11 @@ impl Router {
             !routes.is_empty()
         });
         self.account.remove(node, generation);
+    }
+
+    /// A failed transport cannot carry a pending handshake into its replacement.
+    pub(crate) fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 }
 
