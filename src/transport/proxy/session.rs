@@ -1,7 +1,7 @@
 //! A standard Proxy's single reader/writer and virtual directory channel on shared Tokio.
 
 use super::{
-    FlushOutcome, ProxyError, ProxyOutput, ProxyTransport, QueueError,
+    FlushOutcome, ProxyError, ProxyOutput, ProxyTransport,
     directory::{DirectoryChannel, ReplyFuture, TunnelError},
 };
 use crate::{
@@ -100,25 +100,30 @@ impl ProxySession {
             let outcome = loop {
                 if *stopping.borrow() { break Ok(()); }
                 if let Some(record) = channel.outgoing() {
-                    match writer.try_queue(record, None) {
-                        Ok(()) => channel.output_queued(),
-                        Err(QueueError::Full) => {},
-                        Err(_) => break Err(ProxyError::Closed),
+                    // DirectoryChannel creates valid bounded records, and this
+                    // owner retains the writer's receiver. Only full credit can
+                    // reject admission; retain the same record for the next turn.
+                    if writer.try_queue(record, None).is_ok() {
+                        channel.output_queued();
                     }
                 }
                 if let Some((id, result)) = channel.take_completed() {
-                    if let Some(completed) = pending.take().filter(|work| work.id == id) {
-                        let _ = completed.reply.send(result.map_err(tunnel_error));
-                    }
+                    // One admitted request owns the virtual channel until this
+                    // completion; another request cannot replace its identity.
+                    let completed = pending.take().unwrap();
+                    debug_assert_eq!(completed.id, id);
+                    let _ = completed.reply.send(result.map_err(tunnel_error));
                 }
                 let close_deadline = pending.as_ref().and_then(|work| work.close_deadline);
                 let event = {
                     let mut emit = |record: crate::wire::ProxyRecord<'_>| {
                         if !channel.receive(record) {
-                            let class = match record.kind {
-                                ProxyKind::UdpData => Channel::Audio,
-                                ProxyKind::UdpControl => Channel::Control,
-                                _ => return,
+                            // The directory consumed every TCP kind and the
+                            // reader intercepted System. Only UDP remains.
+                            let class = if record.kind == ProxyKind::UdpData {
+                                Channel::Audio
+                            } else {
+                                Channel::Control
                             };
                             // Full sheds this datagram; neither reader nor another peer waits.
                             let _ = packets.try_push(class, SocketAddr::from((record.address, 0)),
@@ -230,3 +235,7 @@ fn tunnel_error(error: TunnelError) -> TransactionError {
         TunnelError::Invalid | TunnelError::Protocol => TransactionError::Malformed,
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/proxy_session.rs"]
+mod tests;
