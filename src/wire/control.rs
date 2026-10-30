@@ -1,6 +1,6 @@
 //! RTP/RTCP library adaptation for EchoLib's version-three and surplus-zero SDES.
 //! Reference maker: SvxLink 595cf9bb3325be753d05b219bdd39feab6a22b33 rtpacket.cpp.
-use super::{MAX_DATAGRAM, WireError, copy_output};
+use super::{WireError, copy_output};
 use rtcp::{
     goodbye::Goodbye,
     receiver_report::ReceiverReport,
@@ -112,8 +112,10 @@ fn packets(wire: &[u8]) -> Result<Packets, WireError> {
             normalize_sdes(&mut packet)?;
         }
         let first = rtcp::packet::unmarshal(&mut packet.as_slice());
-        let parsed = if first.is_err() && packet[1] == 202 && packet.ends_with(&[0; 4]) {
+        let parsed = if first.is_err() && packet[1] == 202 {
             // The pinned maker can add exactly one whole zero alignment word.
+            // normalize_sdes already checked every item and the zero END tail;
+            // the released parser rejects only surplus complete zero words here.
             packet.truncate(packet.len() - 4);
             let words = (packet.len() / 4 - 1) as u16;
             packet[2..4].copy_from_slice(&words.to_be_bytes());
@@ -309,8 +311,7 @@ fn write_packets(packets: Packets, version: u8, out: &mut [u8]) -> Result<usize,
         }
         wire.extend_from_slice(&part);
     }
-    if wire.len() > MAX_DATAGRAM {
-        return Err(WireError::TooLarge);
-    }
+    // Only the bounded control/APRS builders call this helper: their largest
+    // envelope is 312 bytes, far below the UDP datagram limit.
     copy_output(&wire, out)
 }

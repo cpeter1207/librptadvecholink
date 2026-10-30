@@ -16,6 +16,8 @@ mod settings_fixture;
 use settings_fixture::{secrets, settings, span};
 #[path = "support/context.rs"]
 mod context;
+#[path = "support/peer_contract.rs"]
+mod peer_contract;
 
 fn receive(socket: &mut TcpStream) -> (u8, Vec<u8>) {
     let mut header = [0; 9];
@@ -118,6 +120,7 @@ struct Trace {
     state: AtomicUsize,
     cause: AtomicUsize,
     sent: AtomicBool,
+    checked: AtomicBool,
     pcm: AtomicUsize,
     texts: AtomicUsize,
     errors: AtomicUsize,
@@ -156,12 +159,17 @@ fn attach(
         unsafe { api.dial.unwrap()(account, 123456, &mut qso) },
         Status::Ok
     );
+    assert_eq!(
+        unsafe { peer_contract::before_attach(api, context, qso) },
+        0
+    );
     let trace = Box::new(Trace {
         api,
         qso,
         state: AtomicUsize::new(usize::MAX),
         cause: AtomicUsize::new(0),
         sent: AtomicBool::new(false),
+        checked: AtomicBool::new(false),
         pcm: AtomicUsize::new(0),
         texts: AtomicUsize::new(0),
         errors: AtomicUsize::new(0),
@@ -285,6 +293,12 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
         audio: Some(audio),
         gap: Some(gap),
     };
+    if !trace.checked.swap(true, Ordering::AcqRel) {
+        trace.errors.fetch_add(
+            unsafe { peer_contract::serial(trace.api, trace.qso, &sink) },
+            Ordering::Release,
+        );
+    }
     let status = unsafe {
         trace.api.peer_read.unwrap()(
             trace.qso,

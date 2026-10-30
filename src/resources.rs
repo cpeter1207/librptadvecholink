@@ -9,8 +9,8 @@ use rptadv_jitter_client::Jitter;
 use std::{ffi::c_void, path::PathBuf, slice, str};
 
 pub(crate) struct Resources {
-    // Ownership anchors, not new codec/jitter implementations. The network
-    // capability remains unpublished until the full account/QSO API is wired.
+    // Ownership anchors, not new codec/jitter implementations. Keep their code
+    // loaded through every account's last serialized media/drain callback.
     catalog: CodecCatalog,
     _jitter: Library,
     jitter_descriptor: *const c_void,

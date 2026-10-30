@@ -94,6 +94,107 @@ fn valid_bye_reason_padding_need_not_leave_a_word_aligned_body() {
 }
 
 #[test]
+fn control_padding_identity_and_compound_ambiguity_are_rejected() {
+    for fixture in [
+        // Padding is allowed only on the final compound member.
+        "c0c9000100000000e1cb00020000000100000003c0c9000100000000",
+        "e1cb000100000001",         // Padding steals a source identifier byte.
+        "e0c900020000000100000003", // Unaligned unpadded receiver report.
+        "c1ca00020000000102000000", // Empty NAME.
+        "c1ca00020000000102012100", // Invalid callsign character.
+        "c1ca000300000001020341200a000000", // Control character in name.
+        "c1cb000100000001c1cb000100000002", // Two terminal controls.
+    ] {
+        assert_eq!(
+            parse_datagram(Channel::Control, &hex(fixture)),
+            Err(WireError::Malformed),
+            "{fixture}"
+        );
+    }
+    assert_eq!(
+        parse_datagram(Channel::Control, &hex("e1cb00020000000100000004")),
+        Ok(WirePacket::Control(ControlPacket::Bye {
+            source: 1,
+            reason: vec![]
+        }))
+    );
+    let app = hex("c0cc00020000000154455354");
+    assert_eq!(
+        parse_datagram(Channel::Control, &app),
+        Err(WireError::Unsupported)
+    );
+    let mut compound = hex("c0c9000100000007");
+    compound.extend(app);
+    assert_eq!(
+        parse_datagram(Channel::Control, &compound),
+        Ok(WirePacket::Control(ControlPacket::Report { source: 7 }))
+    );
+}
+
+#[test]
+fn outgoing_control_limits_leave_the_destination_unchanged() {
+    use rptadv_echolink::wire::write_aprs;
+    let mut output = [0xa5; 512];
+    assert_eq!(
+        write_control(
+            &ControlPacket::Bye {
+                source: 1,
+                reason: vec![0; 256]
+            },
+            &mut output
+        ),
+        Err(WireError::TooLarge)
+    );
+    for (callsign, station_name, expected) in [
+        ("A".repeat(16), String::new(), WireError::TooLarge),
+        ("N0CALL".into(), "x".repeat(241), WireError::TooLarge),
+        (String::new(), String::new(), WireError::Malformed),
+        ("!".into(), String::new(), WireError::Malformed),
+        ("N0CALL".into(), "bad\nname".into(), WireError::Malformed),
+    ] {
+        assert_eq!(
+            write_control(
+                &ControlPacket::Sdes {
+                    source: 1,
+                    callsign,
+                    station_name,
+                    speex: false
+                },
+                &mut output
+            ),
+            Err(expected)
+        );
+    }
+    assert_eq!(
+        write_aprs(&"A".repeat(16), "", &mut output),
+        Err(WireError::TooLarge)
+    );
+    assert_eq!(write_aprs("", "", &mut output), Err(WireError::Malformed));
+    assert_eq!(output, [0xa5; 512]);
+    let maximum = ControlPacket::Sdes {
+        source: 1,
+        callsign: "A".repeat(15),
+        station_name: "x".repeat(240),
+        speex: true,
+    };
+    assert_eq!(write_control(&maximum, &mut output), Ok(312));
+    assert_eq!(
+        write_control(
+            &ControlPacket::Bye {
+                source: 1,
+                reason: vec![b'x'; 255]
+            },
+            &mut output
+        ),
+        Ok(272)
+    );
+    assert_eq!(
+        write_aprs(&"A".repeat(15), &"x".repeat(255), &mut output),
+        Ok(308)
+    );
+}
+
+#[test]
 fn gsm_four_units_is_144_bytes() {
     let payload = [0xd0; 132];
     let voice = VoicePacket {
