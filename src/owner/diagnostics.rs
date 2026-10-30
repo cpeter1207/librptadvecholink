@@ -422,5 +422,75 @@ mod tests {
             unsafe { account_observe(pointer, &mut result) },
             ffi::Status::Failed
         );
+        let peer = Account::new(Arc::clone(&runtime), None, None);
+        let pointer = pointer.cast_mut();
+        let other = ptr::from_ref(&peer).cast_mut().cast::<ffi::Account>();
+        let disabled = ffi::AccountConfig::default();
+        assert!(matches!(account.binding(), Err(ffi::Status::Failed)));
+        assert_eq!(account.apply_settings(None), ffi::Status::Failed);
+        unsafe {
+            assert_eq!(
+                super::super::account_activate(pointer, None, ptr::null_mut()),
+                ffi::Status::Failed
+            );
+            assert_eq!(
+                super::super::account_reconfigure(pointer, &disabled, ptr::null()),
+                ffi::Status::Failed
+            );
+            assert_eq!(super::super::account_stop(pointer), ffi::Status::Failed);
+            assert_eq!(
+                super::super::account_apply_prepared(other, pointer),
+                ffi::Status::Failed
+            );
+            assert_eq!(
+                super::super::account_apply_prepared(pointer, other),
+                ffi::Status::Failed
+            );
+        }
+        account.state.clear_poison();
+    }
+
+    #[test]
+    fn lifecycle_lock_failure_is_reported_before_mutating_account_state() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let account = Account::new(Arc::clone(&runtime), None, None);
+        let prepared = Account::new(runtime, None, None);
+        let pointer = ptr::from_ref(&account).cast_mut().cast::<ffi::Account>();
+        let other = ptr::from_ref(&prepared).cast_mut().cast::<ffi::Account>();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = account.operation.lock().unwrap();
+                panic!("intentional test-only lifecycle lock failure");
+            }))
+            .is_err()
+        );
+        let disabled = ffi::AccountConfig::default();
+        unsafe {
+            assert_eq!(
+                super::super::account_activate(pointer, None, ptr::null_mut()),
+                ffi::Status::Failed
+            );
+            assert_eq!(
+                super::super::account_reconfigure(pointer, &disabled, ptr::null()),
+                ffi::Status::Failed
+            );
+            assert_eq!(super::super::account_stop(pointer), ffi::Status::Failed);
+            assert_eq!(
+                super::super::account_apply_prepared(pointer, other),
+                ffi::Status::Failed
+            );
+            assert_eq!(
+                super::super::account_apply_prepared(other, pointer),
+                ffi::Status::Failed
+            );
+        }
+        assert!(!account.state.lock().unwrap().activated);
+        assert!(!account.state.lock().unwrap().stopped);
+        account.operation.clear_poison();
     }
 }
