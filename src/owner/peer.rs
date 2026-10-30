@@ -286,7 +286,7 @@ impl Serial {
             ControlPacket::Sdes {
                 source: self.settings.as_abi().node_number,
                 callsign: self.settings.callsign().into(),
-                station_name: self.settings.directory_login().description.into(),
+                station_name: self.settings.station_name().into(),
                 speex: peer
                     .binding
                     ._resources

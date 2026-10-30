@@ -328,6 +328,25 @@ fn account_owner_registers_routes_verified_packets_and_logs_out_without_public_i
                     }
                 }
             }).await.expect("abandoned route was not retired");
+            replacement.talker.offer(std::time::Instant::now()).unwrap();
+            while replacement.talker.selection().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+            drop(replacement);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while commands.observe().await.unwrap().selected.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("retiring a selected lease stranded its account grant");
+            let mut replacement = network.dial(123456).await.unwrap();
+            replacement.talker.offer(std::time::Instant::now()).unwrap();
+            loop {
+                if let Some(selection) = replacement.talker.selection().unwrap() {
+                    assert_eq!(selection, rptadv_echolink::account::Selection::Selected);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
             network.stop().await.unwrap();
             assert!(matches!(commands.dial(123456).await, Err(NetworkError::Stopped)));
             assert!(replacement.connection.ingress.recv().await.is_none());

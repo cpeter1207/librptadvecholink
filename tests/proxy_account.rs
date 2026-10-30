@@ -507,7 +507,7 @@ fn proxy_closure_delivers_a_final_serial_turn_with_the_first_cause() {
 }
 
 #[test]
-fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
+fn codec_setup_errors_do_not_publish_and_long_location_does_not_enter_sdes_name() {
     unsafe extern "C" fn unexpected(context: *mut std::ffi::c_void) -> i32 {
         unsafe { &*context.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Release);
         -1
@@ -558,11 +558,18 @@ fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
                 )
             },
             if mode == 0 {
-                Status::Invalid
+                Status::Ok
             } else {
                 Status::Failed
             }
         );
+        if mode == 0 {
+            assert!(!registration.is_null());
+            unsafe { api.peer_detach.unwrap()(registration) };
+            unsafe { api.peer_destroy.unwrap()(qso) };
+            socket.shutdown(Shutdown::Both).unwrap();
+            continue;
+        }
         assert!(registration.is_null());
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert_eq!(fault.calls(false), 0);

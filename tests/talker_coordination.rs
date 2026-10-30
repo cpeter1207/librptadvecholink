@@ -136,6 +136,32 @@ fn account_shutdown_cancels_a_pending_talker_offer_without_retaining_it() {
 }
 
 #[test]
+fn retiring_a_selected_generation_discards_its_grant_without_a_dead_port_report() {
+    run(async {
+        let now = Instant::now();
+        let (mut owner, _, connections) = setup(now);
+        let mut first = owner.port(1, connections[0].generation, Arc::new(Control::default()));
+        let mut second = owner.port(2, connections[1].generation, Arc::new(Control::default()));
+        first.offer(now).unwrap();
+        owner.service().await;
+        assert_eq!(first.selection().unwrap(), Some(Selection::Selected));
+        // A stale teardown must not cancel the active generation's pending PCM.
+        owner.remove(1, connections[0].generation + 1);
+        second.offer(now).unwrap();
+        owner.service().await;
+        assert_eq!(second.selection().unwrap(), Some(Selection::Suppressed));
+        // Host detach discards that exact connection's audio before its lease is
+        // retired. No live serial port remains to report a normal played tail.
+        drop(first);
+        owner.remove(1, connections[0].generation);
+        owner.poll(now + Duration::from_secs(1));
+        second.offer(now + Duration::from_secs(1)).unwrap();
+        owner.service().await;
+        assert_eq!(second.selection().unwrap(), Some(Selection::Selected));
+    });
+}
+
+#[test]
 fn unrepresentable_quiet_deadline_does_not_wrap_or_release_a_selected_talker() {
     run(async {
         let now = Instant::now();

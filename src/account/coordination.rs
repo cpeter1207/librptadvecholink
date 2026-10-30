@@ -239,10 +239,18 @@ impl Coordinator {
         (deadline > now || self.drained).then_some(deadline)
     }
 
-    /// Unregister exact routing/admission before QSO teardown. Its selected tail still
-    /// needs a final drain report before dropping that peer's port.
+    /// Retire exact routing/admission after the host has detached that QSO.
+    /// Detach cancels its pending PCM, so no report from its dead port is required.
+    /// Keep the ordinary silence guard; an old generation cannot cancel a replacement.
     pub fn remove(&mut self, node: u32, generation: u64) {
         self.router.remove(node, generation);
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.identity == (node, generation))
+        {
+            self.drained = true;
+        }
     }
 
     /// Stop new control admission, then service remaining commands until service returns false.

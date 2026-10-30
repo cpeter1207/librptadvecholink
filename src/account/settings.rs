@@ -217,6 +217,10 @@ impl PreparedSettings {
     pub fn callsign(&self) -> &str {
         self.known(self.config.callsign)
     }
+    /// Bounded peer SDES NAME, separate from the directory's longer QTH fallback.
+    pub fn station_name(&self) -> &str {
+        self.known(self.config.station.name)
+    }
     pub(crate) fn bind_address(&self) -> &str {
         self.known(self.config.transport.bind_address)
     }

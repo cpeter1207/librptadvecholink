@@ -66,6 +66,10 @@ test: all
 	$(MAKE) $(SMOKE_BINARY)
 	LD_LIBRARY_PATH="$(CURDIR)/build:$${LD_LIBRARY_PATH}" ./$(SMOKE_BINARY)
 
+# Released native dependencies use Debian's multiarch directory. A parent image's
+# codec-only staging prefix does not contain the separate jitter adapter.
+test coverage: export RPTADV_CODEC_DIR := /usr/lib/$(DEBIAN_MULTIARCH)
+
 coverage:
 	mkdir -p build/coverage
 	$(CARGO) +nightly-2025-02-20 llvm-cov --all-targets --branch --json \
