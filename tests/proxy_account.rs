@@ -10,7 +10,7 @@ use std::{
     ptr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -24,14 +24,27 @@ mod context;
 #[path = "support/peer_contract.rs"]
 mod peer_contract;
 
-fn fault_context(api: &Descriptor, fault: &codec_fault::FaultCodec) -> *mut Context {
+fn fault_context(
+    api: &Descriptor,
+    fault: &codec_fault::FaultCodec,
+    profile: rptadv_codec_client::ProfileId,
+) -> *mut Context {
     let directory = std::env::var("RPTADV_CODEC_DIR").unwrap();
+    let gsm = format!("{directory}/librptadv_codec_gsm.so.1");
     let speex = format!("{directory}/librptadv_codec_speex.so.1");
     let jitter = format!("{directory}/rpt_advanced/librptadv_jitter_adapter.so.1");
     let config = RuntimeConfig {
         worker_threads: 1,
-        gsm_library: span(fault.path().to_str().unwrap()),
-        speex_library: span(&speex),
+        gsm_library: span(if profile == rptadv_codec_client::ProfileId::GsmFr {
+            fault.path().to_str().unwrap()
+        } else {
+            &gsm
+        }),
+        speex_library: span(if profile == rptadv_codec_client::ProfileId::Speex {
+            fault.path().to_str().unwrap()
+        } else {
+            &speex
+        }),
         jitter_library: span(&jitter),
         ..Default::default()
     };
@@ -144,6 +157,7 @@ struct Trace {
     state: AtomicUsize,
     cause: AtomicUsize,
     sent: AtomicBool,
+    prepare_status: AtomicI32,
     checked: AtomicBool,
     closing_checked: AtomicBool,
     pcm: AtomicUsize,
@@ -202,6 +216,7 @@ fn attach(
         state: AtomicUsize::new(usize::MAX),
         cause: AtomicUsize::new(0),
         sent: AtomicBool::new(false),
+        prepare_status: AtomicI32::new(Status::Pending as i32),
         checked: AtomicBool::new(false),
         closing_checked: AtomicBool::new(false),
         pcm: AtomicUsize::new(0),
@@ -270,7 +285,7 @@ fn identity(api: &Descriptor, qso: *mut Qso) -> (u64, u64, String) {
         .unwrap(),
     )
 }
-fn start_media(socket: &mut TcpStream, speex: bool) -> (Vec<u8>, Vec<u8>) {
+fn send_sdes(socket: &mut TcpStream, speex: bool) {
     let mut sdes = [0; 512];
     let count = write_control(
         &ControlPacket::Sdes {
@@ -283,6 +298,9 @@ fn start_media(socket: &mut TcpStream, speex: bool) -> (Vec<u8>, Vec<u8>) {
     )
     .unwrap();
     send(socket, 6, [127, 0, 0, 2], &sdes[..count]);
+}
+fn start_media(socket: &mut TcpStream, speex: bool) -> (Vec<u8>, Vec<u8>) {
+    send_sdes(socket, speex);
     let mut media = Vec::new();
     let mut chat = Vec::new();
     while media.is_empty() || chat.is_empty() {
@@ -438,6 +456,7 @@ unsafe extern "C" fn step(opaque: *mut std::ffi::c_void) -> i32 {
     }
     if read.state == 1 && !trace.sent.swap(true, Ordering::AcqRel) {
         let (status, result, packet) = prepared(trace);
+        trace.prepare_status.store(status as i32, Ordering::Release);
         let mut before = PeerObservation {
             struct_size: size_of::<PeerObservation>() as u32,
             abi_version: 1,
@@ -544,7 +563,7 @@ fn failed_codec_open_or_unserializable_sdes_never_publishes_a_registration() {
         let fault = codec_fault::FaultCodec::new(rptadv_codec_client::ProfileId::GsmFr);
         let _catalog = fault.catalog();
         let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
-        let context = fault_context(api, &fault);
+        let context = fault_context(api, &fault, rptadv_codec_client::ProfileId::GsmFr);
         let _context = ContextOwner(api, context);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -683,6 +702,44 @@ fn pending_peer_revalidation_observes_timeout_staleness_and_changed_directory_id
         socket.shutdown(Shutdown::Both).unwrap();
     }
 }
+
+#[test]
+fn failed_negotiated_speex_upgrade_closes_with_owner_failure_not_transport_loss() {
+    let fault = codec_fault::FaultCodec::new(rptadv_codec_client::ProfileId::Speex);
+    let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
+    let context = fault_context(api, &fault, rptadv_codec_client::ProfileId::Speex);
+    let _context = ContextOwner(api, context);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || registered(&listener));
+    let servers = [span("127.0.0.1")];
+    let mut config = settings("K1ABC-R", "Loopback", &servers, &[]);
+    config.transport.kind = 1;
+    config.transport.proxy_host = span("127.0.0.1");
+    config.transport.proxy_port = port;
+    let account = prepare(api, context, &config);
+    assert_eq!(
+        unsafe { api.account_activate.unwrap()(account, None, ptr::null_mut()) },
+        Status::Ok
+    );
+    let mut socket = server.join().unwrap();
+    let fixture = attach(api, context, account, false, None);
+    assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 0));
+    fixture.trace.drained.store(true, Ordering::Release);
+    fault.select(7); // Only the negotiated Speex encoder's open now fails.
+    send_sdes(&mut socket, true);
+    assert!(wait(|| fixture.trace.state.load(Ordering::Acquire) == 3));
+    assert_eq!(
+        fixture.trace.prepare_status.load(Ordering::Acquire),
+        Status::Failed as i32
+    );
+    assert_eq!(fixture.trace.cause.load(Ordering::Acquire), 6);
+    assert_eq!(fixture.trace.errors.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.trace.pcm.load(Ordering::Acquire), 0);
+    fault.select(0);
+    socket.shutdown(Shutdown::Both).unwrap();
+}
+
 fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -698,7 +755,7 @@ fn proxy_case(speex: bool, blocked: bool, faults: bool, cause: usize) {
     });
     let context = codec.as_ref().map_or_else(
         || context::resource_context(api),
-        |codec| fault_context(api, codec),
+        |codec| fault_context(api, codec, rptadv_codec_client::ProfileId::GsmFr),
     );
     let _context = ContextOwner(api, context);
     let servers = [span("127.0.0.1")];
