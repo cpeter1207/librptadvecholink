@@ -20,7 +20,7 @@ pub(crate) const MAX_LINE: usize = 1024;
 pub struct DirectoryEntry {
     /// Positive full EchoLink node number, never an ASL dial alias.
     pub node_number: u32,
-    /// Uppercase validated station identity.
+    /// Uppercase station or conference identity, including conference underscores.
     pub callsign: String,
     /// Display metadata; not an authentication or clock source.
     pub description: String,
@@ -249,7 +249,7 @@ impl DirectorySnapshot {
                 || callsign.len() > 15
                 || !callsign
                     .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"-/*".contains(&byte))
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-/*_".contains(&byte))
                 || !additions.insert(callsign.clone())
             {
                 return Err(DirectoryError::Malformed);

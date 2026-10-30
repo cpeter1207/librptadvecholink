@@ -176,6 +176,31 @@ fn directory_server_notices_do_not_become_stations_or_discard_valid_records() {
 }
 
 #[test]
+fn directory_conference_underscores_remain_dialable_and_address_authenticated() {
+    let now = Instant::now();
+    // Public directories include underscore conference names and space-only notice fields.
+    let response = b"@@@\n3:conferences\n \nWelcome\n \n \n*WX_TALK*\nWeather\n7203\n192.0.2.1\nK1ABC-R\nNorth\n123456\n192.0.2.2\n+++\n";
+    let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
+    for bytes in [response.to_vec(), compressed(response)] {
+        snapshot.update(&bytes, now).unwrap();
+        let conference = snapshot.by_node(7203, now).unwrap();
+        assert_eq!(conference.callsign, "*WX_TALK*");
+        assert_eq!(conference.address, Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(snapshot.by_callsign("*wx_talk*", now).unwrap(), conference);
+        assert_eq!(
+            snapshot.lookup("*WX_TALK*", Ipv4Addr::new(192, 0, 2, 1), now),
+            Ok(conference)
+        );
+        assert_eq!(
+            snapshot.lookup("*WX_TALK*", Ipv4Addr::new(192, 0, 2, 2), now),
+            Err(AdmissionError::Address)
+        );
+        assert_eq!(snapshot.by_node(123456, now).unwrap().callsign, "K1ABC-R");
+        assert_eq!(snapshot.by_callsign(" ", now), Err(AdmissionError::Unknown));
+    }
+}
+
+#[test]
 fn conflicting_and_incomplete_snapshots_never_replace_the_previous_snapshot() {
     let now = Instant::now();
     let mut snapshot = DirectorySnapshot::new(Duration::from_secs(900));
