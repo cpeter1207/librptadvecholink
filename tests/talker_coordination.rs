@@ -152,8 +152,12 @@ fn retiring_a_selected_generation_discards_its_grant_without_a_dead_port_report(
         assert_eq!(second.selection().unwrap(), Some(Selection::Suppressed));
         // Host detach discards that exact connection's audio before its lease is
         // retired. No live serial port remains to report a normal played tail.
+        // A previously queued busy report may arrive after that retirement.
+        first.report_drained(false).unwrap();
         drop(first);
         owner.remove(1, connections[0].generation);
+        assert_eq!(owner.deadline(now), Some(now + Duration::from_millis(320)));
+        owner.service().await;
         owner.poll(now + Duration::from_secs(1));
         second.offer(now + Duration::from_secs(1)).unwrap();
         owner.service().await;

@@ -241,6 +241,7 @@ impl Coordinator {
 
     /// Retire exact routing/admission after the host has detached that QSO.
     /// Detach cancels its pending PCM, so no report from its dead port is required.
+    /// Drop its selected endpoint to fence queued drain reports after retirement.
     /// Keep the ordinary silence guard; an old generation cannot cancel a replacement.
     pub fn remove(&mut self, node: u32, generation: u64) {
         self.router.remove(node, generation);
@@ -250,6 +251,7 @@ impl Coordinator {
             .is_some_and(|selected| selected.identity == (node, generation))
         {
             self.drained = true;
+            self.selected = None;
         }
     }
 
