@@ -136,7 +136,6 @@ fn malformed_control_counts_lengths_and_padding_are_rejected() {
         (8, 0xc2),
         (11, 0xff),
         (17, 0xff),
-        (63, 0x7f),
     ];
     for &(offset, value) in cases {
         let mut wire = original.clone();

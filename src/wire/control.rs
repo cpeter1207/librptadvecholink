@@ -1,4 +1,4 @@
-//! RTP/RTCP library adaptation for EchoLib's version-three and surplus-zero SDES.
+//! RTCP adaptation for EchoLib's version three and ASL's END/alignment handling.
 //! Reference maker: SvxLink 595cf9bb3325be753d05b219bdd39feab6a22b33 rtpacket.cpp.
 use super::{WireError, copy_output};
 use rtcp::{
@@ -43,7 +43,11 @@ fn normalize_sdes(packet: &mut [u8]) -> Result<(), WireError> {
     loop {
         let tag = *packet.get(cursor).ok_or(WireError::Malformed)?;
         if tag == 0 {
-            return if packet[cursor..].iter().all(|byte| *byte == 0) {
+            // ASL stops at END. Some peers leave the remaining alignment
+            // octets uninitialized; ignore only this word, never surplus data.
+            let aligned = (cursor + 1).next_multiple_of(4).min(packet.len());
+            packet[cursor..aligned].fill(0);
+            return if packet[aligned..].iter().all(|byte| *byte == 0) {
                 Ok(())
             } else {
                 Err(WireError::Malformed)
@@ -97,12 +101,13 @@ fn packets(wire: &[u8]) -> Result<Packets, WireError> {
                     return Err(WireError::Malformed);
                 }
             } else {
-                if end % 4 != 0 {
+                if packet[1] != 202 && end % 4 != 0 {
                     return Err(WireError::Malformed);
                 }
                 packet.truncate(end);
                 packet[0] &= !0x20;
-                packet[2..4].copy_from_slice(&((end / 4 - 1) as u16).to_be_bytes());
+                let words = (packet.len() / 4 - 1) as u16;
+                packet[2..4].copy_from_slice(&words.to_be_bytes());
             }
         }
         if matches!(packet[1], 202 | 203) && packet[0] & 0x1f != 1 {
@@ -110,6 +115,11 @@ fn packets(wire: &[u8]) -> Result<Packets, WireError> {
         }
         if packet[1] == 202 {
             normalize_sdes(&mut packet)?;
+            // ASL's outer padding may include SDES alignment. Restore it only
+            // after validating a real END, never inventing a missing terminator.
+            packet.resize(packet.len().next_multiple_of(4), 0);
+            let words = (packet.len() / 4 - 1) as u16;
+            packet[2..4].copy_from_slice(&words.to_be_bytes());
         }
         let first = rtcp::packet::unmarshal(&mut packet.as_slice());
         let parsed = if first.is_err() && packet[1] == 202 {

@@ -76,6 +76,49 @@ fn wire_reference_roundtrip() {
 }
 
 #[test]
+fn asl_sdes_end_alignment_does_not_hide_station_identity() {
+    // W6EK's reply contains nonzero END alignment, followed by outer RTCP
+    // padding. ASL's parser stops at END; keep this compatibility bound to
+    // that word, including valid padding that leaves an unaligned SDES body.
+    let prefix = "c0c9000100000000e1ca000e00000000010843414c4c5349474e020b5736454b2d52205736454b060e416c6c73746172203136383530320803014431";
+    for (words, tail) in [
+        (14_u16, "0000a55a00000004"),
+        (13, "00000001"),
+        (13, "00000002"),
+        (13, "00000003"),
+    ] {
+        let mut bytes = hex(&format!("{prefix}{tail}"));
+        bytes[10..12].copy_from_slice(&words.to_be_bytes());
+        assert_eq!(
+            parse_datagram(Channel::Control, &bytes),
+            Ok(WirePacket::Control(ControlPacket::Sdes {
+                source: 0,
+                callsign: "W6EK-R".into(),
+                station_name: "W6EK".into(),
+                speex: false,
+            })),
+            "padding {}",
+            bytes.last().unwrap()
+        );
+    }
+    // The exception ends at that alignment word; extra nonzero data remains
+    // malformed even when the identity and outer padding are otherwise valid.
+    let mut surplus = hex(&format!("{prefix}000000000000000100000004"));
+    surplus[10..12].copy_from_slice(&15_u16.to_be_bytes());
+    assert_eq!(
+        parse_datagram(Channel::Control, &surplus),
+        Err(WireError::Malformed)
+    );
+    let mut no_end = hex(&format!("{prefix}58000003"));
+    no_end[10..12].copy_from_slice(&13_u16.to_be_bytes());
+    no_end[56] = 4; // The last PRIVATE item ends at byte 61; only outer padding follows.
+    assert_eq!(
+        parse_datagram(Channel::Control, &no_end),
+        Err(WireError::Malformed)
+    );
+}
+
+#[test]
 fn valid_bye_reason_padding_need_not_leave_a_word_aligned_body() {
     // RR followed by a one-source BYE, empty reason and three padding bytes.
     let mut bytes = hex("c0c9000100000000e1cb00020000000100000003");
