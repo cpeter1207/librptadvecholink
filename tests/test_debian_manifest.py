@@ -1,4 +1,4 @@
-"""The runtime package installs its default dynamically loaded media providers."""
+"""Runtime dependencies include providers with the required playout support."""
 
 import unittest
 from pathlib import Path
@@ -16,7 +16,7 @@ class RuntimeProviders(unittest.TestCase):
         for provider in (
             "librptadv-codec-gsm1",
             "librptadv-codec-speex1",
-            "librptadv-jitter-adapter1",
+            "librptadv-jitter-adapter1 (>= 0.1.0~alpha18-1)",
         ):
             with self.subTest(provider=provider):
                 self.assertIn(provider, dependencies)
