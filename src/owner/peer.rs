@@ -67,6 +67,28 @@ struct Registration {
     peer: Arc<Peer>,
 }
 
+/// Final control cleanup stays on the serial task, including a host-aborted or
+/// immediately detached owner. Joining the driver also joins this cleanup.
+struct SerialOwner(Arc<Peer>);
+
+impl Drop for SerialOwner {
+    fn drop(&mut self) {
+        let peer = &self.0;
+        // SAFETY: the owner task has stopped stepping; no host callback is entered.
+        let serial = unsafe { (*peer.serial.get()).as_mut() }.expect("attached serial owner");
+        let action = serial.receiver.control(QsoEvent::Stop, Instant::now());
+        serial.action(peer, action);
+        serial.information = None;
+        if peer.transport_live() {
+            if let Some(packet) = serial.control.take() {
+                // Mandatory detach cannot wait for a host/media drain. Preserve
+                // graceful-close retries while alive; this last attempt is bounded.
+                let _ = serial.try_transport_send(peer, Channel::Control, &packet, None);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Callback {
     function: StepFn,
@@ -218,7 +240,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         Arc::increment_strong_count(qso.cast::<Peer>());
     }
     let peer = unsafe { Arc::from_raw(qso.cast::<Peer>()) };
-    let active = Arc::clone(&peer);
+    let owner = SerialOwner(Arc::clone(&peer));
     let callback = Callback {
         function: callback,
         context: opaque,
@@ -227,7 +249,10 @@ pub(crate) unsafe extern "C" fn peer_attach(
         Arc::clone(&peer.binding.runtime),
         Arc::clone(&peer.control),
         prepared.ingress,
-        move |event| serial_turn(&active, callback, event),
+        move |event| {
+            let owner = &owner;
+            serial_turn(&owner.0, callback, event)
+        },
     ));
     drivers.retain(|driver| driver.strong_count() != 0);
     drivers.push(Arc::downgrade(&driver));
@@ -343,6 +368,18 @@ impl Serial {
         if !peer.live() {
             return Status::Closed;
         }
+        self.try_transport_send(peer, channel, payload, expires)
+    }
+
+    /// The serial owner validates transport lifetime before its final control
+    /// attempt; ordinary sends additionally require the peer's live-operation gate.
+    fn try_transport_send(
+        &mut self,
+        peer: &Peer,
+        channel: Channel,
+        payload: &[u8],
+        expires: Option<Instant>,
+    ) -> Status {
         use crate::transport::{direct::SendError, driver::PeerWritable, proxy::QueueError};
         match &self.transport {
             PeerTransport::Direct(sockets) => {

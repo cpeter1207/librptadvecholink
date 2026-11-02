@@ -310,7 +310,8 @@ struct rptadv_echolink_descriptor_v1 {
     rptadv_echolink_status (*peer_attach)(struct rptadv_echolink_context *, struct rptadv_echolink_qso *, rptadv_echolink_step_fn, void *, struct rptadv_echolink_registration **);
     /** Nonblocking graceful close/BYE request, not a final quiescence barrier. */
     void (*peer_stop)(struct rptadv_echolink_registration *);
-    /** Wait off executor for quiescence before releasing the context/peer. */
+    /** Wait off executor for quiescence and a final nonblocking best-effort BYE
+     * attempt before releasing the context/peer. Does not wait for media drain. */
     void (*peer_detach)(struct rptadv_echolink_registration *);
     /** Wake the existing owner without a task per packet. */
     void (*peer_wake)(struct rptadv_echolink_registration *);

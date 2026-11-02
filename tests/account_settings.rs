@@ -431,6 +431,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
         finish: AtomicBool,
         drained: AtomicBool,
         closed: AtomicBool,
+        abort: AtomicBool,
     }
     unsafe extern "C" fn audio(
         context: *mut std::ffi::c_void,
@@ -471,6 +472,9 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
     }
     unsafe extern "C" fn step(context: *mut std::ffi::c_void) -> i32 {
         let trace = unsafe { &*context.cast::<StepTrace>() };
+        if trace.abort.load(Ordering::Acquire) {
+            return -1;
+        }
         let mut identity = info();
         let mut result = rptadv_echolink::ffi::ReadResult::default();
         if trace.calls.load(Ordering::Acquire) == 0 {
@@ -693,7 +697,12 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    for speex in [false, true] {
+    for (speex, immediate_detach, abort_callback) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let api = unsafe { &*rptadv_echolink::rptadv_echolink_descriptor_v1() };
         let context = resource_context(api);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -843,6 +852,7 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             finish: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
         };
         let mut registration = ptr::null_mut();
         api.peer_read.expect("source-rate receive bridge missing");
@@ -921,8 +931,18 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
             0,
             "played and explicitly cancelled finite prefixes must both release the talker"
         );
-        unsafe { api.peer_stop.unwrap()(registration) };
-        wait(|| serial.closed.load(Ordering::Acquire));
+        if abort_callback {
+            serial.abort.store(true, Ordering::Release);
+            unsafe { api.peer_wake.unwrap()(registration) };
+        } else {
+            unsafe { api.peer_stop.unwrap()(registration) };
+        }
+        if immediate_detach {
+            // The controller drops its registration immediately after requesting stop.
+            unsafe { api.peer_detach.unwrap()(registration) };
+        } else if !abort_callback {
+            wait(|| serial.closed.load(Ordering::Acquire));
+        }
         let mut control = [0; 512];
         loop {
             let (count, _) = feedback.recv_from(&mut control).unwrap();
@@ -939,7 +959,9 @@ fn activated_abi_account_dials_revalidates_incoming_ownership_and_quiesces() {
                 break;
             }
         }
-        unsafe { api.peer_detach.unwrap()(registration) };
+        if !immediate_detach {
+            unsafe { api.peer_detach.unwrap()(registration) };
+        }
         let calls = serial.calls.load(Ordering::Acquire);
         assert_eq!(serial.errors.load(Ordering::Acquire), 0);
         peer.send_to(&sdes[..length], (std::net::Ipv4Addr::LOCALHOST, port + 1))

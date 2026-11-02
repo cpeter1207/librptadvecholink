@@ -652,11 +652,14 @@ pub(crate) unsafe extern "C" fn dial(
 }
 
 impl Peer {
-    fn live(&self) -> bool {
+    fn transport_live(&self) -> bool {
         self.binding.live.load(Ordering::Acquire)
             && self.binding.available.load(Ordering::Acquire)
-            && !self.control.is_stopped()
             && !self.control.is_transport_retired()
+    }
+
+    fn live(&self) -> bool {
+        self.transport_live() && !self.control.is_stopped()
     }
 
     fn validate(&self) -> Status {
