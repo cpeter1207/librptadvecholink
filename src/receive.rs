@@ -390,7 +390,8 @@ impl Receiver {
         } else {
             None
         };
-        let drained = self.pending.is_none() && self.playout.drained() && product_drained;
+        let source_drained = self.pending.is_none() && self.playout.drained();
+        let drained = source_drained && product_drained;
         if self.selected {
             match self.talker.report_drained(drained) {
                 Ok(()) | Err(OfferError::Full) => {}
@@ -410,9 +411,10 @@ impl Receiver {
                 activity = Some(false);
             }
         }
-        // The account's drain acknowledgement may arrive on a later serial
-        // turn. Closing the QSO first would retire its host before final unkey.
-        if drained && !self.selected && self.qso.state() == QsoState::Closing {
+        // Released selection already proves the product tail was acknowledged,
+        // or no source was ever selected. That one-shot completion need not be
+        // repeated on the later account-unkey turn. Pending media still waits.
+        if source_drained && !self.selected && self.qso.state() == QsoState::Closing {
             self.control(QsoEvent::Drained, now);
         }
         Ok(Turn {

@@ -387,7 +387,7 @@ fn selected_audio_keeps_its_tail_until_product_drain_then_unkeys_once() {
                 send_bye: true
             })
         );
-        receiver.poll(later, true, &mut sink).unwrap();
+        receiver.poll(later, false, &mut sink).unwrap();
         assert_eq!(receiver.state(), QsoState::Closed);
         assert!(matches!(
             receiver
@@ -446,13 +446,39 @@ fn graceful_close_waits_for_the_selected_source_unkey_before_retiring() {
         coordinator.service().await;
         assert_eq!(coordinator.poll(later), Some((1, generation)));
         assert_eq!(
-            receiver.poll(later, true, &mut sink).unwrap().activity,
+            receiver.poll(later, false, &mut sink).unwrap().activity,
             Some(false)
         );
         assert_eq!(receiver.state(), QsoState::Closed);
         assert_eq!(
             receiver.poll(later, true, &mut sink).unwrap().activity,
             None
+        );
+    });
+}
+
+#[test]
+fn idle_transport_loss_closes_without_a_product_finish_token() {
+    run(async {
+        let providers = Providers::new();
+        let now = Instant::now();
+        let (_coordinator, mut receiver, generation) = setup(&providers, now);
+        receiver
+            .packet(datagram(generation, Channel::Control, now, &sdes()))
+            .unwrap();
+        receiver.control(QsoEvent::TransportLost, now);
+        assert!(!receiver.product_finish_pending());
+        assert_eq!(
+            receiver
+                .poll(now, false, &mut Sink::default())
+                .unwrap()
+                .activity,
+            None
+        );
+        assert_eq!(receiver.state(), QsoState::Closed);
+        assert_eq!(
+            receiver.observe(now).unwrap().session.first_cause,
+            Some(Cause::TransportLost)
         );
     });
 }
