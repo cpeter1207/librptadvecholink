@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   packet-fit:
-    uses: cpeter1207/librptadvecholink-workflows/.github/workflows/packet-fit.yml@feature/echolink-validation
+    uses: cpeter1207/librptadvecholink-workflows/.github/workflows/packet-fit.yml@main
     with:
       code_ref: ${{ github.sha }}
       target: ${{ inputs.target || 'packet' }}
