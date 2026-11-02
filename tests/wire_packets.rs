@@ -157,6 +157,11 @@ fn control_padding_identity_and_compound_ambiguity_are_rejected() {
             "{fixture}"
         );
     }
+    // Four padding bytes preserve the receiver report's aligned eight-byte body.
+    assert_eq!(
+        parse_datagram(Channel::Control, &hex("e0c900020000000100000004")),
+        Ok(WirePacket::Control(ControlPacket::Report { source: 1 }))
+    );
     assert_eq!(
         parse_datagram(Channel::Control, &hex("e1cb00020000000100000004")),
         Ok(WirePacket::Control(ControlPacket::Bye {
