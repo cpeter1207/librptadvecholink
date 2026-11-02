@@ -2,3 +2,5 @@
 /.work/
 /build/
 /.superpowers/
+/.quality-tools/
+__pycache__/

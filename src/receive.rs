@@ -1,0 +1,440 @@
+//! One QSO's serial receive composition; no executor, PCM ring or codec is duplicated.
+use crate::{
+    account::{
+        Selection,
+        coordination::{OfferError, TalkerPort},
+    },
+    media::{CodecChoice, MediaError},
+    playout::{PcmSink, Playout, Progress, Reception},
+    session::{Packet, Qso, QsoAction, QsoEvent, QsoState},
+    transport::{mailbox::Datagram, routing::PendingHandshake},
+    wire::{Codec, ControlPacket, VoicePacket, WirePacket, parse_datagram},
+};
+use std::{net::IpAddr, time::Instant};
+
+/// One admitted datagram's result, copied before invoking any host step callback.
+pub enum Incoming {
+    /// Invalid, stale, suppressed or unsupported input; never a request to hang up.
+    Ignored,
+    /// Same immutable packet retained until talker selection and jitter admission complete.
+    Retained,
+    /// Connection/control action from the existing QSO state machine.
+    Action(QsoAction),
+    /// Human text only; station information and protocol controls never reach this variant.
+    Text {
+        /// Represented chat sender, not the authenticated connection identity.
+        sender: String,
+        /// Literal bounded text; synthesis/forwarding policy belongs to the product.
+        body: String,
+    },
+}
+
+/// Copied results of one bounded receive turn, not a callback into a borrowed owner.
+pub struct Turn {
+    /// Actual jitter/output progress; Blocked must wait for downstream capacity.
+    pub progress: Progress,
+    /// Selected activity edge, never raw contender/heartbeat activity.
+    pub activity: Option<bool>,
+    /// One timer action, including a preserved first terminal cause.
+    pub action: Option<QsoAction>,
+}
+
+/// Read-only serial-owner metadata. Jitter values use the 8 kHz source clock;
+/// ring fallback concealment is observed separately by the product.
+pub struct Observation {
+    /// QSO state and original liveness anchors.
+    pub session: crate::session::Observation,
+    /// Negotiated outbound format, not a receive packet restriction.
+    pub codec: Codec,
+    /// This connection currently supplies selected/draining RF audio.
+    pub selected: bool,
+    /// Age of a retained original datagram; zero when none is retained.
+    pub retained_age_ms: u64,
+    /// Packets rejected before parsing because their route generation retired.
+    pub stale_packets: u64,
+    /// Wire or media framing failures, never automatic hangups.
+    pub malformed_packets: u64,
+    /// Lower RTP sequences observed within a selected burst, excluding duplicates.
+    pub out_of_order_packets: u64,
+    /// Actual packet-jitter adapter counters and source-sample delay.
+    pub jitter: rptadv_jitter_client::Observation,
+    /// Concealment and fallback spans actually accepted by the product sink.
+    pub concealment: crate::playout::Concealment,
+}
+
+/// Retain the original byte/queue credit and its already-validated wire header.
+/// The payload remains borrowed from that immutable datagram, never copied again.
+struct PendingVoice {
+    packet: Datagram,
+    header: VoicePacket<'static>,
+    payload_start: usize,
+}
+impl PendingVoice {
+    fn voice(&self) -> VoicePacket<'_> {
+        VoicePacket {
+            payload: &self.packet.payload()[self.payload_start..],
+            ..self.header
+        }
+    }
+}
+
+/// Exactly one serial worker owns this object. Host notification occurs only after
+/// ending its mutable borrow. The PCM sink only publishes to the existing product
+/// ring; it must not reenter this owner. Outgoing encoding remains independently owned.
+pub struct Receiver {
+    qso: Qso,
+    playout: Playout,
+    codecs: CodecChoice,
+    talker: TalkerPort,
+    pending: Option<PendingVoice>,
+    granted: bool,
+    selected: bool,
+    ending: bool,
+    highest_sequence: Option<u16>,
+    playout_deadline: Option<Instant>,
+    stale_packets: u64,
+    malformed_packets: u64,
+    out_of_order_packets: u64,
+}
+
+impl Receiver {
+    /// Compose already prepared dynamic capabilities and the account-bound talker port.
+    pub fn new(qso: Qso, playout: Playout, codecs: CodecChoice, talker: TalkerPort) -> Self {
+        Self {
+            qso,
+            playout,
+            codecs,
+            talker,
+            pending: None,
+            granted: false,
+            selected: false,
+            ending: false,
+            highest_sequence: None,
+            playout_deadline: None,
+            stale_packets: 0,
+            malformed_packets: 0,
+            out_of_order_packets: 0,
+        }
+    }
+
+    /// Copy only on this connection's serial owner, never from an audio callback.
+    pub fn observe(&self, now: Instant) -> Result<Observation, MediaError> {
+        Ok(Observation {
+            session: self.qso.observe(now),
+            codec: self.codec(),
+            selected: self.selected,
+            retained_age_ms: self.pending.as_ref().map_or(0, |packet| {
+                crate::session::ms(now.saturating_duration_since(packet.packet.arrived()))
+            }),
+            stale_packets: self.stale_packets,
+            malformed_packets: self.malformed_packets,
+            out_of_order_packets: self.out_of_order_packets,
+            jitter: self.playout.observe()?,
+            concealment: self.playout.concealment(),
+        })
+    }
+
+    /// No new packet may replace the retained one or enter a closing generation.
+    pub fn can_receive(&self) -> bool {
+        self.pending.is_none()
+            && matches!(self.qso.state(), QsoState::Connecting | QsoState::Connected)
+    }
+
+    /// Current QSO state; closed is reached only after accepted downstream media drains.
+    pub fn state(&self) -> QsoState {
+        self.qso.state()
+    }
+
+    /// Update validated account policy on this sole owner. Accepted/decoded
+    /// media, talker ownership and liveness timestamp anchors remain intact.
+    pub(crate) fn reconfigure(
+        &mut self,
+        gain_db: f64,
+        timers: crate::session::Timers,
+    ) -> Result<(), MediaError> {
+        crate::media::gain(gain_db)?;
+        if !self.qso.set_timers(timers) {
+            return Err(MediaError::Invalid);
+        }
+        self.playout.set_gain(gain_db)
+    }
+
+    /// All accepted source PCM has been published, but the product still owns
+    /// its finite tail. Publish one end marker per burst before waiting for
+    /// product-ring drainage; raw guard expiry is not permission to discard PCM.
+    pub fn product_finish_pending(&self) -> bool {
+        self.selected && self.ending && self.pending.is_none() && self.playout.drained()
+    }
+
+    /// Negotiated egress format; receive still selects each packet's own codec.
+    pub fn codec(&self) -> Codec {
+        self.codecs.codec()
+    }
+
+    /// Consume the router-verified incoming establishment on its original arrival
+    /// time. The owner calls this once when moving the admitted connection into
+    /// its receiver; it must not wait for a second remote heartbeat. QSO identity
+    /// checks still precede codec negotiation and connection publication.
+    pub fn initial(&mut self, initial: &PendingHandshake) -> Option<QsoAction> {
+        let IpAddr::V4(address) = initial.source.ip() else {
+            return None;
+        };
+        let ControlPacket::Sdes {
+            source, callsign, ..
+        } = &initial.control
+        else {
+            return None;
+        };
+        let action = self.control(
+            QsoEvent::Packet {
+                address,
+                packet: Packet::Sdes {
+                    source: *source,
+                    callsign: callsign.clone(),
+                },
+            },
+            initial.arrived,
+        );
+        if action == Some(QsoAction::Connected) {
+            self.codecs.observe_sdes(&initial.control);
+        }
+        action
+    }
+
+    /// Apply local/transport events without inventing packet-error hangups.
+    pub fn control(&mut self, event: QsoEvent, now: Instant) -> Option<QsoAction> {
+        let action = self.qso.handle(self.qso.generation(), event, now);
+        if matches!(action, Some(QsoAction::Closing { .. })) {
+            self.playout.end();
+            self.ending = true;
+        }
+        action
+    }
+
+    /// Process only account-routed, endpoint-verified packets from this generation.
+    /// The packet's actual arrival drives liveness and first-talker selection.
+    /// A retained input is a caller contract error, never silently overwritten.
+    pub fn packet(&mut self, packet: Datagram) -> Result<Incoming, MediaError> {
+        if packet.generation() != self.qso.generation() {
+            self.stale_packets = self.stale_packets.saturating_add(1);
+            return Ok(Incoming::Ignored);
+        }
+        if !self.can_receive() {
+            return if self.pending.is_some() {
+                Err(MediaError::Contract)
+            } else {
+                Ok(Incoming::Ignored)
+            };
+        }
+        let IpAddr::V4(address) = packet.source().ip() else {
+            return Ok(Incoming::Ignored);
+        };
+        let Ok(wire) = parse_datagram(packet.class(), packet.payload()) else {
+            self.malformed_packets = self.malformed_packets.saturating_add(1);
+            return Ok(Incoming::Ignored);
+        };
+        if let WirePacket::Voice(voice) = &wire {
+            // Resetting jitter between bursts must not give retired RTP packets
+            // a new playout epoch. Reordering within an active burst remains intact.
+            if self.ending
+                && self.playout.drained()
+                && self
+                    .highest_sequence
+                    .is_some_and(|last| voice.sequence.wrapping_sub(last) as i16 <= 0)
+            {
+                return Ok(Incoming::Ignored);
+            }
+        }
+        let mut retained = None;
+        let input = match &wire {
+            WirePacket::Control(ControlPacket::Sdes {
+                source, callsign, ..
+            }) => Packet::Sdes {
+                source: *source,
+                callsign: callsign.clone(),
+            },
+            WirePacket::Control(ControlPacket::Report { source }) => {
+                Packet::Report { source: *source }
+            }
+            WirePacket::Control(ControlPacket::Bye { source, .. }) => {
+                Packet::Bye { source: *source }
+            }
+            WirePacket::Voice(voice) => {
+                if !self.playout.validate(voice)? {
+                    self.malformed_packets = self.malformed_packets.saturating_add(1);
+                    return Ok(Incoming::Ignored);
+                }
+                retained = Some((
+                    VoicePacket {
+                        payload: &[],
+                        ..*voice
+                    },
+                    packet.payload().len() - voice.payload.len(),
+                ));
+                Packet::Voice { source: voice.ssrc }
+            }
+            WirePacket::Chat { .. } => Packet::Chat,
+            _ => return Ok(Incoming::Ignored),
+        };
+        let action = self.qso.handle(
+            packet.generation(),
+            QsoEvent::Packet {
+                address,
+                packet: input,
+            },
+            packet.arrived(),
+        );
+        if self.qso.state() == QsoState::Connected {
+            match &wire {
+                WirePacket::Control(control @ ControlPacket::Sdes { .. }) => {
+                    self.codecs.observe_sdes(control)
+                }
+                WirePacket::Chat { sender, body } => {
+                    return Ok(Incoming::Text {
+                        sender: (*sender).into(),
+                        body: (*body).into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        if action == Some(QsoAction::Voice) {
+            match self.talker.offer(packet.arrived()) {
+                Ok(()) => {
+                    // QsoAction::Voice is produced only for this validated input.
+                    let (header, payload_start) = retained.unwrap();
+                    self.pending = Some(PendingVoice {
+                        packet,
+                        header,
+                        payload_start,
+                    });
+                    return Ok(Incoming::Retained);
+                }
+                Err(OfferError::Full) => return Ok(Incoming::Ignored),
+                Err(_) => return Err(MediaError::Contract),
+            }
+        }
+        if matches!(action, Some(QsoAction::Closing { .. })) {
+            self.playout.end();
+            self.ending = true;
+        }
+        Ok(action.map_or(Incoming::Ignored, Incoming::Action))
+    }
+
+    /// Advance one retained grant and one jitter prefix. Product release means
+    /// its exact finite prefix either played or was explicitly discarded by a
+    /// retired generation, not merely successful PCM publication.
+    pub fn poll(
+        &mut self,
+        now: Instant,
+        product_drained: bool,
+        sink: &mut dyn PcmSink,
+    ) -> Result<Turn, MediaError> {
+        let action = self.control(QsoEvent::Poll, now);
+        let mut activity = None;
+        if self.pending.is_some() && !self.granted {
+            match self.talker.selection().map_err(|_| MediaError::Contract)? {
+                None => {
+                    return Ok(Turn {
+                        progress: Progress::Idle(None),
+                        activity,
+                        action,
+                    });
+                }
+                Some(Selection::Selected) => self.granted = true,
+                Some(_) => {
+                    self.pending = None;
+                }
+            }
+        }
+        if self.granted {
+            if self.ending && self.playout.drained() {
+                self.playout.reset()?;
+                self.ending = false;
+            }
+            // A grant belongs to the one retained Voice input until admission.
+            let packet = self.pending.as_ref().unwrap();
+            let voice = packet.voice();
+            match self.playout.receive(voice, packet.packet.arrived())? {
+                Reception::Busy => {}
+                Reception::Invalid => return Err(MediaError::Contract),
+                Reception::Admitted(_) => {
+                    if self
+                        .highest_sequence
+                        .is_some_and(|last| (voice.sequence.wrapping_sub(last) as i16) < 0)
+                    {
+                        self.out_of_order_packets = self.out_of_order_packets.saturating_add(1);
+                    }
+                    if self
+                        .highest_sequence
+                        .is_none_or(|last| voice.sequence.wrapping_sub(last) as i16 > 0)
+                    {
+                        self.highest_sequence = Some(voice.sequence);
+                    }
+                    self.pending = None;
+                    self.granted = false;
+                    if !self.selected {
+                        self.selected = true;
+                        activity = Some(true);
+                    }
+                }
+            }
+        }
+        if !self.qso.raw_receiving(now) && self.selected && !self.ending {
+            self.playout.end();
+            self.ending = true;
+        }
+        let progress = self.playout.poll(now, sink)?;
+        self.playout_deadline = if let Progress::Idle(deadline) = progress {
+            deadline
+        } else {
+            None
+        };
+        let drained = self.pending.is_none() && self.playout.drained() && product_drained;
+        if self.selected {
+            match self.talker.report_drained(drained) {
+                Ok(()) | Err(OfferError::Full) => {}
+                // The account owner cannot arbitrate after transport loss.
+                // Its selected QSO still owns the exact downstream tail and
+                // releases that activity locally only after the finite token.
+                Err(OfferError::Closed) if self.qso.state() == QsoState::Closing => {
+                    if drained {
+                        self.selected = false;
+                        activity = Some(false);
+                    }
+                }
+                Err(_) => return Err(MediaError::Contract),
+            }
+            if self.talker.take_unkey() {
+                self.selected = false;
+                activity = Some(false);
+            }
+        }
+        // The account's drain acknowledgement may arrive on a later serial
+        // turn. Closing the QSO first would retire its host before final unkey.
+        if drained && !self.selected && self.qso.state() == QsoState::Closing {
+            self.control(QsoEvent::Drained, now);
+        }
+        Ok(Turn {
+            progress,
+            activity,
+            action,
+        })
+    }
+
+    /// Real protocol, raw-burst and jitter deadlines; no idle polling interval.
+    pub fn deadline(&self, now: Instant) -> Option<Instant> {
+        [
+            self.qso.deadline(),
+            self.qso.receive_deadline(now),
+            self.playout_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/receive_policy.rs"]
+mod tests;

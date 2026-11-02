@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=${prefix}/include/rptadv_echolink
+
+Name: rptadv_echolink
+Description: EchoLink protocol provider for RPT Advanced
+Version: @VERSION@
+abi_version=@ABI_VERSION@
+Libs: -L${libdir} -lrptadv_echolink
+Cflags: -I${includedir}
