@@ -16,3 +16,5 @@ jobs:
       code_ref: ${{ github.sha }}
       tag: ${{ github.ref_name }}
       package_target: release-packages
+    secrets:
+      APT_INDEX_DISPATCH_TOKEN: ${{ secrets.APT_INDEX_DISPATCH_TOKEN }}
