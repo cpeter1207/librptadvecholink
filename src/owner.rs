@@ -25,9 +25,9 @@ mod diagnostics;
 mod peer;
 pub(crate) use diagnostics::account_observe;
 pub(crate) use peer::{
-    peer_attach, peer_detach, peer_elapsed_ms, peer_observe, peer_prepare_audio, peer_read,
-    peer_reset_encoder, peer_send_prepared, peer_send_text, peer_set_deadline, peer_stop,
-    peer_wake,
+    peer_attach, peer_detach, peer_egress_observer, peer_elapsed_ms, peer_observe,
+    peer_prepare_audio, peer_read, peer_reset_encoder, peer_retire_egress, peer_send_prepared,
+    peer_send_text, peer_set_deadline, peer_stop, peer_wake,
 };
 use tokio::{
     runtime::{Handle, Runtime},
@@ -95,6 +95,7 @@ struct Peer {
     pending: Mutex<Option<peer::Prepared>>,
     serial: UnsafeCell<Option<peer::Serial>>,
     created: Instant,
+    transmit: Arc<crate::transport::egress::Lifetime>,
     // Fields drop in declaration order: codec/jitter contexts and sockets must
     // retire before their DSO and runtime ownership, including after account drop.
     binding: Arc<Binding>,
@@ -104,6 +105,11 @@ struct Peer {
 // Identity/control remain independently readable. Detach joins before reclamation.
 unsafe impl Send for Peer {}
 unsafe impl Sync for Peer {}
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.transmit.close();
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Callback {

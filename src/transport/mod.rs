@@ -2,6 +2,7 @@
 
 pub mod direct;
 pub mod driver;
+pub(crate) mod egress;
 pub mod mailbox;
 pub mod proxy;
 pub mod routing;

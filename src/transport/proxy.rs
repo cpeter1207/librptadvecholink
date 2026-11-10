@@ -191,6 +191,8 @@ struct Queued {
     _media_slot: Option<OwnedSemaphorePermit>,
     // Rust drops fields in declaration order. Notify only after every retained
     // byte/slot charge above is released, not while a waiter still sees it full.
+    // Release native eligibility after bytes/credit, before waking waiters.
+    ticket: Option<super::egress::Ticket>,
     _retired: CreditProgress,
 }
 
@@ -320,6 +322,14 @@ impl ProxyOutput {
         record: ProxyRecord<'_>,
         expires: Option<Instant>,
     ) -> Result<(), QueueError> {
+        self.try_queue_scoped(record, expires, None)
+    }
+    pub(crate) fn try_queue_scoped(
+        &self,
+        record: ProxyRecord<'_>,
+        expires: Option<Instant>,
+        epoch: Option<Arc<super::egress::Epoch>>,
+    ) -> Result<(), QueueError> {
         let header = record.header().map_err(|_| QueueError::Invalid)?;
         let media = record.kind == ProxyKind::UdpData;
         // Declare before credits so failed admission releases them before wake.
@@ -358,6 +368,7 @@ impl ProxyOutput {
             _slot: slot,
             _media_slot: media_slot,
             _retired: retired,
+            ticket: epoch.map(|epoch| epoch.ticket()),
         });
         self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -477,7 +488,13 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
         }
         while front.offset < front.wire.len() {
             let count = poll_fn(|cx| {
-                match Pin::new(&mut self.stream).poll_write(cx, &front.wire[front.offset..]) {
+                let mut write =
+                    || Pin::new(&mut self.stream).poll_write(cx, &front.wire[front.offset..]);
+                let step = match &front.ticket {
+                    Some(ticket) => ticket.write(front.offset != 0, write),
+                    None => write().map(|result| result.map(Some)),
+                };
+                match step {
                     Poll::Pending => {
                         metrics.stall();
                         Poll::Pending
@@ -490,6 +507,11 @@ impl<S: AsyncWrite + Unpin> ProxyWriter<S> {
             })
             .await
             .map_err(io_error)?;
+            let Some(count) = count else {
+                metrics.head.store(0, Ordering::Relaxed);
+                self.current = None;
+                return Ok(FlushOutcome::Skipped);
+            };
             if count == 0 {
                 return Err(ProxyError::Io(ErrorKind::WriteZero));
             }

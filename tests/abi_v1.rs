@@ -15,7 +15,7 @@ fn descriptor_exposes_the_complete_sized_network_media_and_text_groups() {
     assert_eq!(api.capabilities, 15);
     assert!(api.account_activate.is_some());
     assert!(api.account_apply_prepared.is_some());
-    let client = unsafe { rptadv_peer_support::echolink::Api::open(api) }.unwrap();
+    let client = unsafe { rptadv_peer_support::echolink::Api::open(&api.released) }.unwrap();
     assert!(client.network_available());
     assert!(client.prepared_media_available());
     assert!(client.text_available());

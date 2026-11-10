@@ -47,6 +47,7 @@ pub(super) struct Serial {
     receiver: Receiver,
     ingress: crate::transport::mailbox::Observer,
     encoder: PreparedMedia,
+    egress: crate::transport::egress::Egress,
     transport: PeerTransport,
     control: Option<Vec<u8>>,
     information: Option<Vec<u8>>,
@@ -130,6 +131,7 @@ impl Peer {
             })),
             serial: std::cell::UnsafeCell::new(None),
             created,
+            transmit: Arc::new(crate::transport::egress::Lifetime::default()),
         }
     }
 }
@@ -216,6 +218,7 @@ pub(crate) unsafe extern "C" fn peer_attach(
         receiver,
         ingress: prepared.ingress.observer(),
         encoder,
+        egress: crate::transport::egress::Egress::new(peer.transmit.clone()),
         transport: prepared.transport,
         control: None,
         information: None,
@@ -381,6 +384,20 @@ impl Serial {
         expires: Option<Instant>,
     ) -> Status {
         use crate::transport::{direct::SendError, driver::PeerWritable, proxy::QueueError};
+        // Chat uses the audio UDP port too. Only actual voice acquires this
+        // QSO's TX epoch; control, information and human text keep their owners.
+        let epoch = if channel == Channel::Audio
+            && matches!(
+                crate::wire::parse_datagram(channel, payload),
+                Ok(crate::wire::WirePacket::Voice(_))
+            ) {
+            let Some(epoch) = self.egress.epoch() else {
+                return Status::Pending;
+            };
+            Some(epoch)
+        } else {
+            None
+        };
         match &self.transport {
             PeerTransport::Direct(sockets) => {
                 let destination = SocketAddr::new(
@@ -413,13 +430,14 @@ impl Serial {
                 } else {
                     ProxyKind::UdpControl
                 };
-                match output.try_queue(
+                match output.try_queue_scoped(
                     ProxyRecord {
                         kind,
                         address: peer.identity.address,
                         payload,
                     },
                     expires,
+                    epoch,
                 ) {
                     Ok(()) => {
                         self.proxy_admitted = self.proxy_admitted.saturating_add(1);
@@ -661,6 +679,9 @@ pub(crate) unsafe extern "C" fn peer_prepare_audio(
     let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
         return Status::Invalid;
     };
+    if serial.egress.retiring() {
+        return Status::Pending;
+    }
     let input = if frames == 0 {
         &[]
     } else {
@@ -775,6 +796,86 @@ pub(crate) unsafe extern "C" fn peer_reset_encoder(qso: *mut ffi::Qso) -> Status
     match serial.encoder.reset() {
         Ok(()) => Status::Ok,
         Err(_) => Status::Failed,
+    }
+}
+
+/// Revoke old voice and reset its encoder on the existing serial owner. Queued
+/// partial TCP remains pending until the writer really finishes/drops the frame.
+pub(crate) unsafe extern "C" fn peer_retire_egress(qso: *mut ffi::Qso, token: *mut u64) -> Status {
+    if token.is_null() {
+        return Status::Invalid;
+    }
+    unsafe { token.write(0) };
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let Some(serial) = (unsafe { (*peer.serial.get()).as_mut() }) else {
+        return Status::Invalid;
+    };
+    if serial.egress.begin() {
+        if serial.encoder.reset().is_err() {
+            return Status::Failed;
+        }
+        serial.egress.reset_completed();
+    }
+    match serial.egress.complete() {
+        Ok(Some(completed)) => {
+            unsafe { token.write(completed) };
+            Status::Ok
+        }
+        Ok(None) => Status::Pending,
+        Err(crate::transport::egress::Exhausted) => Status::Failed,
+    }
+}
+
+/// Copy a sized metadata observer. No source, socket, runtime or QSO is retained.
+pub(crate) unsafe extern "C" fn peer_egress_observer(
+    qso: *const ffi::Qso,
+    output: *mut ffi::EgressObserver,
+) -> Status {
+    if output.is_null() {
+        return Status::Invalid;
+    }
+    let size = unsafe { output.cast::<u32>().read_unaligned() };
+    if (size as usize) < size_of::<ffi::EgressObserver>() {
+        return Status::Invalid;
+    }
+    let abi = unsafe { output.cast::<u32>().add(1).read_unaligned() };
+    if abi != 1 {
+        return Status::Invalid;
+    }
+    let empty = ffi::EgressObserver {
+        struct_size: size_of::<ffi::EgressObserver>() as u32,
+        abi_version: 1,
+        context: ptr::null_mut(),
+        disposed: None,
+        release: None,
+    };
+    unsafe { output.write_unaligned(empty) };
+    let Some(peer) = (unsafe { qso.cast::<Peer>().as_ref() }) else {
+        return Status::Invalid;
+    };
+    let observer = ffi::EgressObserver {
+        struct_size: size_of::<ffi::EgressObserver>() as u32,
+        abi_version: 1,
+        context: Arc::into_raw(peer.transmit.clone()).cast_mut().cast(),
+        disposed: Some(egress_disposed),
+        release: Some(egress_release),
+    };
+    unsafe { output.write_unaligned(observer) };
+    Status::Ok
+}
+unsafe extern "C" fn egress_disposed(context: *const c_void) -> i32 {
+    unsafe {
+        context
+            .cast::<crate::transport::egress::Lifetime>()
+            .as_ref()
+    }
+    .map_or(-1, |lifetime| i32::from(lifetime.disposed()))
+}
+unsafe extern "C" fn egress_release(context: *mut c_void) {
+    if !context.is_null() {
+        drop(unsafe { Arc::from_raw(context.cast::<crate::transport::egress::Lifetime>()) });
     }
 }
 

@@ -275,6 +275,20 @@ struct rptadv_echolink_peer_observation_v1 {
 };
 
 /** Immutable table; unavailable slots are not advertised as capabilities. */
+/** Owned metadata-only reference, independent of QSO/account/socket ownership.
+ * Keep provider code loaded until release. Neither elapsed time nor peer_destroy
+ * alone certifies a partially submitted Proxy frame. */
+struct rptadv_echolink_egress_observer_v1 {
+    uint32_t struct_size; /**< Complete readable/writable size,32bytes. */
+    uint32_t abi_version; /**< Exact revision,one. */
+    void *context; /**< Owned metadata reference; release exactly once. */
+    /** Zero while live/queued,one after QSO destruction and actual media disposal,
+     * negative for invalid context. Performs no network I/O or waiting. */
+    int32_t (*disposed)(const void *context);
+    void (*release)(void *context); /**< Release metadata; null is harmless. */
+};
+
+/** Sized lifecycle, network, prepared-media and optional retirement operations. */
 struct rptadv_echolink_descriptor_v1 {
     uint32_t struct_size; /**< Complete readable table size. */
     uint32_t abi_version; /**< One. */
@@ -362,7 +376,22 @@ struct rptadv_echolink_descriptor_v1 {
     /** Copy metadata only inside this peer's sole registered serial step. */
     rptadv_echolink_status (*peer_observe)(const struct rptadv_echolink_qso *,
         struct rptadv_echolink_peer_observation_v1 *);
+    /** Optional complete egress pair. Call only on the existing serial QSO owner.
+     * Revoke old queued voice and reset its actual encoder. Pending clears token
+     * until every retained old frame is dropped or completely submitted. Partial
+     * TCP frames finish without corrupting framing; controls/other QSOs survive.
+     * Ok returns a nonzero actual epoch. New PCM is rejected while Pending.
+     * Neither this receipt nor UDP/TCP acceptance proves remote/RF silence. */
+    rptadv_echolink_status (*peer_retire_egress)(struct rptadv_echolink_qso *, uint64_t *token);
+    /** Retain metadata before peer_destroy; no QSO/runtime/socket is retained.
+     * The observer remains valid after actual account/context destruction. */
+    rptadv_echolink_status (*peer_egress_observer)(const struct rptadv_echolink_qso *,
+        struct rptadv_echolink_egress_observer_v1 *);
 };
+/** Minimum readable descriptor for the complete optional egress pair. */
+#define RPTADV_ECHOLINK_DESCRIPTOR_EGRESS_MIN_SIZE \
+    (offsetof(struct rptadv_echolink_descriptor_v1, peer_egress_observer) + \
+     sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->peer_egress_observer))
 /** Borrow the immutable table while the DSO remains loaded. */
 const struct rptadv_echolink_descriptor_v1 *rptadv_echolink_descriptor_v1(void);
 #ifdef __cplusplus

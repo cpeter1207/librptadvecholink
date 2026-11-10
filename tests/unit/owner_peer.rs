@@ -12,6 +12,8 @@ mod context;
 #[path = "../support/proxy_login.rs"]
 mod proxy_login;
 use settings_fixture::{secrets, settings, span};
+#[path = "../support/codec_fault.rs"]
+mod codec_fault;
 
 /// The same three directory transactions as account_settings' direct fixture.
 struct DirectPeer {
@@ -136,6 +138,328 @@ impl Drop for DirectPeer {
         if !std::thread::panicking() {
             joined.unwrap();
         }
+    }
+}
+
+#[test]
+fn actual_qso_retirement_resets_codec_and_metadata_outlives_destroyed_io_until_partial_disposal() {
+    use crate::transport::proxy::{FlushOutcome, ProxyOutput, ProxyWriter};
+    use std::sync::atomic::AtomicBool;
+    use tokio::io::AsyncReadExt;
+    struct Work<'a> {
+        qso: *mut ffi::Qso,
+        proxy: Option<ProxyOutput>,
+        phase: AtomicUsize,
+        failed: AtomicBool,
+        fault: &'a codec_fault::FaultCodec,
+        packet: std::sync::Mutex<Vec<u8>>,
+    }
+    unsafe extern "C" fn step(opaque: *mut c_void) -> i32 {
+        let work = unsafe { &*opaque.cast::<Work>() };
+        let phase = work.phase.load(Ordering::Acquire);
+        if phase == 1 {
+            return 0;
+        }
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let peer = unsafe { &*work.qso.cast::<Peer>() };
+            let api = unsafe { &*crate::rptadv_echolink_descriptor_v1() };
+            let mut bytes = [0; 264];
+            let mut encoded: rptadv_codec_client::EncodeResultRaw = unsafe { std::mem::zeroed() };
+            encoded.struct_size = size_of::<rptadv_codec_client::EncodeResultRaw>() as u32;
+            if phase == 0 {
+                let catalog = work.fault.catalog();
+                let replacement = PreparedMedia::new(
+                    &catalog,
+                    0.0,
+                    0,
+                    peer.binding.settings.as_abi().node_number,
+                )
+                .unwrap();
+                unsafe { (*peer.serial.get()).as_mut() }.unwrap().encoder = replacement;
+                assert_eq!(
+                    unsafe {
+                        api.peer_prepare_audio.unwrap()(
+                            work.qso,
+                            [0.25; 320].as_ptr(),
+                            320,
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                            0,
+                            ptr::from_mut(&mut encoded).cast(),
+                        )
+                    },
+                    Status::Ok
+                );
+                assert_eq!(encoded.encoded_bytes, 0);
+                work.fault.select(9);
+                let mut token = 99;
+                assert_eq!(
+                    unsafe { api.peer_retire_egress.unwrap()(work.qso, &mut token) },
+                    Status::Failed
+                );
+                assert_eq!(token, 0);
+                assert_eq!(
+                    unsafe {
+                        api.peer_prepare_audio.unwrap()(
+                            work.qso,
+                            [0.5; 320].as_ptr(),
+                            320,
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                            0,
+                            ptr::from_mut(&mut encoded).cast(),
+                        )
+                    },
+                    Status::Pending
+                );
+                work.fault.select(0);
+                assert_eq!(
+                    unsafe { api.peer_retire_egress.unwrap()(work.qso, &mut token) },
+                    Status::Ok
+                );
+                assert!(token > 0);
+                assert_eq!(
+                    unsafe {
+                        api.peer_prepare_audio.unwrap()(
+                            work.qso,
+                            [0.5; 320].as_ptr(),
+                            320,
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                            0,
+                            ptr::from_mut(&mut encoded).cast(),
+                        )
+                    },
+                    Status::Ok
+                );
+                assert_eq!(
+                    encoded.encoded_bytes, 0,
+                    "old320frames must really be discarded"
+                );
+                assert_eq!(
+                    unsafe {
+                        api.peer_prepare_audio.unwrap()(
+                            work.qso,
+                            [0.5; 320].as_ptr(),
+                            320,
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                            0,
+                            ptr::from_mut(&mut encoded).cast(),
+                        )
+                    },
+                    Status::Ok
+                );
+                assert!(encoded.encoded_bytes > 0);
+                assert_eq!(work.fault.calls(false), 0);
+                assert_eq!(
+                    work.fault.calls(true),
+                    0,
+                    "TX retirement never enters RX decoder/PLC"
+                );
+                *work.packet.lock().unwrap() = bytes[..encoded.encoded_bytes].to_vec();
+                if let Some(proxy) = &work.proxy {
+                    let serial = unsafe { (*peer.serial.get()).as_mut() }.unwrap();
+                    serial.transport = PeerTransport::Proxy(proxy.clone());
+                    assert_eq!(
+                        serial.try_transport_send(
+                            peer,
+                            Channel::Audio,
+                            &bytes[..encoded.encoded_bytes],
+                            Some(Instant::now() + Duration::from_millis(200))
+                        ),
+                        Status::Ok
+                    );
+                }
+                work.phase.store(1, Ordering::Release);
+            } else {
+                let mut token = 99;
+                assert_eq!(
+                    unsafe { api.peer_retire_egress.unwrap()(work.qso, &mut token) },
+                    if work.proxy.is_some() {
+                        Status::Pending
+                    } else {
+                        Status::Ok
+                    }
+                );
+                if work.proxy.is_some() {
+                    assert_eq!(token, 0);
+                    assert_eq!(
+                        unsafe { api.peer_retire_egress.unwrap()(work.qso, &mut token) },
+                        Status::Pending
+                    );
+                } else {
+                    assert!(token > 0);
+                    unsafe { (*peer.serial.get()).as_mut() }
+                        .unwrap()
+                        .egress
+                        .exhaust();
+                    assert_eq!(
+                        unsafe { api.peer_retire_egress.unwrap()(work.qso, &mut token) },
+                        Status::Failed
+                    );
+                    assert_eq!(token, 0);
+                }
+                assert_eq!(
+                    unsafe {
+                        api.peer_prepare_audio.unwrap()(
+                            work.qso,
+                            ptr::null(),
+                            0,
+                            bytes.as_mut_ptr(),
+                            bytes.len(),
+                            0,
+                            ptr::from_mut(&mut encoded).cast(),
+                        )
+                    },
+                    Status::Pending
+                );
+                let serial = unsafe { (*peer.serial.get()).as_mut() }.unwrap();
+                assert_eq!(
+                    serial.try_transport_send(
+                        peer,
+                        Channel::Audio,
+                        &work.packet.lock().unwrap(),
+                        Some(Instant::now() + Duration::from_millis(200))
+                    ),
+                    Status::Pending,
+                    "old prepared voice cannot re-enter a retired epoch"
+                );
+                if work.proxy.is_some() {
+                    let mut chat = [0; 64];
+                    let count =
+                        crate::wire::write_chat("K1ABC-R", "control survives", &mut chat).unwrap();
+                    assert_eq!(
+                        serial.try_transport_send(peer, Channel::Audio, &chat[..count], None),
+                        Status::Ok
+                    );
+                }
+                work.phase.store(3, Ordering::Release);
+            }
+        }));
+        if result.is_err() {
+            work.failed.store(true, Ordering::Release);
+            work.phase.store(3, Ordering::Release);
+        }
+        if work.phase.load(Ordering::Acquire) == 3 {
+            -1
+        } else {
+            0
+        }
+    }
+    for mode in 0..3 {
+        let fault = codec_fault::FaultCodec::new(rptadv_codec_client::ProfileId::GsmFr);
+        let mut fixture = DirectPeer::open();
+        let peer = unsafe { &*fixture.qso.cast::<Peer>() };
+        let runtime = Arc::downgrade(&peer.binding.runtime);
+        let metadata = Arc::downgrade(&peer.transmit);
+        let mut observer = ffi::EgressObserver {
+            struct_size: size_of::<ffi::EgressObserver>() as u32,
+            abi_version: 1,
+            context: ptr::null_mut(),
+            disposed: None,
+            release: None,
+        };
+        assert_eq!(
+            unsafe { fixture.api.peer_egress_observer.unwrap()(fixture.qso, &mut observer) },
+            Status::Ok
+        );
+        assert_eq!(unsafe { observer.disposed.unwrap()(ptr::null()) }, -1);
+        unsafe { observer.release.unwrap()(ptr::null_mut()) };
+        assert_eq!(unsafe { observer.disposed.unwrap()(observer.context) }, 0);
+        let mut token = 99;
+        assert_eq!(
+            unsafe { fixture.api.peer_retire_egress.unwrap()(fixture.qso, &mut token) },
+            Status::Invalid
+        );
+        assert_eq!(token, 0);
+        let (output, mut input) = tokio::io::duplex(1);
+        let mut writer = ProxyWriter::new(output);
+        let work = Work {
+            qso: fixture.qso,
+            proxy: (mode != 0).then(|| writer.output()),
+            phase: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            fault: &fault,
+            packet: std::sync::Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            unsafe {
+                fixture.api.peer_attach.unwrap()(
+                    fixture.context,
+                    fixture.qso,
+                    Some(step),
+                    ptr::from_ref(&work).cast_mut().cast(),
+                    &mut fixture.registration,
+                )
+            },
+            Status::Ok
+        );
+        assert!(proxy_login::wait(|| work.phase.load(Ordering::Acquire) != 0));
+        assert!(!work.failed.load(Ordering::Acquire));
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        if mode != 0 {
+            assert!(
+                executor
+                    .block_on(async {
+                        tokio::time::timeout(Duration::from_millis(5), writer.flush_next()).await
+                    })
+                    .is_err()
+            );
+        }
+        work.phase.store(2, Ordering::Release);
+        unsafe { fixture.api.peer_wake.unwrap()(fixture.registration) };
+        assert!(proxy_login::wait(|| work.phase.load(Ordering::Acquire) == 3));
+        assert!(!work.failed.load(Ordering::Acquire));
+        unsafe { fixture.api.peer_detach.unwrap()(fixture.registration) };
+        fixture.registration = ptr::null_mut();
+        drop(fixture);
+        assert!(
+            runtime.upgrade().is_none(),
+            "metadata observer must not retain account/QSO runtime"
+        );
+        assert_eq!(
+            unsafe { observer.disposed.unwrap()(observer.context) },
+            i32::from(mode == 0)
+        );
+        if mode == 1 {
+            executor.block_on(async {
+                let read = tokio::spawn(async move {
+                    let mut header = [0; 9];
+                    input.read_exact(&mut header).await.unwrap();
+                    let count = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+                    let mut payload = vec![0; count];
+                    input.read_exact(&mut payload).await.unwrap();
+                    assert!(matches!(
+                        crate::wire::parse_datagram(Channel::Audio, &payload),
+                        Ok(crate::wire::WirePacket::Voice(_))
+                    ));
+                });
+                assert_eq!(
+                    writer
+                        .flush_one(Instant::now() + Duration::from_secs(1))
+                        .await
+                        .unwrap(),
+                    FlushOutcome::Sent
+                );
+                read.await.unwrap();
+            });
+            assert_eq!(
+                unsafe { observer.disposed.unwrap()(observer.context) },
+                1,
+                "untagged control/chat never retains voice eligibility"
+            );
+        }
+        drop(writer);
+        assert_eq!(unsafe { observer.disposed.unwrap()(observer.context) }, 1);
+        unsafe { observer.release.unwrap()(observer.context) };
+        assert!(
+            metadata.upgrade().is_none(),
+            "release is metadata-only and balanced after queued ticket destruction"
+        );
     }
 }
 
