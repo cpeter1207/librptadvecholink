@@ -1,6 +1,6 @@
 [package]
 name = "librptadvecholink"
-version = "0.1.0-alpha1"
+version = "0.1.0-alpha2"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-2.0-only"

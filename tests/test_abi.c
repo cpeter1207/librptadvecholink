@@ -4,6 +4,13 @@
 #include <assert.h>
 #include <string.h>
 
+_Static_assert(sizeof(struct rptadv_echolink_egress_observer_v1) == 32,
+               "complete native eligibility metadata observer");
+_Static_assert(offsetof(struct rptadv_echolink_descriptor_v1, peer_retire_egress) ==
+                   offsetof(struct rptadv_echolink_descriptor_v1, peer_observe) +
+                       sizeof(((struct rptadv_echolink_descriptor_v1 *)0)->peer_observe),
+               "actual retirement appends after the complete released prefix");
+
 _Static_assert(offsetof(struct rptadv_echolink_account_config_v1, aprs_server) == 344,
                "APRS endpoint appends without moving existing account fields");
 _Static_assert(sizeof(struct rptadv_echolink_account_config_v1) == 360,
@@ -48,6 +55,8 @@ int main(int argc, char **argv)
     assert(api != NULL);
     assert(api->struct_size == sizeof(*api));
     assert(api->abi_version == 1);
+    assert(api->struct_size >= RPTADV_ECHOLINK_DESCRIPTOR_EGRESS_MIN_SIZE);
+    assert(api->peer_retire_egress != NULL && api->peer_egress_observer != NULL);
     assert(memcmp(api->capability, "rptadv.echolink.v1", 19) == 0);
     struct rptadv_echolink_runtime_config_v1 config = {0};
     config.struct_size = sizeof(config);

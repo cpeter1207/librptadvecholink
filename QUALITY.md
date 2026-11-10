@@ -22,6 +22,23 @@ operations. Lifecycle-only sized prefixes remain usable; consumers that need
 network service require the complete operation group. The final PR gate must
 cover the current revision, including its packet and disconnect fixes.
 
+Alpha2 appends a complete optional egress pair to the released ABI1 descriptor;
+the released prefix, capabilities and SONAME1 remain compatible. Consumers must
+check the descriptor's physical `struct_size` before copying either tail slot.
+On the existing serial QSO owner, retirement revokes old voice and resets its
+actual encoder. `Pending` requires retry; only `Ok` with a nonzero epoch certifies
+that no old voice remains eligible in the native queue. New PCM and voice sends
+remain gated while retirement is pending. Other QSOs, control and chat survive.
+
+The metadata-only observer can outlive QSO/account/context destruction without
+retaining those I/O owners. Destruction alone is insufficient: an already
+partially submitted Proxy TCP frame must finish or lose its actual transport
+before the observer reports disposal. Unsubmitted retired voice is discarded.
+Keep the provider DSO loaded until releasing the observer. Neither completion nor
+UDP/TCP acceptance proves remote reception or RF silence. The observer and queue
+tests exercise actual bounded writer ownership, codec reset failures and native
+teardown; they do not establish public Proxy or radio interoperability.
+
 Fixture and native quality checks do not establish public-network acceptance.
 Check incoming and outgoing calls, both audio directions, silence, text,
 disconnect, and reload with the clients, controller host, and direct or Proxy
